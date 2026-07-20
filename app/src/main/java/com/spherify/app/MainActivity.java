@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -15,7 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 
 public class MainActivity extends Activity {
-    private SphereProjectionView projectionView;
+    private GLProjectionView projectionView;
     private TextView statusText;
     private Button modeButton;
     private Button invertButton;
@@ -25,7 +26,7 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
 
         Bitmap panorama = loadBundledPanorama();
-        projectionView = new SphereProjectionView(this);
+        projectionView = new GLProjectionView(this);
         projectionView.setPanorama(panorama);
 
         LinearLayout root = new LinearLayout(this);
@@ -89,7 +90,17 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(
+                    insets.getSystemWindowInsetLeft(),
+                    insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(),
+                    insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+
         setContentView(root);
+        root.requestApplyInsets();
         updateLabels();
     }
 
@@ -132,7 +143,7 @@ public class MainActivity extends Activity {
     }
 
     private void updateLabels() {
-        modeButton.setText(projectionView.getMode() == SphereProjectionView.Mode.SPHERE
+        modeButton.setText(projectionView.getMode() == GLProjectionView.Mode.SPHERE
                 ? "Tiny World"
                 : "PhotoSphere");
         invertButton.setText(projectionView.isInverted() ? "Normal" : "Invert");
