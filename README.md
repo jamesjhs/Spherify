@@ -27,37 +27,47 @@ When Phase 1 app code begins, the repository should contain at least:
 - A debug build variant, usually available as `app:assembleDebug`.
 - A runnable launcher activity.
 
-The goal of this runbook is to install and run the developer/debug version of Spherisphy in two places:
+The goal of this runbook is to install and run the developer/debug version of Spherisphy from VS Code in two places:
 
 - A physically linked Android phone or tablet connected by USB.
-- An Android Studio emulator, which acts as a sandboxed developer device.
+- An Android Emulator virtual device, which acts as a sandboxed developer device.
 
 ### Required Tools
 
 Install these before attempting either run path.
 
-1. Install Android Studio from the official Android developer site.
-2. Open Android Studio once after installing it.
-3. Let Android Studio finish its first-run setup.
-4. Install the Android SDK when Android Studio asks.
-5. Install the Android SDK Platform for the target API level chosen by the project.
-6. Install Android SDK Platform-Tools.
-7. Install Android SDK Build-Tools if Android Studio has not already installed them.
-8. Install the Android Emulator component if emulator testing is needed.
-9. On Windows, install the Google USB Driver from Android Studio if using a Google Pixel or another compatible device.
-10. On Windows, install the device manufacturer's USB driver if using a non-Google device that needs one.
-11. Make sure Git is installed.
-12. Make sure there is enough free disk space for Android Studio, SDK packages, Gradle caches, emulator images, build outputs, and app data.
-13. Use a reliable USB data cable for physical-device testing. Some cables charge only and cannot transfer data.
+1. Install Visual Studio Code.
+2. Install Git.
+3. Install Java/JDK at the version required by the Android Gradle Plugin chosen by the project.
+4. Install the Android SDK.
+5. Install Android SDK Platform-Tools.
+6. Install Android SDK Build-Tools.
+7. Install the Android SDK Platform for the target API level chosen by the project.
+8. Install the Android Emulator package if emulator testing is needed.
+9. Install Android command-line tools so `sdkmanager`, `avdmanager`, `adb`, and `emulator` are available.
+10. Keep Android Studio installed if desired as the provider of the Android SDK and emulator backend, but do not use Android Studio as the IDE for normal Spherisphy development.
+11. On Windows, install the Google USB Driver if using a Google Pixel or another compatible device.
+12. On Windows, install the device manufacturer's USB driver if using a non-Google device that needs one.
+13. Make sure there is enough free disk space for VS Code, Android SDK packages, Gradle caches, emulator images, build outputs, and app data.
+14. Use a reliable USB data cable for physical-device testing. Some cables charge only and cannot transfer data.
 
-Useful Android Studio menus:
+Useful VS Code areas:
 
-- SDK packages: `Tools > SDK Manager`.
-- Emulator and virtual devices: `Tools > Device Manager`.
-- Build and run target selector: the device menu in the main toolbar.
-- Run button: the green triangle in the main toolbar.
-- Logs: `View > Tool Windows > Logcat`.
-- Terminal: `View > Tool Windows > Terminal`.
+- Explorer: browse and edit project files.
+- Source Control: inspect Git changes.
+- Terminal: run Gradle, ADB, emulator, and SDK commands.
+- Problems: inspect compiler, Kotlin, XML, and lint issues reported by extensions or tasks.
+- Extensions: install Kotlin, Gradle, XML, Android, and debugger helpers if they are useful for the project.
+
+Recommended VS Code extensions once app code exists:
+
+- Kotlin language support.
+- Gradle task support.
+- XML support.
+- Android resource/file helpers if preferred.
+- A Java debugger if JVM debugging is needed.
+
+Android Studio may be installed on the same machine, but the intended development rule is simple: edit, build, run, and inspect from VS Code and terminal commands. Only use Android Studio for rare SDK or emulator administration if the command-line tools are broken or missing.
 
 Useful command-line tools:
 
@@ -65,6 +75,9 @@ Useful command-line tools:
 - `gradlew.bat`: the Windows Gradle wrapper script committed with the project.
 - `./gradlew`: the macOS/Linux Gradle wrapper script committed with the project.
 - `emulator`: the Android Emulator command-line launcher.
+- `sdkmanager`: installs Android SDK packages from the command line.
+- `avdmanager`: creates and manages Android Virtual Devices from the command line.
+- `java`: runs Java tooling used by Gradle and Android builds.
 
 On Windows PowerShell, run project commands from the repository root:
 
@@ -104,39 +117,64 @@ ls
 7. If those files are missing, stop. The repository is still documentation-only.
 8. If those files exist, continue.
 
-### Open the Project in Android Studio
+### Open the Project in VS Code
 
-1. Start Android Studio.
-2. Choose `Open`.
+1. Start VS Code.
+2. Choose `File > Open Folder`.
 3. Browse to the local repository folder.
 4. Select the repository root, not the `app/` directory.
-5. Wait for Android Studio to index the project.
-6. Wait for Gradle sync to start.
-7. If Android Studio asks whether to trust the project, trust it only if this is your local checkout of Spherisphy.
-8. Wait for Gradle sync to finish.
-9. If Android Studio says the Android Gradle Plugin or Gradle version is unsupported, follow the project-maintainer-approved upgrade path instead of randomly accepting major upgrades.
-10. If Android Studio asks to install missing SDK components, read the list.
-11. Install missing SDK components if they match the project's configured compile SDK and tools.
-12. Wait for the install to finish.
-13. Let Gradle sync run again.
-14. Confirm that the `app` run configuration appears in the toolbar.
-15. If no run configuration appears, open `Run > Edit Configurations`.
-16. Add an Android App configuration if needed.
-17. Select the `app` module.
-18. Apply the configuration.
+5. Trust the workspace only if this is your local checkout of Spherisphy.
+6. Open the VS Code terminal with ``Ctrl+` ``.
+7. Confirm the terminal is at the repository root.
+8. If it is not, change into the repository root.
+9. Check the Java installation.
+
+```bash
+java -version
+```
+
+10. Check that ADB is available.
+
+```bash
+adb version
+```
+
+11. Check that the emulator command is available if emulator testing will be used.
+
+```bash
+emulator -version
+```
+
+12. Check that the Gradle wrapper exists once app code has been scaffolded.
+
+Windows PowerShell:
+
+```powershell
+Test-Path .\gradlew.bat
+```
+
+macOS/Linux:
+
+```bash
+test -f ./gradlew && echo "gradlew found"
+```
+
+13. If `adb`, `emulator`, or Java are not found, fix the system `PATH` or Android SDK/JDK installation before continuing.
+14. If `gradlew` or `gradlew.bat` is missing, stop. The Android project scaffold has not been created yet.
+15. Use VS Code Explorer to edit files.
+16. Use VS Code Source Control to review changes before committing.
+17. Use the VS Code terminal for all build, install, run, reset, and log commands.
 
 ### Build the Debug App
 
 This checks that the developer build can compile before attempting installation.
 
-Android Studio path:
+VS Code terminal path:
 
-1. Open the project.
-2. Wait for Gradle sync to finish.
-3. Select `Build > Make Project`.
-4. Wait for the build to finish.
-5. Open the Build tool window if there is an error.
-6. Fix missing SDK, dependency, manifest, Kotlin, Compose, or resource errors before trying to run.
+1. Open the repository in VS Code.
+2. Open the integrated terminal.
+3. Confirm the terminal is at the repository root.
+4. Run the debug build command.
 
 Command-line path on Windows:
 
@@ -158,11 +196,19 @@ Expected successful result:
 If the build fails:
 
 1. Read the first real error, not only the final `BUILD FAILED` line.
-2. If the error says an SDK is missing, install that SDK from `Tools > SDK Manager`.
+2. If the error says an SDK is missing, install that SDK with `sdkmanager` or the installed Android SDK tooling.
 3. If the error says Java is wrong, use the JDK version required by the Android Gradle Plugin.
 4. If the error says a dependency cannot be resolved, check the internet connection and Gradle repositories.
 5. If the error says a file is missing, confirm the file exists in Git and was not ignored.
 6. Re-run the build after fixing the first error.
+
+Example SDK install command:
+
+```bash
+sdkmanager "platform-tools" "build-tools;35.0.0" "platforms;android-35"
+```
+
+The exact API level and build-tools version should match the future project configuration.
 
 ### Run on a Physically Linked Android Device
 
@@ -237,36 +283,12 @@ Common results and what they mean:
 
 On Windows, if no device appears:
 
-1. Open Android Studio.
-2. Open `Tools > SDK Manager`.
-3. Open the `SDK Tools` tab.
-4. Install `Google USB Driver` if using a compatible Google device.
-5. Install the manufacturer's USB driver if the device is not covered by the Google USB Driver.
-6. Unplug and reconnect the phone.
-7. Re-run `adb devices`.
+1. Install `Google USB Driver` if using a compatible Google device.
+2. Install the manufacturer's USB driver if the device is not covered by the Google USB Driver.
+3. Unplug and reconnect the phone.
+4. Re-run `adb devices`.
 
-#### Run on the Physical Device from Android Studio
-
-1. Open the project in Android Studio.
-2. Wait for Gradle sync to finish.
-3. Unlock the Android device.
-4. Confirm `adb devices` shows the device as `device`.
-5. In Android Studio's toolbar, choose the `app` run configuration.
-6. Open the target device menu.
-7. Select the connected USB device.
-8. Click the green Run button.
-9. Wait for Android Studio to build the debug APK.
-10. Wait for Android Studio to install the APK.
-11. Watch the phone for any permission or install prompts.
-12. If Android asks to allow installing or debugging this app, allow it.
-13. Wait for Spherisphy to open on the device.
-14. Open `View > Tool Windows > Logcat` in Android Studio.
-15. Select the physical device in Logcat.
-16. Select the Spherisphy app process if Logcat offers a process selector.
-17. Use the app normally.
-18. Watch Logcat for crashes, permission errors, sensor errors, storage errors, and rendering errors.
-
-#### Run on the Physical Device from the Command Line
+#### Run on the Physical Device from VS Code
 
 1. Build the debug APK.
 
@@ -334,6 +356,16 @@ adb logcat
 ```
 
 8. Stop logging with `Ctrl+C`.
+9. Keep VS Code open for edits.
+10. Repeat the edit, build, install, launch, log loop as needed.
+
+Optional filtered logs after the final package name is known:
+
+```bash
+adb logcat --pid=$(adb shell pidof -s com.spherisphy.app)
+```
+
+On Windows PowerShell, use the simpler unfiltered `adb logcat` first unless a project script provides a reliable filtered command.
 
 #### Reset the App on the Physical Device
 
@@ -357,7 +389,7 @@ To uninstall the debug app:
 adb uninstall com.spherisphy.app
 ```
 
-### Run in an Android Studio Emulator Sandbox
+### Run in an Android Emulator Sandbox from VS Code
 
 This path installs and runs the debug version of Spherisphy inside an Android Virtual Device.
 
@@ -377,53 +409,69 @@ Do not rely on the emulator alone for final capture validation. Camera, compass,
 
 #### Create an Android Virtual Device
 
-1. Open Android Studio.
-2. Open `Tools > Device Manager`.
-3. Click `Create device`.
-4. Choose a hardware profile.
-5. For normal phone testing, choose a common Pixel phone profile.
-6. Click `Next`.
-7. Choose a system image.
-8. Prefer a recent stable Android API level that matches the project's compile and target plans.
-9. Use a Google APIs or Google Play image if Google services are needed.
-10. Use a plain AOSP image if Google services are not needed for the test.
-11. Download the system image if Android Studio says it is not installed.
-12. Wait for the image download to finish.
-13. Click `Next`.
-14. Name the virtual device clearly, for example `Spherisphy_API_35_Pixel`.
-15. Confirm the startup orientation.
-16. Confirm the graphics setting.
-17. Use hardware graphics acceleration when available.
-18. Click `Finish`.
+1. Open VS Code.
+2. Open the repository folder.
+3. Open the integrated terminal.
+4. List installed SDK packages.
 
-#### Start the Emulator
+```bash
+sdkmanager --list_installed
+```
 
-Android Studio path:
+5. If no suitable emulator system image is installed, install one.
 
-1. Open `Tools > Device Manager`.
-2. Find the virtual device.
-3. Click the Run button beside it.
-4. Wait for the emulator window or Running Devices panel to appear.
-5. Wait for Android to finish booting.
-6. Unlock the emulator if it starts on the lock screen.
-7. Wait until the home screen is responsive.
+Example:
 
-Command-line path:
+```bash
+sdkmanager "system-images;android-35;google_apis;x86_64"
+```
 
-1. List available emulator devices.
+6. List available device profiles.
+
+```bash
+avdmanager list device
+```
+
+7. Create an AVD with a clear Spherisphy name.
+
+Example:
+
+```bash
+avdmanager create avd -n Spherisphy_API_35_Pixel -k "system-images;android-35;google_apis;x86_64" -d pixel_7
+```
+
+8. If `avdmanager` asks whether to create a custom hardware profile, answer `no` unless the project needs special hardware settings.
+9. Confirm the AVD exists.
 
 ```bash
 emulator -list-avds
 ```
 
-2. Start the chosen emulator.
+10. Prefer a recent stable Android API level that matches the project's compile and target plans.
+11. Use a Google APIs or Google Play image if Google services are needed.
+12. Use a plain AOSP image if Google services are not needed for the test.
+13. Use hardware graphics acceleration when available.
+14. Keep the AVD name stable so scripts and notes can refer to it.
+
+#### Start the Emulator
+
+1. Open VS Code.
+2. Open the integrated terminal.
+3. List available emulator devices.
+
+```bash
+emulator -list-avds
+```
+
+4. Start the chosen emulator.
 
 ```bash
 emulator -avd Spherisphy_API_35_Pixel
 ```
 
-3. Leave the terminal open while the emulator runs.
-4. In a second terminal, confirm that ADB sees the emulator.
+5. Leave the terminal open while the emulator runs.
+6. Open a second VS Code terminal.
+7. Confirm that ADB sees the emulator.
 
 ```bash
 adb devices
@@ -441,29 +489,10 @@ If the emulator is slow or fails to boot:
 3. Use a smaller device profile.
 4. Use a lower-resolution emulator.
 5. Close other memory-heavy applications.
-6. Wipe the emulator data from Device Manager if the virtual device state is corrupted.
+6. Wipe the emulator data if the virtual device state is corrupted.
 7. Create a new AVD if wiping data does not help.
 
-#### Run on the Emulator from Android Studio
-
-1. Open the project in Android Studio.
-2. Wait for Gradle sync to finish.
-3. Start the emulator or let Android Studio start it during Run.
-4. Choose the `app` run configuration.
-5. Open the target device menu.
-6. Select the running emulator.
-7. Click the green Run button.
-8. Wait for the debug APK to build.
-9. Wait for Android Studio to install the APK into the emulator.
-10. Wait for Spherisphy to launch.
-11. Open Logcat.
-12. Select the emulator.
-13. Select the Spherisphy app process if available.
-14. Test the app.
-15. Rotate the emulator if orientation behavior matters.
-16. Use emulator extended controls for location, camera, and sensor simulation where applicable.
-
-#### Run on the Emulator from the Command Line
+#### Run on the Emulator from VS Code
 
 1. Start the emulator.
 2. Confirm ADB sees it.
@@ -517,6 +546,20 @@ adb -e logcat
 ```
 
 7. Stop logging with `Ctrl+C`.
+8. Keep VS Code open for edits.
+9. Repeat the edit, build, install, launch, log loop as needed.
+
+Useful emulator commands:
+
+```bash
+adb -e emu kill
+```
+
+```bash
+emulator -avd Spherisphy_API_35_Pixel -wipe-data
+```
+
+The first command closes the running emulator. The second starts the AVD with its data wiped.
 
 #### Reset the Emulator Sandbox
 
@@ -536,13 +579,15 @@ adb -e uninstall com.spherisphy.app
 
 To wipe the whole emulator:
 
-1. Open `Tools > Device Manager`.
-2. Find the AVD.
-3. Open its actions menu.
-4. Choose `Wipe Data`.
-5. Confirm.
-6. Start the emulator again.
-7. Reinstall the app.
+1. Close the emulator.
+2. Start the emulator with `-wipe-data`.
+
+```bash
+emulator -avd Spherisphy_API_35_Pixel -wipe-data
+```
+
+3. Wait for the emulator to boot.
+4. Reinstall the app.
 
 Wiping the emulator deletes its apps, local files, settings, and test state. It does not delete the source code repository.
 
@@ -581,13 +626,13 @@ Before each test run:
 
 1. Pull or fetch the latest intended code.
 2. Confirm the working tree changes are understood.
-3. Open Android Studio or a terminal at the repository root.
-4. Let Gradle sync finish.
+3. Open the repository in VS Code.
+4. Open the VS Code integrated terminal at the repository root.
 5. Run a debug build.
 6. Choose exactly one target device unless deliberately testing multiple devices.
 7. Confirm `adb devices` shows the target.
 8. Install and run the debug app.
-9. Watch Logcat.
+9. Watch `adb logcat`.
 10. Record the device model, Android version, and app commit when reporting a bug.
 
 For physical-device capture testing, also record:
@@ -620,17 +665,19 @@ For emulator testing, also record:
 1. The Android project scaffold has not been created yet.
 2. Stop and create or restore the Gradle wrapper before trying to build.
 
-Android Studio cannot find an SDK:
+The build cannot find an Android SDK:
 
-1. Open `Tools > SDK Manager`.
-2. Install the SDK Platform required by the project.
-3. Install Platform-Tools.
-4. Sync Gradle again.
+1. Confirm `ANDROID_HOME` or `ANDROID_SDK_ROOT` points to the installed Android SDK.
+2. Confirm `platform-tools` is on `PATH`.
+3. Run `adb version`.
+4. Install the SDK Platform required by the project with `sdkmanager`.
+5. Install Platform-Tools with `sdkmanager` if needed.
+6. Re-run the Gradle build from the VS Code terminal.
 
-The device does not appear in Android Studio:
+The device does not appear in ADB:
 
 1. Run `adb devices`.
-2. If the device does not appear there, Android Studio will not see it either.
+2. If the device does not appear there, VS Code and Gradle install commands cannot target it.
 3. Check the cable.
 4. Check USB debugging.
 5. Check the debugging authorization prompt.
@@ -654,7 +701,7 @@ The emulator boots but the app will not install:
 
 The app starts and immediately closes:
 
-1. Open Logcat.
+1. Run `adb logcat`.
 2. Filter by the app package name.
 3. Look for `FATAL EXCEPTION`.
 4. Fix the first crash stack trace.
@@ -668,7 +715,8 @@ The app behaves differently on emulator and real phone:
 
 ### Official References
 
-- Android Studio build and run overview: https://developer.android.com/studio/run
+- VS Code documentation: https://code.visualstudio.com/docs
+- Android command-line tools: https://developer.android.com/tools
 - Run apps on a local device: https://developer.android.com/studio/run/device
 - Google USB Driver for Windows: https://developer.android.com/studio/run/win-usb
 - Run apps on the Android Emulator: https://developer.android.com/studio/run/emulator
