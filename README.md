@@ -1,2 +1,1392 @@
 # Spherisphy
-Android app to create immediate PhotoSphere and TinyWorld images and integrate them to Google Photos and Google Maps
+
+Version: 0.0.1
+
+Spherisphy is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny World images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
+
+This repository currently contains planning notes only. No application code has been started.
+
+## Developer Build and Run Runbook
+
+This section is intentionally basic and explicit. It is written for the future point where this repository contains an Android project, but it also explains what happens today.
+
+Current status:
+
+- The repository currently has no Gradle wrapper, no `settings.gradle` or `settings.gradle.kts`, no Android app module, and no source code.
+- Because of that, there is nothing to build or install yet.
+- The commands below become usable after the Android project scaffold exists.
+- Until then, any command such as `.\gradlew assembleDebug` will fail because `gradlew` does not exist.
+
+When Phase 1 app code begins, the repository should contain at least:
+
+- `settings.gradle` or `settings.gradle.kts`.
+- A root `build.gradle` or `build.gradle.kts`.
+- A Gradle wrapper: `gradlew`, `gradlew.bat`, and the `gradle/wrapper/` directory.
+- An Android app module, usually named `app/`.
+- An Android manifest at a path like `app/src/main/AndroidManifest.xml`.
+- A debug build variant, usually available as `app:assembleDebug`.
+- A runnable launcher activity.
+
+The goal of this runbook is to install and run the developer/debug version of Spherisphy in two places:
+
+- A physically linked Android phone or tablet connected by USB.
+- An Android Studio emulator, which acts as a sandboxed developer device.
+
+### Required Tools
+
+Install these before attempting either run path.
+
+1. Install Android Studio from the official Android developer site.
+2. Open Android Studio once after installing it.
+3. Let Android Studio finish its first-run setup.
+4. Install the Android SDK when Android Studio asks.
+5. Install the Android SDK Platform for the target API level chosen by the project.
+6. Install Android SDK Platform-Tools.
+7. Install Android SDK Build-Tools if Android Studio has not already installed them.
+8. Install the Android Emulator component if emulator testing is needed.
+9. On Windows, install the Google USB Driver from Android Studio if using a Google Pixel or another compatible device.
+10. On Windows, install the device manufacturer's USB driver if using a non-Google device that needs one.
+11. Make sure Git is installed.
+12. Make sure there is enough free disk space for Android Studio, SDK packages, Gradle caches, emulator images, build outputs, and app data.
+13. Use a reliable USB data cable for physical-device testing. Some cables charge only and cannot transfer data.
+
+Useful Android Studio menus:
+
+- SDK packages: `Tools > SDK Manager`.
+- Emulator and virtual devices: `Tools > Device Manager`.
+- Build and run target selector: the device menu in the main toolbar.
+- Run button: the green triangle in the main toolbar.
+- Logs: `View > Tool Windows > Logcat`.
+- Terminal: `View > Tool Windows > Terminal`.
+
+Useful command-line tools:
+
+- `adb`: Android Debug Bridge. It lists devices, installs APKs, opens shells, reads logs, and starts activities.
+- `gradlew.bat`: the Windows Gradle wrapper script committed with the project.
+- `./gradlew`: the macOS/Linux Gradle wrapper script committed with the project.
+- `emulator`: the Android Emulator command-line launcher.
+
+On Windows PowerShell, run project commands from the repository root:
+
+```powershell
+cd C:\GitHub\Spherisphy
+```
+
+On macOS or Linux, run project commands from wherever the repository was cloned:
+
+```bash
+cd /path/to/Spherisphy
+```
+
+### First Repository Check
+
+Do this before trying to run on either a real device or an emulator.
+
+1. Open a terminal.
+2. Change into the repository root.
+3. Check that the repository has app code.
+
+Windows PowerShell:
+
+```powershell
+Get-ChildItem
+```
+
+macOS/Linux:
+
+```bash
+ls
+```
+
+4. Look for `gradlew.bat` on Windows or `gradlew` on macOS/Linux.
+5. Look for `settings.gradle` or `settings.gradle.kts`.
+6. Look for an app module directory, usually `app`.
+7. If those files are missing, stop. The repository is still documentation-only.
+8. If those files exist, continue.
+
+### Open the Project in Android Studio
+
+1. Start Android Studio.
+2. Choose `Open`.
+3. Browse to the local repository folder.
+4. Select the repository root, not the `app/` directory.
+5. Wait for Android Studio to index the project.
+6. Wait for Gradle sync to start.
+7. If Android Studio asks whether to trust the project, trust it only if this is your local checkout of Spherisphy.
+8. Wait for Gradle sync to finish.
+9. If Android Studio says the Android Gradle Plugin or Gradle version is unsupported, follow the project-maintainer-approved upgrade path instead of randomly accepting major upgrades.
+10. If Android Studio asks to install missing SDK components, read the list.
+11. Install missing SDK components if they match the project's configured compile SDK and tools.
+12. Wait for the install to finish.
+13. Let Gradle sync run again.
+14. Confirm that the `app` run configuration appears in the toolbar.
+15. If no run configuration appears, open `Run > Edit Configurations`.
+16. Add an Android App configuration if needed.
+17. Select the `app` module.
+18. Apply the configuration.
+
+### Build the Debug App
+
+This checks that the developer build can compile before attempting installation.
+
+Android Studio path:
+
+1. Open the project.
+2. Wait for Gradle sync to finish.
+3. Select `Build > Make Project`.
+4. Wait for the build to finish.
+5. Open the Build tool window if there is an error.
+6. Fix missing SDK, dependency, manifest, Kotlin, Compose, or resource errors before trying to run.
+
+Command-line path on Windows:
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+Command-line path on macOS/Linux:
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+Expected successful result:
+
+- Gradle ends with `BUILD SUCCESSFUL`.
+- A debug APK exists under a path similar to `app/build/outputs/apk/debug/app-debug.apk`.
+
+If the build fails:
+
+1. Read the first real error, not only the final `BUILD FAILED` line.
+2. If the error says an SDK is missing, install that SDK from `Tools > SDK Manager`.
+3. If the error says Java is wrong, use the JDK version required by the Android Gradle Plugin.
+4. If the error says a dependency cannot be resolved, check the internet connection and Gradle repositories.
+5. If the error says a file is missing, confirm the file exists in Git and was not ignored.
+6. Re-run the build after fixing the first error.
+
+### Run on a Physically Linked Android Device
+
+This path installs and runs the debug version of Spherisphy on a real phone or tablet connected to the development computer.
+
+Use this path when testing:
+
+- Real camera behavior.
+- Real gyroscope, accelerometer, compass, and rotation-vector behavior.
+- Real location behavior.
+- Real storage and MediaStore behavior.
+- Real performance and thermal behavior.
+- Real permission prompts.
+
+The emulator is useful, but it cannot fully prove Spherisphy's capture experience because PhotoSphere capture depends heavily on physical camera and motion sensors.
+
+#### Prepare the Android Device
+
+1. Turn on the Android device.
+2. Unlock the device.
+3. Open the device's Settings app.
+4. Scroll to `About phone` or `About tablet`.
+5. Find `Build number`.
+6. Tap `Build number` seven times.
+7. Enter the device PIN, password, or pattern if Android asks.
+8. Confirm that Android says developer options are enabled.
+9. Go back to the main Settings screen.
+10. Open `System`.
+11. Open `Developer options`. The exact location varies by manufacturer.
+12. Turn on `USB debugging`.
+13. If the device has a `Default USB configuration` setting, set it to file transfer or data transfer if available.
+14. Leave the device unlocked for the first connection.
+
+#### Connect the Device by USB
+
+1. Plug the USB cable into the computer.
+2. Plug the USB cable into the Android device.
+3. If the phone asks what to do with the USB connection, choose file transfer, data transfer, or the closest equivalent.
+4. Watch the phone screen for an `Allow USB debugging?` prompt.
+5. Check the computer's RSA fingerprint if you want to be careful.
+6. Select `Always allow from this computer` if this is your own development machine.
+7. Tap `Allow`.
+8. Keep the device unlocked until the computer recognizes it.
+
+#### Confirm That ADB Sees the Device
+
+Run this from a terminal:
+
+Windows PowerShell:
+
+```powershell
+adb devices
+```
+
+macOS/Linux:
+
+```bash
+adb devices
+```
+
+Expected result:
+
+- A line appears with a device serial number.
+- The state says `device`.
+
+Common results and what they mean:
+
+- `unauthorized`: unlock the phone and accept the USB debugging prompt.
+- `offline`: unplug the cable, plug it back in, and re-run `adb devices`.
+- No device listed: try a different USB cable, USB port, or driver.
+- Multiple devices listed: disconnect extra devices or pass an explicit device serial to `adb`.
+
+On Windows, if no device appears:
+
+1. Open Android Studio.
+2. Open `Tools > SDK Manager`.
+3. Open the `SDK Tools` tab.
+4. Install `Google USB Driver` if using a compatible Google device.
+5. Install the manufacturer's USB driver if the device is not covered by the Google USB Driver.
+6. Unplug and reconnect the phone.
+7. Re-run `adb devices`.
+
+#### Run on the Physical Device from Android Studio
+
+1. Open the project in Android Studio.
+2. Wait for Gradle sync to finish.
+3. Unlock the Android device.
+4. Confirm `adb devices` shows the device as `device`.
+5. In Android Studio's toolbar, choose the `app` run configuration.
+6. Open the target device menu.
+7. Select the connected USB device.
+8. Click the green Run button.
+9. Wait for Android Studio to build the debug APK.
+10. Wait for Android Studio to install the APK.
+11. Watch the phone for any permission or install prompts.
+12. If Android asks to allow installing or debugging this app, allow it.
+13. Wait for Spherisphy to open on the device.
+14. Open `View > Tool Windows > Logcat` in Android Studio.
+15. Select the physical device in Logcat.
+16. Select the Spherisphy app process if Logcat offers a process selector.
+17. Use the app normally.
+18. Watch Logcat for crashes, permission errors, sensor errors, storage errors, and rendering errors.
+
+#### Run on the Physical Device from the Command Line
+
+1. Build the debug APK.
+
+Windows PowerShell:
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+macOS/Linux:
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+2. Confirm that the device is visible.
+
+```bash
+adb devices
+```
+
+3. Install the debug APK.
+
+Windows PowerShell:
+
+```powershell
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+macOS/Linux:
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+4. If more than one device or emulator is connected, copy the target serial from `adb devices`.
+5. Install to that exact serial.
+
+Windows PowerShell:
+
+```powershell
+adb -s DEVICE_SERIAL install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+macOS/Linux:
+
+```bash
+adb -s DEVICE_SERIAL install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+6. Start the app from the launcher on the phone, or start it with an `adb shell am start` command after the package name and launch activity are known.
+
+The package name is expected to be something like `com.spherisphy.app`, but the actual package name must come from the future Android manifest or Gradle namespace.
+
+Example only:
+
+```bash
+adb shell monkey -p com.spherisphy.app 1
+```
+
+7. Read device logs while testing.
+
+```bash
+adb logcat
+```
+
+8. Stop logging with `Ctrl+C`.
+
+#### Reset the App on the Physical Device
+
+Use this when the app has bad local state, stale permissions, or old test data.
+
+1. Find the package name from the manifest or Gradle namespace.
+2. Clear the app data.
+
+Example only:
+
+```bash
+adb shell pm clear com.spherisphy.app
+```
+
+3. Reopen the app.
+4. Repeat the first-run and permission flow.
+
+To uninstall the debug app:
+
+```bash
+adb uninstall com.spherisphy.app
+```
+
+### Run in an Android Studio Emulator Sandbox
+
+This path installs and runs the debug version of Spherisphy inside an Android Virtual Device.
+
+Use this path when testing:
+
+- Basic app launch.
+- Navigation.
+- Layout and Compose rendering.
+- PhotoSphere viewer rendering.
+- Tiny World reprojection controls.
+- Import/export flows that do not require real camera behavior.
+- Permission copy and denial paths.
+- Different screen sizes, densities, orientations, and Android versions.
+- Clean app state without touching a real phone.
+
+Do not rely on the emulator alone for final capture validation. Camera, compass, gyroscope, location, GPU behavior, and storage behavior can differ from real hardware.
+
+#### Create an Android Virtual Device
+
+1. Open Android Studio.
+2. Open `Tools > Device Manager`.
+3. Click `Create device`.
+4. Choose a hardware profile.
+5. For normal phone testing, choose a common Pixel phone profile.
+6. Click `Next`.
+7. Choose a system image.
+8. Prefer a recent stable Android API level that matches the project's compile and target plans.
+9. Use a Google APIs or Google Play image if Google services are needed.
+10. Use a plain AOSP image if Google services are not needed for the test.
+11. Download the system image if Android Studio says it is not installed.
+12. Wait for the image download to finish.
+13. Click `Next`.
+14. Name the virtual device clearly, for example `Spherisphy_API_35_Pixel`.
+15. Confirm the startup orientation.
+16. Confirm the graphics setting.
+17. Use hardware graphics acceleration when available.
+18. Click `Finish`.
+
+#### Start the Emulator
+
+Android Studio path:
+
+1. Open `Tools > Device Manager`.
+2. Find the virtual device.
+3. Click the Run button beside it.
+4. Wait for the emulator window or Running Devices panel to appear.
+5. Wait for Android to finish booting.
+6. Unlock the emulator if it starts on the lock screen.
+7. Wait until the home screen is responsive.
+
+Command-line path:
+
+1. List available emulator devices.
+
+```bash
+emulator -list-avds
+```
+
+2. Start the chosen emulator.
+
+```bash
+emulator -avd Spherisphy_API_35_Pixel
+```
+
+3. Leave the terminal open while the emulator runs.
+4. In a second terminal, confirm that ADB sees the emulator.
+
+```bash
+adb devices
+```
+
+Expected result:
+
+- A device appears with a name like `emulator-5554`.
+- The state says `device`.
+
+If the emulator is slow or fails to boot:
+
+1. Confirm that the computer meets Android Emulator system requirements.
+2. Enable hardware virtualization in BIOS or firmware if needed.
+3. Use a smaller device profile.
+4. Use a lower-resolution emulator.
+5. Close other memory-heavy applications.
+6. Wipe the emulator data from Device Manager if the virtual device state is corrupted.
+7. Create a new AVD if wiping data does not help.
+
+#### Run on the Emulator from Android Studio
+
+1. Open the project in Android Studio.
+2. Wait for Gradle sync to finish.
+3. Start the emulator or let Android Studio start it during Run.
+4. Choose the `app` run configuration.
+5. Open the target device menu.
+6. Select the running emulator.
+7. Click the green Run button.
+8. Wait for the debug APK to build.
+9. Wait for Android Studio to install the APK into the emulator.
+10. Wait for Spherisphy to launch.
+11. Open Logcat.
+12. Select the emulator.
+13. Select the Spherisphy app process if available.
+14. Test the app.
+15. Rotate the emulator if orientation behavior matters.
+16. Use emulator extended controls for location, camera, and sensor simulation where applicable.
+
+#### Run on the Emulator from the Command Line
+
+1. Start the emulator.
+2. Confirm ADB sees it.
+
+```bash
+adb devices
+```
+
+3. Build the debug APK.
+
+Windows PowerShell:
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+macOS/Linux:
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+4. Install the debug APK.
+
+Windows PowerShell:
+
+```powershell
+adb -e install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+macOS/Linux:
+
+```bash
+adb -e install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+The `-e` flag targets the emulator. Use it when a physical device is also connected.
+
+5. Start the app from the emulator launcher, or use an `adb shell monkey` command after the package name is known.
+
+Example only:
+
+```bash
+adb -e shell monkey -p com.spherisphy.app 1
+```
+
+6. Read emulator logs.
+
+```bash
+adb -e logcat
+```
+
+7. Stop logging with `Ctrl+C`.
+
+#### Reset the Emulator Sandbox
+
+Use this when you want a clean developer app environment.
+
+To clear only Spherisphy's app data:
+
+```bash
+adb -e shell pm clear com.spherisphy.app
+```
+
+To uninstall the debug app:
+
+```bash
+adb -e uninstall com.spherisphy.app
+```
+
+To wipe the whole emulator:
+
+1. Open `Tools > Device Manager`.
+2. Find the AVD.
+3. Open its actions menu.
+4. Choose `Wipe Data`.
+5. Confirm.
+6. Start the emulator again.
+7. Reinstall the app.
+
+Wiping the emulator deletes its apps, local files, settings, and test state. It does not delete the source code repository.
+
+### Permission Checks During Developer Runs
+
+Spherisphy is expected to request permissions contextually, not all at startup. During testing, check each permission at the moment the app needs it.
+
+Physical device checks:
+
+1. Start the app fresh.
+2. Confirm it does not immediately request every sensitive permission.
+3. Start a capture flow.
+4. Confirm camera permission appears only when capture needs it.
+5. Grant camera permission.
+6. Confirm the camera preview opens.
+7. Enable map-ready location tagging.
+8. Confirm location permission appears at that moment.
+9. Grant location permission.
+10. Confirm location status appears in the app only where relevant.
+11. Deny a permission on a second run.
+12. Confirm the app explains the reduced feature without crashing.
+
+Emulator checks:
+
+1. Start from a clean emulator or clear app data.
+2. Run the app.
+3. Test first launch.
+4. Test permission denial.
+5. Test permission grant.
+6. Use emulator location controls if location behavior is being tested.
+7. Use emulator camera controls only for basic camera plumbing. Do not treat emulator camera behavior as proof of real PhotoSphere capture quality.
+
+### Developer Run Checklist
+
+Before each test run:
+
+1. Pull or fetch the latest intended code.
+2. Confirm the working tree changes are understood.
+3. Open Android Studio or a terminal at the repository root.
+4. Let Gradle sync finish.
+5. Run a debug build.
+6. Choose exactly one target device unless deliberately testing multiple devices.
+7. Confirm `adb devices` shows the target.
+8. Install and run the debug app.
+9. Watch Logcat.
+10. Record the device model, Android version, and app commit when reporting a bug.
+
+For physical-device capture testing, also record:
+
+- Device manufacturer and model.
+- Android version.
+- Camera lens used.
+- Whether gyroscope is present.
+- Whether accelerometer is present.
+- Whether magnetometer/compass is present.
+- Whether rotation vector is present.
+- Whether location was enabled.
+- Lighting conditions.
+- Approximate capture duration.
+- Whether source frames were saved.
+
+For emulator testing, also record:
+
+- AVD name.
+- Hardware profile.
+- Android API level.
+- System image type, such as AOSP, Google APIs, or Google Play.
+- Graphics mode.
+- Whether the emulator was cold booted, quick booted, or wiped.
+
+### Common Problems
+
+`gradlew` or `gradlew.bat` is missing:
+
+1. The Android project scaffold has not been created yet.
+2. Stop and create or restore the Gradle wrapper before trying to build.
+
+Android Studio cannot find an SDK:
+
+1. Open `Tools > SDK Manager`.
+2. Install the SDK Platform required by the project.
+3. Install Platform-Tools.
+4. Sync Gradle again.
+
+The device does not appear in Android Studio:
+
+1. Run `adb devices`.
+2. If the device does not appear there, Android Studio will not see it either.
+3. Check the cable.
+4. Check USB debugging.
+5. Check the debugging authorization prompt.
+6. Check Windows USB drivers if on Windows.
+
+The device appears as `unauthorized`:
+
+1. Unlock the device.
+2. Look for the USB debugging prompt.
+3. Tap `Allow`.
+4. If the prompt does not appear, turn USB debugging off and on again.
+5. Unplug and reconnect the cable.
+
+The emulator boots but the app will not install:
+
+1. Confirm the emulator is fully booted and unlocked.
+2. Run `adb devices`.
+3. Confirm the emulator state is `device`.
+4. Rebuild the debug APK.
+5. If install still fails, uninstall the old package or wipe app data.
+
+The app starts and immediately closes:
+
+1. Open Logcat.
+2. Filter by the app package name.
+3. Look for `FATAL EXCEPTION`.
+4. Fix the first crash stack trace.
+5. Rebuild and reinstall.
+
+The app behaves differently on emulator and real phone:
+
+1. Prefer the real phone result for camera, sensors, compass, storage, thermal, and location behavior.
+2. Prefer emulator results only for controlled UI, navigation, layout, and clean-state tests.
+3. Add a device-specific note if a hardware sensor is missing or unreliable.
+
+### Official References
+
+- Android Studio build and run overview: https://developer.android.com/studio/run
+- Run apps on a local device: https://developer.android.com/studio/run/device
+- Google USB Driver for Windows: https://developer.android.com/studio/run/win-usb
+- Run apps on the Android Emulator: https://developer.android.com/studio/run/emulator
+- Start the emulator from the command line: https://developer.android.com/studio/run/emulator-commandline
+- Android Emulator troubleshooting: https://developer.android.com/studio/run/emulator-troubleshooting
+- Android Emulator hardware acceleration: https://developer.android.com/studio/run/emulator-acceleration
+
+## Development Blog
+
+### 2026-07-20: First Research Pass
+
+The original spark is nicely ambitious: make a free Android app that can guide a user through capturing a full 360 x 180 scene, use the camera plus accelerometer, gyroscope, compass, and location services to stabilize and orient the capture, stitch and exposure-balance the frames, save the result to device storage, and later browse or reproject the saved images between PhotoSphere and Tiny World views.
+
+The core file format target should be an equirectangular JPEG master at a 2:1 aspect ratio. Google Maps' own Photo Sphere guidance expects 7.5 MP or larger, a 2:1 image, no more than 75 MB, no horizon gaps, and no major stitching errors. That makes a 3840 x 1920 output the minimum credible target, with higher resolutions desirable on modern phones.
+
+The best product direction is probably not "one-click magic" at first. A realistic first version would be a guided capture tool with a clear sphere/cube coverage map, live horizon/orientation feedback, local saves, a gallery, and reprojection/export. Full automatic high-quality stitching is the hard part. Publishing and browsing are approachable; capture guidance is approachable; reliable stitching across phones, lenses, parallax, moving objects, low light, and exposure shifts is the real research project.
+
+### Current Market Notes
+
+I did not find a clearly free current Android or PWA offering that does all of the desired pieces in one place: guided phone-only PhotoSphere capture, sensor-assisted stabilization/orientation, image matching and exposure compensation, Tiny World generation, local gallery, reversible reprojection browser, Google Photos integration, and Google Maps publishing.
+
+There are partial products:
+
+- Google Maps can publish Photo Spheres and Google documents that developers can build publishing tools with the Street View Publish API, but Google's standalone Street View app was discontinued in 2023.
+- Panorra 360 appears to focus on 360-photo sharing and one-tap Google Street View publishing.
+- Go Street View Photo Sphere and 360 Photo Cam advertise phone-based 360 capture/stitching flows.
+- Tiny Planet - Global Photo focuses on turning photos/panoramas into Tiny Planet or wormhole-style images, with import/camera/export features.
+- Web libraries such as Photo Sphere Viewer, Pannellum, and Marzipano are excellent for viewing equirectangular panoramas in browsers, but they are viewers/toolkits rather than complete phone capture, stitch, local-gallery, and Google-publishing products.
+
+The gap seems real: the market has viewers, editors, uploaders, and capture apps, but not a polished free app that combines the whole workflow and treats Tiny World and PhotoSphere as two projections of the same saved master.
+
+### Google Platform Reality
+
+Google Maps publishing is possible, but must be treated carefully. Google says Photo Spheres can be uploaded with the Android Google Maps app or browser, and developers can create tools with the Street View Publish API. The API can publish 360 photos to Google Maps with position, orientation, and connectivity metadata. That is promising for Spherisphy, especially if each image stores GPS, compass heading, capture time, and XMP Photo Sphere metadata.
+
+Google Photos is more constrained. Since the March 31, 2025 API changes, the Library API is aimed at managing photos and videos created by the app. Access to media not uploaded by the app moved toward explicit user selection through the Picker API. For Spherisphy this suggests:
+
+- Upload app-created exports to Google Photos using the Google Photos Library API.
+- Import existing Google Photos items through the Android photo picker or Google Photos Picker API when the user explicitly selects them.
+- Avoid promising unrestricted browsing of the user's whole Google Photos account.
+- Keep a local app gallery as the reliable primary library.
+
+Device storage is straightforward in principle. Android MediaStore supports saving app-created images into shared media storage, and Android 10+ does not require broad storage permission for photos the app itself creates. Reading unrelated images should go through the Android photo picker where possible.
+
+### Technical Feasibility
+
+The app is buildable, but not small.
+
+The feasible first release is an Android-native app using CameraX or Camera2, Android SensorManager, fused location/orientation data, MediaStore, a local database, and a GPU-backed viewer. Capture can start with a structured grid of overlapping photos around the user, using sensor fusion to suggest the next target direction. The app should save all source frames plus a generated equirectangular master so reprocessing can improve over time.
+
+The hard engineering work is the stitching pipeline:
+
+- Feature detection and image matching across overlapping camera frames.
+- Sensor-informed initial pose estimates from gyroscope, accelerometer, magnetometer/compass, and rotation vector.
+- Exposure/white-balance compensation across frames.
+- Seam selection, blending, and ghost handling for moving objects.
+- Horizon correction and nadir/zenith handling.
+- Robust behavior across ultra-wide, wide, and telephoto lenses.
+
+The Tiny World feature is easier if it is treated as a reprojection of an equirectangular master using stereographic projection. The reverse direction is only lossless when the original equirectangular master is retained. A flattened Tiny World export alone does not contain enough information to reconstruct a full PhotoSphere.
+
+### PWA Versus Android Native
+
+A PWA could be useful for viewing and reprojection experiments, but a Play Store Android-native app is the better primary route.
+
+PWAs can use WebGL and libraries like Photo Sphere Viewer, Pannellum, or Marzipano for interactive viewing. Some browsers expose camera, geolocation, orientation, and motion APIs, but capture permissions, sensor availability, background behavior, file access, performance, and Play Store distribution are less predictable than native Android. A PWA or web module might still be valuable later as a browser-based gallery/export companion, or wrapped inside a native shell for the viewer only.
+
+### Product Shape
+
+The first useful app could be:
+
+- Capture: guided sphere capture with orientation targets, overlap hints, exposure lock, and live progress.
+- Process: stitch source frames into an equirectangular PhotoSphere master, store source frames for later reprocessing, and generate preview thumbnails.
+- Browse: local gallery of Spherisphy captures and imports.
+- Reproject: interactive PhotoSphere view, Tiny World view, wormhole/inverted view, horizon rotation, zoom, roll, and export.
+- Save: write masters and exported projections to device storage.
+- Publish: upload app-created images to Google Photos, share/export to Google Maps manually, and later add Street View Publish API support.
+
+### Design Prerequisites
+
+Before the first line of app code, the product needs a few design decisions pinned down. These are not visual-polish questions; they determine whether the app can feel trustworthy, stable, and feasible.
+
+The app should be designed around a local-first library. Google Photos and Google Maps should feel like export destinations, not the place where the app's primary state lives. The local library should keep a durable record for every capture: source frame set, stitched equirectangular master, exported Tiny World variants, capture metadata, processing status, and publishing status. That gives the user confidence that a failed upload or later API change will not strand their work.
+
+The permission model should be contextual and progressive. Android guidance says runtime permissions should be requested when the user starts the feature that needs them, not at app startup. For Spherisphy this means:
+
+- Camera permission appears when the user starts a new capture.
+- Location permission appears when the user enables map-ready geotagging or publishing metadata.
+- Photo/media access is avoided for app-created images and handled through MediaStore; imports from other apps or Google Photos should use the Android photo picker where possible.
+- Google account authorization appears only when the user chooses Google Photos upload or Google Maps/Street View publishing.
+- Motion sensors should be used while capture is visible and active, with no background collection.
+
+The app should also be useful when optional permissions are denied. Without location, the user can still create and save PhotoSpheres and Tiny Worlds, but exports will not be map-ready until location is added manually. Without Google sign-in, the user can still save locally and share files. Without photo-library access, the user can still use the Spherisphy library and select individual external images through the picker.
+
+The minimum viable technical surface should include:
+
+- Camera preview and capture with exposure/focus controls.
+- Motion/orientation sensor fusion for capture guidance.
+- Foreground-only location capture for optional geotagging.
+- Local storage with app-owned image access.
+- Equirectangular image viewer.
+- Stereographic Tiny World renderer/exporter.
+- Processing queue with resumable stitch/reproject jobs.
+- Metadata editor for title, location, orientation, projection, and publishing readiness.
+
+The minimum viable design surface should include:
+
+- A home/gallery view that opens straight into existing work, not a marketing page.
+- One primary action: start capture or import image.
+- A capture screen that is mostly camera preview, with a sphere coverage guide and minimal controls.
+- A processing screen that explains progress without pretending stitching is instant.
+- A viewer/editor that treats PhotoSphere and Tiny World as modes of the same master image.
+- A publish/export sheet that separates local save, Google Photos upload, Google Maps publish/share, and generic Android share.
+
+### Workflow Investigation
+
+The intended user journey has six major phases.
+
+1. First launch and setup
+
+The first launch should be short and practical. The app should show the local gallery, empty if new, with a primary capture action and a secondary import action. It should not ask for camera, location, files, or Google sign-in immediately. A small first-run note can explain that capture needs camera access, map-ready exports need location, and cloud publishing is optional.
+
+The empty state should offer:
+
+- Capture PhotoSphere.
+- Import 360 image.
+- Open sample panorama, if bundled later.
+
+2. Capture preparation
+
+When the user taps Capture PhotoSphere, the app checks the environment and requested capture mode. This screen should detect available cameras, gyroscope, accelerometer, magnetometer/compass, rotation vector, current battery state, storage availability, and whether location is enabled. It should warn without blocking where possible.
+
+The ideal prep checklist:
+
+- Camera ready.
+- Motion tracking ready.
+- Compass quality acceptable or needs calibration.
+- Enough free storage for source frames and stitched output.
+- Location available, optional.
+- Lighting stable enough for exposure lock, optional but recommended.
+
+The user should be able to choose:
+
+- Capture quality: standard, high, archival.
+- Lens: main wide, ultra-wide if supported, manual choice if multiple lenses are reliable.
+- Save source frames: always, ask, or storage saver.
+- Location tagging: on/off.
+- Exposure mode: auto, locked after first frame, manual compensation.
+
+3. Guided capture
+
+The capture UI should behave like a calm instrument panel. The camera preview takes the whole screen. On top of it, the app overlays a sphere coverage guide: target dots or tiles arranged around yaw/pitch positions. The user turns slowly and aligns a reticle with each target. A frame is captured automatically when alignment, stability, and overlap are acceptable, or manually if the user chooses.
+
+The screen needs:
+
+- Center reticle and next target marker.
+- Coverage mini-map showing captured, missing, and weak-overlap regions.
+- Horizon/level indicator.
+- Stability indicator based on gyro movement.
+- Exposure lock status.
+- Undo last frame.
+- Pause/resume capture.
+- Finish when enough coverage exists.
+- Cancel with a clear "keep source frames?" choice.
+
+Capture should prefer fewer, better prompts over dense instruction text. The app can use short states: Move slower, Hold steady, Aim higher, Recapture weak area, Too dark, Exposure shifted, Complete. These states should be visible but not block the preview.
+
+The capture flow should support failure recovery:
+
+- If compass quality drops, continue with gyro-relative orientation and flag metadata for review.
+- If a frame is blurred, prompt for recapture.
+- If a moving object crosses a frame, mark it as likely ghosting risk.
+- If capture is interrupted, save a draft session.
+- If coverage is incomplete, allow partial save but label it as not map-ready.
+
+4. Processing and quality review
+
+After capture, processing should be explicit. Stitching can be slow, so the app needs a queue rather than a single spinner. The processing screen should show stages:
+
+- Align frames.
+- Match overlap.
+- Balance exposure and white balance.
+- Blend seams.
+- Fill/flag zenith and nadir gaps.
+- Generate equirectangular master.
+- Generate preview projections.
+- Validate PhotoSphere metadata.
+
+The review screen should show the equirectangular master first, with quality flags:
+
+- Resolution and aspect ratio.
+- Location present or missing.
+- Compass/orientation confidence.
+- Horizon quality.
+- Stitching confidence.
+- Gap/blur/ghosting warnings.
+- Google Maps readiness against known requirements.
+
+The user should be able to fix what can be fixed:
+
+- Rotate horizon.
+- Adjust heading/north.
+- Crop or pad only if the output remains valid 2:1.
+- Re-run stitch with alternate seam/blend settings.
+- Hide nadir with blur/patch if allowed.
+- Add or edit location.
+- Save as draft, master, or export.
+
+5. Local browsing and reprojection
+
+The gallery should be the emotional center of the app. It should make later re-use pleasant, not merely list files. Each item should show a thumbnail, projection badges, capture date, location status, and publish status. Filters should include Drafts, Masters, Tiny Worlds, Map-ready, Uploaded, Needs review, and Imports.
+
+Opening an item should launch the viewer/editor. The main viewer modes:
+
+- PhotoSphere: interactive immersive viewer with pan, tilt, zoom, gyro look-around toggle, compass overlay, and reset view.
+- Tiny World: stereographic projection with planet/wormhole toggle, roll, zoom, center point, horizon bend, rotation, and field-of-view controls.
+- Equirectangular: flat technical view for checking seams, metadata, and map readiness.
+
+The bonus "on-the-fly image browser" should be designed as a non-destructive projection workspace. The master image remains untouched. Each Tiny World or adjusted PhotoSphere is a saved variant linked back to the master. If the user imports a Tiny World-only flat image, the app should treat it as a flat image and not pretend it can reconstruct the original sphere.
+
+6. Export and publish
+
+Export should be a bottom sheet or dedicated publish screen with four distinct choices:
+
+- Save to device: writes the selected master or projection to shared media storage.
+- Share: opens Android share for any exported image.
+- Upload to Google Photos: uploads app-created export through the Google Photos Library API, with clear status.
+- Publish to Google Maps/Street View: either hand off to Google Maps/manual upload in early versions, or use the Street View Publish API later.
+
+For Google Maps, the app should run a readiness check before publishing:
+
+- Equirectangular 2:1 output.
+- At least 3840 x 1920.
+- File under 75 MB.
+- GPS location present.
+- Heading/orientation present or user-reviewed.
+- No known major stitch/gap errors.
+- User confirms imagery is appropriate for public Maps contribution.
+
+Publishing status should be visible after the export:
+
+- Local only.
+- Saved to device.
+- Uploaded to Google Photos.
+- Submitted to Google Maps.
+- Processing on Google Maps.
+- Published.
+- Failed, with retry.
+
+### Probable User Interface
+
+The likely UI architecture is a bottom-navigation Android app with four destinations:
+
+- Library: local gallery and capture history.
+- Capture: camera-driven PhotoSphere capture.
+- Create: import/reproject/export workspace.
+- Settings: permissions, storage, accounts, quality defaults, privacy, and diagnostics.
+
+The Library screen should use a dense but friendly grid. The top app bar can contain search, filter, sort, and account/status. A prominent capture button should be available, likely a floating action button because capture is the primary creation action. Import can sit beside it in a small action menu or as a secondary button in the empty state.
+
+The Capture screen should hide bottom navigation while active. It should use the whole display for preview, with a top strip for close, flash/exposure, lens, and help, and a bottom strip for shutter/auto-capture, undo, pause, and finish. The sphere coverage mini-map should be visible but compact. Accessibility matters here: indicators should not rely on color alone, and capture state should be readable through labels/haptics.
+
+The Processing screen should look like a job card list, not a modal trap. Users should be able to leave processing and return later. Each job shows thumbnail, current stage, elapsed time, estimated remaining time if meaningful, and actions for pause, cancel, or view draft.
+
+The Viewer/Editor screen should have a full-bleed image viewer with a compact mode switch: Sphere, Tiny World, Flat. Editing controls should slide up only when needed. For Tiny World, the most important controls are center, zoom, twist/roll, invert, and export. For PhotoSphere, the important controls are heading, horizon, gyro toggle, metadata, and export.
+
+The Publish/Export UI should be conservative and explicit. It should never make a public upload feel like a casual save. Google Maps publishing especially needs a preflight page with a preview, location, account, visibility implication, and readiness warnings. Google Photos upload can be lighter, but still should clearly say which account is being used and whether the item is app-created.
+
+The Settings screen should include:
+
+- Capture defaults: quality, source-frame retention, auto-capture sensitivity, exposure lock, lens preference.
+- Storage: local library size, source frames size, cache size, cleanup controls.
+- Accounts: Google Photos connection, Google Maps/Street View publishing connection.
+- Privacy: location tagging default, metadata export choices, permission status.
+- Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
+- About: version 0.0.1, license, acknowledgements.
+
+### Suggested Setup-First UI Workflow
+
+Although Android and Google Play guidance generally favors requesting permissions in context, Spherisphy can still offer an immediate setup path if it is framed as a friendly readiness flow. The app cannot force permissions or account access; the user must grant them through Android and Google consent screens. The design goal is to make the fastest route obvious: "Get Spherisphy ready now," while still allowing the user to skip and use local features.
+
+The setup-first flow should use simple splash screens with one clear action per screen.
+
+1. Welcome splash
+
+Purpose: establish the app's promise in one glance.
+
+Primary text: Create PhotoSpheres and Tiny Worlds.
+
+Supporting text: Capture, reproject, save, and publish 360 images from your phone.
+
+Buttons:
+
+- Set up Spherisphy.
+- Browse without setup.
+
+2. Readiness splash
+
+Purpose: explain why the app asks for several sensitive capabilities.
+
+Primary text: A few things make the sphere work.
+
+Supporting text: Camera captures the scene, motion sensors guide the sphere, location prepares map-ready images, and Google accounts enable optional upload.
+
+Buttons:
+
+- Grant essentials.
+- Choose one by one.
+
+3. Camera permission screen
+
+Purpose: unlock capture.
+
+UI:
+
+- Large camera icon.
+- Short copy: Camera access lets Spherisphy capture the frames for your PhotoSphere.
+- Button: Allow camera.
+- Secondary: Skip for now.
+
+Result:
+
+- If granted, continue.
+- If denied, mark Capture as unavailable and continue to import/gallery setup.
+
+4. Motion/orientation readiness screen
+
+Purpose: check sensors without making the screen feel technical.
+
+UI:
+
+- Simple animated phone-orbit graphic.
+- Status chips: Gyroscope, Accelerometer, Compass, Rotation vector.
+- Button: Check motion tracking.
+- Secondary: Continue anyway.
+
+Result:
+
+- If sensors are present, show Ready.
+- If compass quality is weak, offer Calibrate compass.
+- If a sensor is missing, continue with reduced capture guidance.
+
+5. Location permission screen
+
+Purpose: enable map-ready images.
+
+UI:
+
+- Map pin over a small sphere thumbnail.
+- Short copy: Location helps Google Maps place your PhotoSphere correctly. You can still create images without it.
+- Buttons: Allow location, Use without location.
+
+Preferred permission:
+
+- Foreground location only.
+- Precise location if the user wants Google Maps publishing.
+- Approximate location is acceptable for private/local organization but should be flagged as not ideal for Maps.
+
+6. Local storage setup screen
+
+Purpose: reassure the user that their work is saved on the device first.
+
+UI:
+
+- Folder/gallery icon.
+- Short copy: Spherisphy saves your masters and exports locally first.
+- Buttons: Create local library, Change later.
+
+Notes:
+
+- App-created media should use app-owned storage and MediaStore.
+- Broad photo/video permission should be avoided unless future requirements truly need it.
+- Imports should use the Android photo picker.
+
+7. Google account setup screen
+
+Purpose: connect Google Photos and Google Maps publishing after core device permissions.
+
+UI:
+
+- Two account cards:
+- Google Photos: Upload app-created exports.
+- Google Maps / Street View: Publish map-ready PhotoSpheres.
+
+Buttons:
+
+- Connect Google.
+- Skip cloud setup.
+
+Result:
+
+- If connected, show the selected Google account and enabled destinations.
+- If skipped, local save and Android share remain available.
+
+8. Setup complete splash
+
+Purpose: land the user with confidence and next steps.
+
+Primary text: Ready to make a sphere.
+
+Status checklist:
+
+- Camera ready.
+- Motion tracking ready.
+- Local library ready.
+- Location ready or skipped.
+- Google upload ready or skipped.
+
+Buttons:
+
+- Capture PhotoSphere.
+- Import 360 image.
+- Open Library.
+
+This setup-first approach keeps the interface friendly while satisfying the desire to grant permissions and accounts immediately. The important product rule is that every skipped or denied item must degrade gracefully: the app should never punish the user with a dead end.
+
+### Simple Function Buttons
+
+The home screen after setup should avoid clutter. A user should be able to understand the app from four large function buttons:
+
+- Capture: start a guided PhotoSphere capture.
+- Import: choose an existing 360 image or panorama.
+- Browse: open the local Spherisphy library.
+- Create Tiny World: open the reprojection editor from a selected master or imported image.
+
+Secondary actions can live behind smaller icons or menus:
+
+- Save to device.
+- Upload to Google Photos.
+- Publish to Google Maps.
+- Share.
+- Settings.
+
+The button language should remain concrete. Prefer Capture, Import, Browse, Create, Save, Upload, Publish, and Share over abstract words like Workspace, Assets, Pipeline, or Render.
+
+### Design Risks
+
+The biggest UX risk is over-promising capture quality. The app should be honest about draft, partial, and map-ready states. A beautiful Tiny World can tolerate flaws that Google Maps should reject, so the UI must separate creative exports from public 360 imagery.
+
+The second risk is permission fatigue. Asking for camera, location, media, motion, and Google account access in one clump would feel alarming. Contextual requests and graceful degradation are central to the design.
+
+The third risk is losing the user during capture. PhotoSphere capture is physical: the user is rotating, aiming, holding the phone steady, and trying not to lose their place. The UI should behave like a guide, not a control panel.
+
+The fourth risk is treating Tiny World and PhotoSphere as reversible when they are not always reversible. The app's data model and UI should make "master" and "exported variant" clear.
+
+The fifth risk is Google platform dependency. Direct publishing features should be modular, so a Google API policy change does not break local creation, browsing, and export.
+
+### Open Questions
+
+- Should version 0.1 aim for high-quality stitching, or should it start with import/reprojection/gallery and add capture later?
+- Is the project willing to depend on native image-processing libraries such as OpenCV, Hugin/Panorama Tools-inspired algorithms, or commercial SDKs if open-source quality is insufficient?
+- Should Google Maps publishing be direct through Street View Publish API from the start, or should the first release hand off exported Photo Spheres to Google Maps?
+- What minimum Android version should be supported? Android 13+ has better photo-picker behavior with Google Photos cloud media, but a wider minimum increases reach.
+- Should the app preserve all capture frames by default, or offer a storage-saving mode that keeps only the stitched master?
+- Should the first UI expose advanced stitching controls, or keep them behind a diagnostics/advanced panel?
+- Should the app include a bundled sample panorama so users can try Tiny World mode before granting camera permission?
+- Should incomplete captures be allowed as creative Tiny World drafts even when they are not valid PhotoSpheres?
+
+## Research Sources
+
+- Google Maps Help: Create and publish Photo Spheres to Google Maps: https://support.google.com/maps/answer/7012050
+- Google Street View Publish API: https://developers.google.com/streetview/publish
+- Google Street View contribution guidance: https://www.google.com/streetview/contribute/
+- Google Photos API updates: https://developers.google.com/photos/support/updates
+- Google Photos upload media guide: https://developers.google.com/photos/library/guides/upload-media
+- Google Photos Picker API: https://developers.google.com/photos/picker/guides/get-started-picker
+- Android MediaStore and shared storage: https://developer.android.com/training/data-storage/shared/media
+- Android photo picker with Google Photos: https://support.google.com/photos/answer/14442861
+- Android CameraX configuration and exposure compensation: https://developer.android.com/media/camera/camerax/configuration
+- Android sensors overview: https://developer.android.com/develop/sensors-and-location/sensors/sensors_overview
+- Android permissions overview: https://developer.android.com/guide/topics/permissions/overview
+- Android runtime permission requests: https://developer.android.com/training/permissions/requesting
+- Android location permissions: https://developer.android.com/develop/sensors-and-location/location/permissions
+- Android core app quality guidelines: https://developer.android.com/docs/quality-guidelines/core-app-quality
+- Google Play policies: https://developer.android.com/distribute/play-policies
+- Material Design floating action button guidance: https://m3.material.io/components/floating-action-button/guidelines
+- Photo Sphere Viewer: https://photo-sphere-viewer.js.org/
+- Pannellum: https://pannellum.org/
+- Marzipano: https://www.marzipano.net/
+- Panorra 360 on Google Play: https://play.google.com/store/apps/details?id=com.gothru.panorra
+- Go Street View Photo Sphere on Google Play: https://play.google.com/store/apps/details?id=com.gostreetview.camera
+- 360 Photo Cam on Google Play: https://play.google.com/store/apps/details?id=com.dospace.photo360
+- Tiny Planet - Global Photo on Google Play: https://play.google.com/store/apps/details?id=globe.tiny.planet.globalphoto.tinyplanet
+
+## Development Workflow and Timeline
+
+This roadmap assumes the project starts from no application code and grows through small, testable milestones. The order is intentionally local-first: prove image handling, projection, and storage before depending on Google account flows or public publishing.
+
+### Phase 0: Repository and Product Groundwork
+
+Goal: prepare the project without committing to the full implementation too early.
+
+Work:
+
+- Choose the Android baseline: Kotlin, Jetpack Compose, CameraX/Camera2 decision, minimum Android version, and target Play Store requirements.
+- Choose a local image metadata model: capture session, source frame, equirectangular master, exported variant, location metadata, and publish status.
+- Decide whether stitching research starts with OpenCV or another native/image-processing library.
+- Define sample assets for testing equirectangular viewing and Tiny World reprojection.
+- Create a privacy and permissions matrix before app code begins.
+
+Exit criteria:
+
+- A clear app architecture note.
+- A local-first data model.
+- A short list of candidate image-processing libraries.
+- A decision on minimum Android version.
+
+### Phase 1: Barebones Technology Proof of Concept
+
+Goal: prove the core image manipulation idea with the least possible UI.
+
+Work:
+
+- Load a bundled equirectangular test image.
+- Display it in a basic interactive PhotoSphere viewer.
+- Reproject it into Tiny World/stereographic view.
+- Allow simple manipulation: rotate, zoom, invert, reset.
+- Export the current projection as a JPEG or PNG into app storage.
+- Save a generated thumbnail.
+
+Exit criteria:
+
+- One test panorama can be viewed as PhotoSphere.
+- The same panorama can be transformed into Tiny World.
+- The transformed output can be saved and reopened.
+
+### Phase 2: Local Storage and Image Library
+
+Goal: make image work durable and user-visible.
+
+Work:
+
+- Build the local Spherisphy library.
+- Store masters, variants, thumbnails, and metadata.
+- Save app-created images through MediaStore where appropriate.
+- Import external images through the Android photo picker.
+- Add gallery filters for Masters, Tiny Worlds, Imports, Drafts, and Saved.
+- Add delete, rename/title, duplicate/export variant, and metadata view.
+
+Exit criteria:
+
+- A user can import an image, create a Tiny World variant, save it, close the app, reopen, and continue working.
+- App-created images are visible in the device gallery when exported.
+- The app does not require broad photo-library permission for normal use.
+
+### Phase 3: Capture Shell and Sensor Readiness
+
+Goal: prove the phone can guide a capture before attempting full stitching.
+
+Work:
+
+- Create the setup-first splash workflow.
+- Request camera/location/account permissions through friendly, skippable screens.
+- Build camera preview with simple still capture.
+- Read accelerometer, gyroscope, compass/magnetometer, and rotation vector where available.
+- Show sensor readiness and compass calibration status.
+- Save captured frames into a draft capture session.
+- Save foreground location metadata when enabled.
+
+Exit criteria:
+
+- A user can grant camera/location, capture frames, and see the draft session in the library.
+- Sensor status is visible and does not block unsupported devices unnecessarily.
+- Location remains optional.
+
+### Phase 4: Guided PhotoSphere Capture Prototype
+
+Goal: turn raw camera capture into a structured sphere capture experience.
+
+Work:
+
+- Add sphere target grid around yaw/pitch positions.
+- Add reticle alignment, stability detection, and coverage progress.
+- Support manual capture first, then auto-capture when alignment is good.
+- Add undo, pause/resume, cancel, and finish.
+- Store each frame with approximate orientation, timestamp, exposure data, and location/session metadata.
+- Add draft recovery if capture is interrupted.
+
+Exit criteria:
+
+- A user can complete a guided capture session with enough overlapping frames for stitching experiments.
+- The app can show missing/weak coverage areas.
+- Capture drafts survive app interruption.
+
+### Phase 5: Stitching and Equirectangular Master Generation
+
+Goal: produce the first real app-created PhotoSphere master.
+
+Work:
+
+- Build or integrate a stitching pipeline.
+- Use sensor orientation as an initial pose estimate.
+- Match features across overlapping frames.
+- Estimate alignment and correct drift.
+- Balance exposure and white balance between frames.
+- Blend seams and flag weak areas.
+- Generate a 2:1 equirectangular JPEG master.
+- Add basic PhotoSphere/XMP-style metadata.
+- Validate output against Google Maps readiness requirements.
+
+Exit criteria:
+
+- At least one real phone capture produces a usable equirectangular master.
+- The master can be viewed, reprojected, saved, and exported.
+- The app identifies non-map-ready captures instead of silently treating them as publishable.
+
+### Phase 6: Review, Repair, and Creative Editing
+
+Goal: let users improve imperfect outputs and make beautiful variants.
+
+Work:
+
+- Add quality review screen with resolution, aspect ratio, horizon, stitch confidence, gap warnings, and location status.
+- Add heading/north adjustment.
+- Add horizon rotation and simple leveling.
+- Add nadir/zenith patch or blur options if feasible.
+- Add alternate Tiny World controls: center, zoom, roll, planet/wormhole, field of view.
+- Add non-destructive saved variants linked to the master.
+
+Exit criteria:
+
+- Users can fix common metadata/orientation issues without reprocessing the whole session.
+- Creative Tiny World export is reliable even when Google Maps readiness is not.
+- Master and variant relationships are clear in the UI.
+
+### Phase 7: Google Photos Upload
+
+Goal: add optional cloud upload for app-created exports.
+
+Work:
+
+- Add Google sign-in/account connection for upload features.
+- Use the Google Photos Library API for app-created media uploads.
+- Keep imports from Google Photos user-selected through the picker model.
+- Add upload progress, retry, and failure states.
+- Store uploaded status and account destination metadata.
+
+Exit criteria:
+
+- A user can upload an app-created master or Tiny World export to Google Photos.
+- The app clearly shows which account was used.
+- Failed uploads remain safely available locally.
+
+### Phase 8: Google Maps Publishing Preparation
+
+Goal: prepare map-ready PhotoSpheres and user-facing publish checks.
+
+Work:
+
+- Add Google Maps readiness preflight.
+- Validate 2:1 aspect ratio, minimum 3840 x 1920 resolution, file size under 75 MB, location, heading, and stitch warnings.
+- Add metadata editor for location and heading review.
+- Add a manual export/share-to-Google-Maps path for early releases.
+- Document the expected Google Maps processing delay and public contribution implications.
+
+Exit criteria:
+
+- The user can produce a map-ready export and hand it off manually.
+- The app prevents obvious invalid submissions from being labeled ready.
+- Local publish status distinguishes "exported for Maps" from "published on Maps."
+
+### Phase 9: Direct Street View Publish API Integration
+
+Goal: submit app-created 360 imagery directly to Google Maps/Street View where policy and API access allow.
+
+Work:
+
+- Complete Street View Publish API authorization and OAuth scopes.
+- Upload 360 photos with required metadata.
+- Handle API errors, quota issues, retries, and user cancellation.
+- Track submitted, processing, published, failed, and removed states.
+- Add optional linking/connectivity for tours if this becomes a core use case.
+- Add clear public-publishing confirmation before submission.
+
+Exit criteria:
+
+- A user can submit a validated PhotoSphere from Spherisphy to Google Maps/Street View.
+- The app records submission status and exposes retry/failure details.
+- Public upload is never confused with local save or private Google Photos upload.
+
+### Phase 10: Play Store Readiness and Beta
+
+Goal: turn the prototype into a testable Play Store app.
+
+Work:
+
+- Run privacy, permissions, data safety, and Play policy review.
+- Add crash reporting and performance diagnostics without logging sensitive image/location data.
+- Test on multiple camera/sensor combinations.
+- Optimize memory use for large panoramas.
+- Add accessibility pass for capture controls, labels, color contrast, and haptics.
+- Prepare closed testing release.
+- Collect real-world capture examples and failure cases.
+
+Exit criteria:
+
+- Closed beta users can capture, save, reproject, upload, and attempt Maps-ready export.
+- Known device limitations are documented.
+- Data safety and permission justifications are ready for Play Console.
+
+### Phase 11: Public Release and Iteration
+
+Goal: launch carefully, then improve quality from real captures.
+
+Work:
+
+- Release a conservative 1.0 focused on local creation, save/export, reprojection, Google Photos upload, and Maps-ready export or direct Maps publishing if stable.
+- Improve stitching based on real-world failures.
+- Add capture presets for indoor, outdoor, low light, and fast creative Tiny World.
+- Add batch export and cloud backup options only if privacy and API limits permit.
+- Explore web/PWA companion for viewing and sharing if useful.
+
+Exit criteria:
+
+- Users can reliably create and keep their images without cloud dependency.
+- Google integrations enhance the product but do not define whether it works.
+- The app has a feedback loop for capture quality, device support, and publishing success.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
