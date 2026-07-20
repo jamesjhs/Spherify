@@ -1,8 +1,8 @@
-# Spherisphy
+# Spherify
 
 Version: 0.0.1
 
-Spherisphy is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny World images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
+Spherify is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny World images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
 This repository currently contains planning notes only. No application code has been started.
 
@@ -27,7 +27,7 @@ When Phase 1 app code begins, the repository should contain at least:
 - A debug build variant, usually available as `app:assembleDebug`.
 - A runnable launcher activity.
 
-The goal of this runbook is to install and run the developer/debug version of Spherisphy from VS Code in two places:
+The goal of this runbook is to install and run the developer/debug version of Spherify from VS Code in two places:
 
 - A physically linked Android phone or tablet connected by USB.
 - An Android Emulator virtual device, which acts as a sandboxed developer device.
@@ -45,7 +45,7 @@ Install these before attempting either run path.
 7. Install the Android SDK Platform for the target API level chosen by the project.
 8. Install the Android Emulator package if emulator testing is needed.
 9. Install Android command-line tools so `sdkmanager`, `avdmanager`, `adb`, and `emulator` are available.
-10. Keep Android Studio installed if desired as the provider of the Android SDK and emulator backend, but do not use Android Studio as the IDE for normal Spherisphy development.
+10. Keep Android Studio installed if desired as the provider of the Android SDK and emulator backend, but do not use Android Studio as the IDE for normal Spherify development.
 11. On Windows, install the Google USB Driver if using a Google Pixel or another compatible device.
 12. On Windows, install the device manufacturer's USB driver if using a non-Google device that needs one.
 13. Make sure there is enough free disk space for VS Code, Android SDK packages, Gradle caches, emulator images, build outputs, and app data.
@@ -82,13 +82,13 @@ Useful command-line tools:
 On Windows PowerShell, run project commands from the repository root:
 
 ```powershell
-cd C:\GitHub\Spherisphy
+cd C:\GitHub\Spherify
 ```
 
 On macOS or Linux, run project commands from wherever the repository was cloned:
 
 ```bash
-cd /path/to/Spherisphy
+cd /path/to/Spherify
 ```
 
 ### First Repository Check
@@ -123,7 +123,7 @@ ls
 2. Choose `File > Open Folder`.
 3. Browse to the local repository folder.
 4. Select the repository root, not the `app/` directory.
-5. Trust the workspace only if this is your local checkout of Spherisphy.
+5. Trust the workspace only if this is your local checkout of Spherify.
 6. Open the VS Code terminal with ``Ctrl+` ``.
 7. Confirm the terminal is at the repository root.
 8. If it is not, change into the repository root.
@@ -212,7 +212,7 @@ The exact API level and build-tools version should match the future project conf
 
 ### Run on a Physically Linked Android Device
 
-This path installs and runs the debug version of Spherisphy on a real phone or tablet connected to the development computer.
+This path installs and runs the debug version of Spherify on a real phone or tablet connected to the development computer.
 
 Use this path when testing:
 
@@ -223,7 +223,7 @@ Use this path when testing:
 - Real performance and thermal behavior.
 - Real permission prompts.
 
-The emulator is useful, but it cannot fully prove Spherisphy's capture experience because PhotoSphere capture depends heavily on physical camera and motion sensors.
+The emulator is useful, but it cannot fully prove Spherify's capture experience because PhotoSphere capture depends heavily on physical camera and motion sensors.
 
 #### Prepare the Android Device
 
@@ -341,12 +341,12 @@ adb -s DEVICE_SERIAL install -r app/build/outputs/apk/debug/app-debug.apk
 
 6. Start the app from the launcher on the phone, or start it with an `adb shell am start` command after the package name and launch activity are known.
 
-The package name is expected to be something like `com.spherisphy.app`, but the actual package name must come from the future Android manifest or Gradle namespace.
+The package name is expected to be something like `com.spherify.app`, but the actual package name must come from the future Android manifest or Gradle namespace.
 
 Example only:
 
 ```bash
-adb shell monkey -p com.spherisphy.app 1
+adb shell monkey -p com.spherify.app 1
 ```
 
 7. Read device logs while testing.
@@ -362,7 +362,7 @@ adb logcat
 Optional filtered logs after the final package name is known:
 
 ```bash
-adb logcat --pid=$(adb shell pidof -s com.spherisphy.app)
+adb logcat --pid=$(adb shell pidof -s com.spherify.app)
 ```
 
 On Windows PowerShell, use the simpler unfiltered `adb logcat` first unless a project script provides a reliable filtered command.
@@ -377,7 +377,7 @@ Use this when the app has bad local state, stale permissions, or old test data.
 Example only:
 
 ```bash
-adb shell pm clear com.spherisphy.app
+adb shell pm clear com.spherify.app
 ```
 
 3. Reopen the app.
@@ -386,12 +386,12 @@ adb shell pm clear com.spherisphy.app
 To uninstall the debug app:
 
 ```bash
-adb uninstall com.spherisphy.app
+adb uninstall com.spherify.app
 ```
 
 ### Run in an Android Emulator Sandbox from VS Code
 
-This path installs and runs the debug version of Spherisphy inside an Android Virtual Device.
+This path installs and runs the debug version of Spherify inside an Android Virtual Device.
 
 Use this path when testing:
 
@@ -432,12 +432,12 @@ sdkmanager "system-images;android-35;google_apis;x86_64"
 avdmanager list device
 ```
 
-7. Create an AVD with a clear Spherisphy name.
+7. Create an AVD with a clear Spherify name.
 
 Example:
 
 ```bash
-avdmanager create avd -n Spherisphy_API_35_Pixel -k "system-images;android-35;google_apis;x86_64" -d pixel_7
+avdmanager create avd -n Spherify_API_35_Pixel -k "system-images;android-35;google_apis;x86_64" -d pixel_7
 ```
 
 8. If `avdmanager` asks whether to create a custom hardware profile, answer `no` unless the project needs special hardware settings.
@@ -466,7 +466,7 @@ emulator -list-avds
 4. Start the chosen emulator.
 
 ```bash
-emulator -avd Spherisphy_API_35_Pixel
+emulator -avd Spherify_API_35_Pixel
 ```
 
 5. Leave the terminal open while the emulator runs.
@@ -536,7 +536,7 @@ The `-e` flag targets the emulator. Use it when a physical device is also connec
 Example only:
 
 ```bash
-adb -e shell monkey -p com.spherisphy.app 1
+adb -e shell monkey -p com.spherify.app 1
 ```
 
 6. Read emulator logs.
@@ -556,7 +556,7 @@ adb -e emu kill
 ```
 
 ```bash
-emulator -avd Spherisphy_API_35_Pixel -wipe-data
+emulator -avd Spherify_API_35_Pixel -wipe-data
 ```
 
 The first command closes the running emulator. The second starts the AVD with its data wiped.
@@ -565,16 +565,16 @@ The first command closes the running emulator. The second starts the AVD with it
 
 Use this when you want a clean developer app environment.
 
-To clear only Spherisphy's app data:
+To clear only Spherify's app data:
 
 ```bash
-adb -e shell pm clear com.spherisphy.app
+adb -e shell pm clear com.spherify.app
 ```
 
 To uninstall the debug app:
 
 ```bash
-adb -e uninstall com.spherisphy.app
+adb -e uninstall com.spherify.app
 ```
 
 To wipe the whole emulator:
@@ -583,7 +583,7 @@ To wipe the whole emulator:
 2. Start the emulator with `-wipe-data`.
 
 ```bash
-emulator -avd Spherisphy_API_35_Pixel -wipe-data
+emulator -avd Spherify_API_35_Pixel -wipe-data
 ```
 
 3. Wait for the emulator to boot.
@@ -593,7 +593,7 @@ Wiping the emulator deletes its apps, local files, settings, and test state. It 
 
 ### Permission Checks During Developer Runs
 
-Spherisphy is expected to request permissions contextually, not all at startup. During testing, check each permission at the moment the app needs it.
+Spherify is expected to request permissions contextually, not all at startup. During testing, check each permission at the moment the app needs it.
 
 Physical device checks:
 
@@ -750,9 +750,9 @@ The gap seems real: the market has viewers, editors, uploaders, and capture apps
 
 ### Google Platform Reality
 
-Google Maps publishing is possible, but must be treated carefully. Google says Photo Spheres can be uploaded with the Android Google Maps app or browser, and developers can create tools with the Street View Publish API. The API can publish 360 photos to Google Maps with position, orientation, and connectivity metadata. That is promising for Spherisphy, especially if each image stores GPS, compass heading, capture time, and XMP Photo Sphere metadata.
+Google Maps publishing is possible, but must be treated carefully. Google says Photo Spheres can be uploaded with the Android Google Maps app or browser, and developers can create tools with the Street View Publish API. The API can publish 360 photos to Google Maps with position, orientation, and connectivity metadata. That is promising for Spherify, especially if each image stores GPS, compass heading, capture time, and XMP Photo Sphere metadata.
 
-Google Photos is more constrained. Since the March 31, 2025 API changes, the Library API is aimed at managing photos and videos created by the app. Access to media not uploaded by the app moved toward explicit user selection through the Picker API. For Spherisphy this suggests:
+Google Photos is more constrained. Since the March 31, 2025 API changes, the Library API is aimed at managing photos and videos created by the app. Access to media not uploaded by the app moved toward explicit user selection through the Picker API. For Spherify this suggests:
 
 - Upload app-created exports to Google Photos using the Google Photos Library API.
 - Import existing Google Photos items through the Android photo picker or Google Photos Picker API when the user explicitly selects them.
@@ -790,7 +790,7 @@ The first useful app could be:
 
 - Capture: guided sphere capture with orientation targets, overlap hints, exposure lock, and live progress.
 - Process: stitch source frames into an equirectangular PhotoSphere master, store source frames for later reprocessing, and generate preview thumbnails.
-- Browse: local gallery of Spherisphy captures and imports.
+- Browse: local gallery of Spherify captures and imports.
 - Reproject: interactive PhotoSphere view, Tiny World view, wormhole/inverted view, horizon rotation, zoom, roll, and export.
 - Save: write masters and exported projections to device storage.
 - Publish: upload app-created images to Google Photos, share/export to Google Maps manually, and later add Street View Publish API support.
@@ -801,7 +801,7 @@ Before the first line of app code, the product needs a few design decisions pinn
 
 The app should be designed around a local-first library. Google Photos and Google Maps should feel like export destinations, not the place where the app's primary state lives. The local library should keep a durable record for every capture: source frame set, stitched equirectangular master, exported Tiny World variants, capture metadata, processing status, and publishing status. That gives the user confidence that a failed upload or later API change will not strand their work.
 
-The permission model should be contextual and progressive. Android guidance says runtime permissions should be requested when the user starts the feature that needs them, not at app startup. For Spherisphy this means:
+The permission model should be contextual and progressive. Android guidance says runtime permissions should be requested when the user starts the feature that needs them, not at app startup. For Spherify this means:
 
 - Camera permission appears when the user starts a new capture.
 - Location permission appears when the user enables map-ready geotagging or publishing metadata.
@@ -809,7 +809,7 @@ The permission model should be contextual and progressive. Android guidance says
 - Google account authorization appears only when the user chooses Google Photos upload or Google Maps/Street View publishing.
 - Motion sensors should be used while capture is visible and active, with no background collection.
 
-The app should also be useful when optional permissions are denied. Without location, the user can still create and save PhotoSpheres and Tiny Worlds, but exports will not be map-ready until location is added manually. Without Google sign-in, the user can still save locally and share files. Without photo-library access, the user can still use the Spherisphy library and select individual external images through the picker.
+The app should also be useful when optional permissions are denied. Without location, the user can still create and save PhotoSpheres and Tiny Worlds, but exports will not be map-ready until location is added manually. Without Google sign-in, the user can still save locally and share files. Without photo-library access, the user can still use the Spherify library and select individual external images through the picker.
 
 The minimum viable technical surface should include:
 
@@ -996,7 +996,7 @@ The Settings screen should include:
 
 ### Suggested Setup-First UI Workflow
 
-Although Android and Google Play guidance generally favors requesting permissions in context, Spherisphy can still offer an immediate setup path if it is framed as a friendly readiness flow. The app cannot force permissions or account access; the user must grant them through Android and Google consent screens. The design goal is to make the fastest route obvious: "Get Spherisphy ready now," while still allowing the user to skip and use local features.
+Although Android and Google Play guidance generally favors requesting permissions in context, Spherify can still offer an immediate setup path if it is framed as a friendly readiness flow. The app cannot force permissions or account access; the user must grant them through Android and Google consent screens. The design goal is to make the fastest route obvious: "Get Spherify ready now," while still allowing the user to skip and use local features.
 
 The setup-first flow should use simple splash screens with one clear action per screen.
 
@@ -1010,7 +1010,7 @@ Supporting text: Capture, reproject, save, and publish 360 images from your phon
 
 Buttons:
 
-- Set up Spherisphy.
+- Set up Spherify.
 - Browse without setup.
 
 2. Readiness splash
@@ -1033,7 +1033,7 @@ Purpose: unlock capture.
 UI:
 
 - Large camera icon.
-- Short copy: Camera access lets Spherisphy capture the frames for your PhotoSphere.
+- Short copy: Camera access lets Spherify capture the frames for your PhotoSphere.
 - Button: Allow camera.
 - Secondary: Skip for now.
 
@@ -1082,7 +1082,7 @@ Purpose: reassure the user that their work is saved on the device first.
 UI:
 
 - Folder/gallery icon.
-- Short copy: Spherisphy saves your masters and exports locally first.
+- Short copy: Spherify saves your masters and exports locally first.
 - Buttons: Create local library, Change later.
 
 Notes:
@@ -1139,7 +1139,7 @@ The home screen after setup should avoid clutter. A user should be able to under
 
 - Capture: start a guided PhotoSphere capture.
 - Import: choose an existing 360 image or panorama.
-- Browse: open the local Spherisphy library.
+- Browse: open the local Spherify library.
 - Create Tiny World: open the reprojection editor from a selected master or imported image.
 
 Secondary actions can live behind smaller icons or menus:
@@ -1249,7 +1249,7 @@ Goal: make image work durable and user-visible.
 
 Work:
 
-- Build the local Spherisphy library.
+- Build the local Spherify library.
 - Store masters, variants, thumbnails, and metadata.
 - Save app-created images through MediaStore where appropriate.
 - Import external images through the Android photo picker.
@@ -1393,7 +1393,7 @@ Work:
 
 Exit criteria:
 
-- A user can submit a validated PhotoSphere from Spherisphy to Google Maps/Street View.
+- A user can submit a validated PhotoSphere from Spherify to Google Maps/Street View.
 - The app records submission status and exposes retry/failure details.
 - Public upload is never confused with local save or private Google Photos upload.
 
