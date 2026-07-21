@@ -1,23 +1,23 @@
 # Spherify
 
-Version: 0.0.1
+Version: 0.2.0
 
 Spherify is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny World images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository currently contains planning notes only. No application code has been started.
+This repository now contains the first Android proof-of-concept application code. The 0.2.0 build includes a GPU-backed PhotoSphere/Tiny World viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, and a CameraX capture shell that saves draft frames.
 
 ## Developer Build and Run Runbook
 
-This section is intentionally basic and explicit. It is written for the future point where this repository contains an Android project, but it also explains what happens today.
+This section is intentionally basic and explicit. It describes how to build, install, and run the current Android project from VS Code and terminal commands.
 
 Current status:
 
-- The repository currently has no Gradle wrapper, no `settings.gradle` or `settings.gradle.kts`, no Android app module, and no source code.
-- Because of that, there is nothing to build or install yet.
-- The commands below become usable after the Android project scaffold exists.
-- Until then, any command such as `.\gradlew assembleDebug` will fail because `gradlew` does not exist.
+- The repository has a Gradle wrapper, Android app module, launcher activity, bundled test panorama, and debug build.
+- The current application ID is `com.spherify.app`.
+- The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
+- The current Phase 2 prototype is local-first and does not require broad photo-library permission for normal use.
 
-When Phase 1 app code begins, the repository should contain at least:
+The repository contains:
 
 - `settings.gradle` or `settings.gradle.kts`.
 - A root `build.gradle` or `build.gradle.kts`.
@@ -114,7 +114,7 @@ ls
 4. Look for `gradlew.bat` on Windows or `gradlew` on macOS/Linux.
 5. Look for `settings.gradle` or `settings.gradle.kts`.
 6. Look for an app module directory, usually `app`.
-7. If those files are missing, stop. The repository is still documentation-only.
+7. If those files are missing, stop and restore the Android project scaffold before building.
 8. If those files exist, continue.
 
 ### Open the Project in VS Code
@@ -992,7 +992,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.0.1, license, acknowledgements.
+- About: version 0.2.0, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 

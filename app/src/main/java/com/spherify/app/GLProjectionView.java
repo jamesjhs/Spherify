@@ -29,6 +29,7 @@ public class GLProjectionView extends GLSurfaceView {
 
     private static final int EXPORT_SIZE = 1600;
     private static final int THUMBNAIL_SIZE = 320;
+    private static final float PHOTOSPHERE_BASE_ROLL_DEGREES = 180f;
 
     private final ProjectionRenderer renderer;
     private final ScaleGestureDetector scaleDetector;
@@ -36,14 +37,21 @@ public class GLProjectionView extends GLSurfaceView {
     private int[] panoramaPixels = new int[0];
     private int panoramaWidth;
     private int panoramaHeight;
+    private boolean sourceTinyWorld;
     private Mode mode = Mode.SPHERE;
-    private boolean inverted;
+    private float centerYaw;
+    private float centerPitch;
+    private float centerRoll;
     private float yaw;
     private float pitch;
     private float roll;
     private float zoom = 1f;
     private float lastX;
     private float lastY;
+    private float lastPointerAngle;
+    private float lastPointerFocusX;
+    private float lastPointerFocusY;
+    private boolean rotatingGesture;
 
     public GLProjectionView(Context context) {
         this(context, null);
@@ -61,7 +69,7 @@ public class GLProjectionView extends GLSurfaceView {
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
-                zoom = clamp(zoom * detector.getScaleFactor(), 0.45f, 5f);
+                zoom = clamp(zoom * detector.getScaleFactor(), getMinimumZoom(), 5f);
                 pushStateToRenderer();
                 return true;
             }
@@ -72,33 +80,49 @@ public class GLProjectionView extends GLSurfaceView {
         this.panorama = panorama;
         panoramaWidth = panorama.getWidth();
         panoramaHeight = panorama.getHeight();
+        sourceTinyWorld = isSquareish(panoramaWidth, panoramaHeight);
         panoramaPixels = new int[panoramaWidth * panoramaHeight];
         panorama.getPixels(panoramaPixels, 0, panoramaWidth, 0, 0, panoramaWidth, panoramaHeight);
-        queueEvent(() -> renderer.setPanorama(panorama));
-        requestRender();
+        centerYaw = 0f;
+        centerPitch = 0f;
+        centerRoll = 0f;
+        yaw = 0f;
+        pitch = 0f;
+        roll = 0f;
+        boolean currentSourceTinyWorld = sourceTinyWorld;
+        queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyWorld));
+        pushStateToRenderer();
     }
 
     public Mode getMode() {
         return mode;
     }
 
-    public boolean isInverted() {
-        return inverted;
-    }
-
     public String getStatusText() {
         String modeName = mode == Mode.SPHERE ? "PhotoSphere" : "Tiny World";
-        return String.format(Locale.US, "%s  |  GPU preview  |  zoom %.2fx", modeName, zoom);
+        return String.format(Locale.US, "%s  |  GPU preview  |  zoom %.2fx  |  centre %.0f/%.0f",
+                modeName,
+                zoom,
+                centerYaw,
+                centerPitch);
     }
 
     public void toggleMode() {
         mode = mode == Mode.SPHERE ? Mode.TINY_WORLD : Mode.SPHERE;
+        zoom = Math.max(zoom, getMinimumZoom());
         roll = 0f;
         pushStateToRenderer();
     }
 
-    public void toggleInverted() {
-        inverted = !inverted;
+    public void recentre() {
+        centerYaw = normalizeDegrees(centerYaw + yaw);
+        centerPitch = mode == Mode.SPHERE
+                ? clamp(centerPitch + pitch, -89f, 89f)
+                : normalizeDegrees(centerPitch + pitch);
+        centerRoll = normalizeDegrees(centerRoll + roll);
+        yaw = 0f;
+        pitch = 0f;
+        roll = 0f;
         pushStateToRenderer();
     }
 
@@ -107,7 +131,6 @@ public class GLProjectionView extends GLSurfaceView {
         pitch = 0f;
         roll = 0f;
         zoom = 1f;
-        inverted = false;
         pushStateToRenderer();
     }
 
@@ -138,12 +161,26 @@ public class GLProjectionView extends GLSurfaceView {
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         scaleDetector.onTouchEvent(event);
+
+        if (event.getActionMasked() == MotionEvent.ACTION_POINTER_UP) {
+            int liftedPointer = event.getActionIndex();
+            int remainingPointer = liftedPointer == 0 ? 1 : 0;
+            if (remainingPointer < event.getPointerCount()) {
+                lastX = event.getX(remainingPointer);
+                lastY = event.getY(remainingPointer);
+            }
+            rotatingGesture = false;
+            return true;
+        }
+
         if (event.getPointerCount() > 1) {
+            handleTwoFingerGesture(event);
             return true;
         }
 
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                rotatingGesture = false;
                 lastX = event.getX();
                 lastY = event.getY();
                 return true;
@@ -153,30 +190,61 @@ public class GLProjectionView extends GLSurfaceView {
                 lastX = event.getX();
                 lastY = event.getY();
 
-                yaw -= dx / Math.max(1f, getWidth()) * 360f / zoom;
-                if (mode == Mode.SPHERE) {
-                    pitch = clamp(pitch + dy / Math.max(1f, getHeight()) * 120f / zoom, -85f, 85f);
-                } else {
-                    roll += dx / Math.max(1f, getWidth()) * 240f;
-                    pitch = clamp(pitch + dy / Math.max(1f, getHeight()) * 90f / zoom, -85f, 85f);
-                }
-                pushStateToRenderer();
+                applyDragDelta(dx, dy);
+                return true;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                rotatingGesture = false;
                 return true;
             default:
                 return true;
         }
     }
 
+    private void handleTwoFingerGesture(MotionEvent event) {
+        float pointerDx = event.getX(1) - event.getX(0);
+        float pointerDy = event.getY(1) - event.getY(0);
+        float angle = (float) Math.toDegrees(Math.atan2(pointerDy, pointerDx));
+        float focusX = (event.getX(0) + event.getX(1)) * 0.5f;
+        float focusY = (event.getY(0) + event.getY(1)) * 0.5f;
+        if (event.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN || !rotatingGesture) {
+            lastPointerAngle = angle;
+            lastPointerFocusX = focusX;
+            lastPointerFocusY = focusY;
+            rotatingGesture = true;
+            return;
+        }
+
+        float focusDx = focusX - lastPointerFocusX;
+        float focusDy = focusY - lastPointerFocusY;
+        roll = normalizeDegrees(roll + normalizeDegrees(angle - lastPointerAngle));
+        lastPointerAngle = angle;
+        lastPointerFocusX = focusX;
+        lastPointerFocusY = focusY;
+        applyDragDelta(focusDx, focusDy);
+    }
+
+    private void applyDragDelta(float dx, float dy) {
+        float verticalDragReference = Math.max(1f, Math.min(getWidth(), getHeight()));
+        if (mode == Mode.SPHERE) {
+            yaw = normalizeDegrees(yaw + dx / Math.max(1f, getWidth()) * 180f / zoom);
+            pitch = clamp(pitch - dy / verticalDragReference * 120f / zoom, -89f, 89f);
+        } else {
+            yaw = normalizeDegrees(yaw - dx / Math.max(1f, getWidth()) * 180f / zoom);
+            roll = normalizeDegrees(roll + dx / Math.max(1f, getWidth()) * 240f);
+            pitch = normalizeDegrees(pitch + dy / verticalDragReference * 180f / zoom);
+        }
+        pushStateToRenderer();
+    }
+
     private void pushStateToRenderer() {
         Mode currentMode = mode;
-        boolean currentInverted = inverted;
-        float currentYaw = yaw;
-        float currentPitch = pitch;
-        float currentRoll = roll;
+        float currentYaw = getEffectiveYaw();
+        float currentPitch = getEffectivePitch();
+        float currentRoll = getEffectiveRoll();
         float currentZoom = zoom;
         queueEvent(() -> renderer.setState(
                 currentMode,
-                currentInverted,
                 currentYaw,
                 currentPitch,
                 currentRoll,
@@ -188,9 +256,9 @@ public class GLProjectionView extends GLSurfaceView {
         Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         int[] pixels = new int[width * height];
 
-        double yawRad = Math.toRadians(yaw);
-        double pitchRad = Math.toRadians(pitch);
-        double rollRad = Math.toRadians(roll);
+        double yawRad = Math.toRadians(getEffectiveYaw());
+        double pitchRad = Math.toRadians(getEffectivePitch());
+        double rollRad = Math.toRadians(getEffectiveRoll());
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
         double aspect = width / (double) height;
@@ -202,7 +270,9 @@ public class GLProjectionView extends GLSurfaceView {
                 Sample sample = mode == Mode.SPHERE
                         ? sampleSphere(nx, ny, yawRad, pitchRad)
                         : sampleTinyWorld(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
-                pixels[y * width + x] = samplePanorama(sample.u, sample.v);
+                pixels[y * width + x] = sourceTinyWorld
+                        ? sampleTinyWorldSource(sample.x, sample.y, sample.z)
+                        : samplePanorama(sample.u, sample.v);
             }
         }
 
@@ -211,27 +281,29 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     private Sample sampleSphere(double nx, double ny, double yawRad, double pitchRad) {
+        double rollRad = Math.toRadians(getEffectiveRoll());
+        double cosRoll = Math.cos(rollRad);
+        double sinRoll = Math.sin(rollRad);
+        double rx = nx * cosRoll - ny * sinRoll;
+        double ry = nx * sinRoll + ny * cosRoll;
         double fov = Math.toRadians(92.0 / zoom);
-        double x = nx * Math.tan(fov / 2.0);
-        double y = -ny * Math.tan(fov / 2.0);
-        double z = 1.0;
+        double spread = Math.tan(fov * 0.5);
 
+        double forwardX = Math.sin(yawRad) * Math.cos(pitchRad);
+        double forwardY = Math.sin(pitchRad);
+        double forwardZ = Math.cos(yawRad) * Math.cos(pitchRad);
+        double rightX = Math.cos(yawRad);
+        double rightY = 0.0;
+        double rightZ = -Math.sin(yawRad);
+        double upX = forwardY * rightZ - forwardZ * rightY;
+        double upY = forwardZ * rightX - forwardX * rightZ;
+        double upZ = forwardX * rightY - forwardY * rightX;
+
+        double x = forwardX + rightX * rx * spread + upX * ry * spread;
+        double y = forwardY + rightY * rx * spread + upY * ry * spread;
+        double z = forwardZ + rightZ * rx * spread + upZ * ry * spread;
         double length = Math.sqrt(x * x + y * y + z * z);
-        x /= length;
-        y /= length;
-        z /= length;
-
-        double cy = Math.cos(yawRad);
-        double sy = Math.sin(yawRad);
-        double cp = Math.cos(pitchRad);
-        double sp = Math.sin(pitchRad);
-
-        double x1 = cy * x + sy * z;
-        double z1 = -sy * x + cy * z;
-        double y1 = cp * y - sp * z1;
-        double z2 = sp * y + cp * z1;
-
-        return directionToSample(x1, y1, z2);
+        return directionToSample(x / length, y / length, z / length);
     }
 
     private Sample sampleTinyWorld(
@@ -245,12 +317,10 @@ public class GLProjectionView extends GLSurfaceView {
         double ry = (nx * sinRoll + ny * cosRoll) / zoom;
         double radius = Math.sqrt(rx * rx + ry * ry);
         double angle = Math.atan2(ry, rx);
-        double polar = inverted
-                ? Math.PI - 2.0 * Math.atan(radius)
-                : 2.0 * Math.atan(radius);
+        double polar = 2.0 * Math.atan(radius);
 
         double sx = Math.sin(polar) * Math.cos(angle);
-        double sy = inverted ? -Math.cos(polar) : Math.cos(polar);
+        double sy = Math.cos(polar);
         double sz = Math.sin(polar) * Math.sin(angle);
 
         double cp = Math.cos(pitchRad);
@@ -271,13 +341,54 @@ public class GLProjectionView extends GLSurfaceView {
         double latitude = Math.asin(clamp(y, -1.0, 1.0));
         double u = (longitude / (2.0 * Math.PI)) + 0.5;
         double v = 0.5 - (latitude / Math.PI);
-        return new Sample(u, v);
+        return new Sample(u, v, x, y, z);
     }
 
     private int samplePanorama(double u, double v) {
         int sourceX = wrap((int) (u * panoramaWidth), panoramaWidth);
         int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
+    }
+
+    private int sampleTinyWorldSource(double x, double y, double z) {
+        double polar = Math.acos(clamp(y, -1.0, 1.0));
+        double radius = Math.tan(polar * 0.5);
+        double angle = Math.atan2(z, x);
+        double u = 0.5 + Math.cos(angle) * radius * 0.5;
+        double v = 0.5 + Math.sin(angle) * radius * 0.5;
+        int sourceX = clamp((int) (u * panoramaWidth), 0, panoramaWidth - 1);
+        int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
+        return panoramaPixels[sourceY * panoramaWidth + sourceX];
+    }
+
+    private float getEffectiveYaw() {
+        return normalizeDegrees(centerYaw + yaw);
+    }
+
+    private float getEffectivePitch() {
+        if (mode == Mode.SPHERE) {
+            return clamp(centerPitch + pitch, -89f, 89f);
+        }
+        return normalizeDegrees(centerPitch + pitch);
+    }
+
+    private float getEffectiveRoll() {
+        float baseRoll = mode == Mode.SPHERE ? PHOTOSPHERE_BASE_ROLL_DEGREES : 0f;
+        return normalizeDegrees(baseRoll + centerRoll + roll);
+    }
+
+    private float getMinimumZoom() {
+        return mode == Mode.TINY_WORLD ? 0.1f : 0.45f;
+    }
+
+    private static float normalizeDegrees(float value) {
+        float normalized = value % 360f;
+        if (normalized > 180f) {
+            normalized -= 360f;
+        } else if (normalized < -180f) {
+            normalized += 360f;
+        }
+        return normalized;
     }
 
     private static void writeBitmap(
@@ -309,13 +420,25 @@ public class GLProjectionView extends GLSurfaceView {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    private static boolean isSquareish(int width, int height) {
+        int larger = Math.max(width, height);
+        int smaller = Math.min(width, height);
+        return larger > 0 && smaller / (float) larger > 0.9f;
+    }
+
     private static final class Sample {
         final double u;
         final double v;
+        final double x;
+        final double y;
+        final double z;
 
-        Sample(double u, double v) {
+        Sample(double u, double v, double x, double y, double z) {
             this.u = u;
             this.v = v;
+            this.x = x;
+            this.y = y;
+            this.z = z;
         }
     }
 
@@ -333,12 +456,12 @@ public class GLProjectionView extends GLSurfaceView {
                 "varying vec2 vPosition;\n" +
                 "uniform sampler2D uTexture;\n" +
                 "uniform int uMode;\n" +
-                "uniform int uInverted;\n" +
                 "uniform float uYaw;\n" +
                 "uniform float uPitch;\n" +
                 "uniform float uRoll;\n" +
                 "uniform float uZoom;\n" +
                 "uniform float uAspect;\n" +
+                "uniform int uSourceProjection;\n" +
                 "const float PI = 3.14159265358979323846;\n" +
                 "vec3 rotateYawPitch(vec3 d) {\n" +
                 "  float cy = cos(uYaw);\n" +
@@ -351,36 +474,49 @@ public class GLProjectionView extends GLSurfaceView {
                 "  float z2 = sp * d.y + cp * z1;\n" +
                 "  return vec3(x1, y1, z2);\n" +
                 "}\n" +
-                "vec2 directionToUv(vec3 d) {\n" +
+                "vec2 equirectUv(vec3 d) {\n" +
                 "  float longitude = atan(d.x, d.z);\n" +
                 "  float latitude = asin(clamp(d.y, -1.0, 1.0));\n" +
                 "  float u = fract(longitude / (2.0 * PI) + 0.5);\n" +
                 "  float v = clamp(0.5 - latitude / PI, 0.0, 1.0);\n" +
                 "  return vec2(u, v);\n" +
                 "}\n" +
-                "vec3 sphereDirection(vec2 p) {\n" +
-                "  float fov = radians(92.0 / uZoom);\n" +
-                "  float spread = tan(fov * 0.5);\n" +
-                "  return normalize(vec3(p.x * spread, -p.y * spread, 1.0));\n" +
+                "vec2 tinyWorldUv(vec3 d) {\n" +
+                "  float polar = acos(clamp(d.y, -1.0, 1.0));\n" +
+                "  float radius = tan(polar * 0.5);\n" +
+                "  float angle = atan(d.z, d.x);\n" +
+                "  vec2 uv = vec2(0.5 + cos(angle) * radius * 0.5, 0.5 + sin(angle) * radius * 0.5);\n" +
+                "  return clamp(uv, 0.0, 1.0);\n" +
                 "}\n" +
-                "vec3 tinyWorldDirection(vec2 p) {\n" +
+                "vec4 sampleSource(vec3 d) {\n" +
+                "  vec2 uv = uSourceProjection == 1 ? tinyWorldUv(d) : equirectUv(d);\n" +
+                "  return texture2D(uTexture, vec2(uv.x, 1.0 - uv.y));\n" +
+                "}\n" +
+                "vec2 rollScreen(vec2 p) {\n" +
                 "  float cr = cos(uRoll);\n" +
                 "  float sr = sin(uRoll);\n" +
-                "  vec2 r = vec2(p.x * cr - p.y * sr, p.x * sr + p.y * cr) / uZoom;\n" +
+                "  return vec2(p.x * cr - p.y * sr, p.x * sr + p.y * cr);\n" +
+                "}\n" +
+                "vec3 sphereDirection(vec2 p) {\n" +
+                "  vec2 r = rollScreen(p);\n" +
+                "  float spread = tan(radians(92.0 / uZoom) * 0.5);\n" +
+                "  vec3 forward = vec3(sin(uYaw) * cos(uPitch), sin(uPitch), cos(uYaw) * cos(uPitch));\n" +
+                "  vec3 right = vec3(cos(uYaw), 0.0, -sin(uYaw));\n" +
+                "  vec3 up = cross(forward, right);\n" +
+                "  return normalize(forward + right * r.x * spread + up * r.y * spread);\n" +
+                "}\n" +
+                "vec3 tinyWorldDirection(vec2 p) {\n" +
+                "  vec2 r = rollScreen(p) / uZoom;\n" +
                 "  float radius = length(r);\n" +
                 "  float angle = atan(r.y, r.x);\n" +
-                "  float polar = uInverted == 1 ? PI - 2.0 * atan(radius) : 2.0 * atan(radius);\n" +
+                "  float polar = 2.0 * atan(radius);\n" +
                 "  vec3 d = vec3(sin(polar) * cos(angle), cos(polar), sin(polar) * sin(angle));\n" +
-                "  if (uInverted == 1) {\n" +
-                "    d.y = -d.y;\n" +
-                "  }\n" +
                 "  return d;\n" +
                 "}\n" +
                 "void main() {\n" +
                 "  vec2 p = vec2(vPosition.x * uAspect, vPosition.y);\n" +
-                "  vec3 d = uMode == 0 ? sphereDirection(p) : tinyWorldDirection(p);\n" +
-                "  d = rotateYawPitch(d);\n" +
-                "  gl_FragColor = texture2D(uTexture, directionToUv(d));\n" +
+                "  vec3 d = uMode == 0 ? sphereDirection(p) : rotateYawPitch(tinyWorldDirection(p));\n" +
+                "  gl_FragColor = sampleSource(d);\n" +
                 "}\n";
 
         private final FloatBuffer vertices = ByteBuffer
@@ -395,16 +531,16 @@ public class GLProjectionView extends GLSurfaceView {
         private int positionHandle;
         private int textureHandle;
         private int modeHandle;
-        private int invertedHandle;
         private int yawHandle;
         private int pitchHandle;
         private int rollHandle;
         private int zoomHandle;
         private int aspectHandle;
+        private int sourceProjectionHandle;
         private int viewportWidth = 1;
         private int viewportHeight = 1;
+        private boolean sourceTinyWorld;
         private Mode mode = Mode.SPHERE;
-        private boolean inverted;
         private float yaw;
         private float pitch;
         private float roll;
@@ -414,16 +550,16 @@ public class GLProjectionView extends GLSurfaceView {
             vertices.position(0);
         }
 
-        void setPanorama(Bitmap panorama) {
+        void setPanorama(Bitmap panorama, boolean sourceTinyWorld) {
             pendingPanorama = panorama;
+            this.sourceTinyWorld = sourceTinyWorld;
             if (program != 0) {
                 uploadPendingPanorama();
             }
         }
 
-        void setState(Mode mode, boolean inverted, float yaw, float pitch, float roll, float zoom) {
+        void setState(Mode mode, float yaw, float pitch, float roll, float zoom) {
             this.mode = mode;
-            this.inverted = inverted;
             this.yaw = yaw;
             this.pitch = pitch;
             this.roll = roll;
@@ -437,12 +573,12 @@ public class GLProjectionView extends GLSurfaceView {
             positionHandle = GLES20.glGetAttribLocation(program, "aPosition");
             textureHandle = GLES20.glGetUniformLocation(program, "uTexture");
             modeHandle = GLES20.glGetUniformLocation(program, "uMode");
-            invertedHandle = GLES20.glGetUniformLocation(program, "uInverted");
             yawHandle = GLES20.glGetUniformLocation(program, "uYaw");
             pitchHandle = GLES20.glGetUniformLocation(program, "uPitch");
             rollHandle = GLES20.glGetUniformLocation(program, "uRoll");
             zoomHandle = GLES20.glGetUniformLocation(program, "uZoom");
             aspectHandle = GLES20.glGetUniformLocation(program, "uAspect");
+            sourceProjectionHandle = GLES20.glGetUniformLocation(program, "uSourceProjection");
             uploadPendingPanorama();
         }
 
@@ -465,12 +601,12 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
             GLES20.glUniform1i(textureHandle, 0);
             GLES20.glUniform1i(modeHandle, mode == Mode.SPHERE ? 0 : 1);
-            GLES20.glUniform1i(invertedHandle, inverted ? 1 : 0);
             GLES20.glUniform1f(yawHandle, (float) Math.toRadians(yaw));
             GLES20.glUniform1f(pitchHandle, (float) Math.toRadians(pitch));
             GLES20.glUniform1f(rollHandle, (float) Math.toRadians(roll));
             GLES20.glUniform1f(zoomHandle, zoom);
             GLES20.glUniform1f(aspectHandle, viewportWidth / (float) viewportHeight);
+            GLES20.glUniform1i(sourceProjectionHandle, sourceTinyWorld ? 1 : 0);
 
             GLES20.glEnableVertexAttribArray(positionHandle);
             GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertices);
