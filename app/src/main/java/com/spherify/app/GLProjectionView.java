@@ -1,3 +1,44 @@
+/*
+ * GLProjectionView.java
+ *
+ * Educational overview:
+ * GLProjectionView is the interactive projection engine for Spherify. It is a
+ * GLSurfaceView that can display an equirectangular Photo Sphere as either an
+ * immersive sphere view or a Tiny Planet projection. It also exports the current
+ * view to bitmap files using a CPU renderer that mirrors the OpenGL math.
+ *
+ * Data flow:
+ * MainActivity decodes a LibraryItem image into a Bitmap -> setPanorama() stores
+ * pixel data and sends the bitmap to ProjectionRenderer on the GL thread ->
+ * touch/adjustment methods update yaw, pitch, roll, horizon, and zoom ->
+ * pushStateToRenderer() queues state for OpenGL uniforms -> ProjectionRenderer
+ * draws the view using shader math. During export, exportProjection() calls
+ * renderProjectionOnCpu(), writes a full-size PNG and thumbnail JPEG, and
+ * returns ProjectionExport for SpherifyLibrary to save.
+ *
+ * External files/functions:
+ * Reads Bitmap pixels supplied by MainActivity/SpherifyLibrary.
+ * Writes temporary export files under getExternalFilesDir(Pictures)/Spherify.
+ * Uses Android OpenGL ES 2.0 APIs through GLES20 and GLSurfaceView.Renderer.
+ * Uses ProjectionExport as the file handoff object for saved variants.
+ *
+ * Imports/dependencies:
+ * Bitmap/File/FileOutputStream support export and thumbnail creation.
+ * GLES20/GLSurfaceView/GLUtils provide GPU rendering and texture uploads.
+ * Bundle saves/restores projection state across Activity recreation.
+ * MotionEvent/ScaleGestureDetector translate gestures into projection changes.
+ * FloatBuffer/ByteBuffer feed a full-screen quad into the vertex shader.
+ *
+ * Key variables:
+ * renderer: nested OpenGL renderer that owns shader program and texture state.
+ * panorama/panoramaPixels/panoramaWidth/panoramaHeight: source image data used
+ * by GPU preview and CPU export.
+ * sourceTinyPlanet: true when the input is already a tiny-planet-like square.
+ * mode: current output projection, SPHERE or TINY_PLANET.
+ * centerYaw/centerPitch/centerRoll: accumulated recentering offsets.
+ * yaw/pitch/roll/horizonOffset/zoom: live interaction and adjustment state.
+ * last* and rotatingGesture fields: gesture bookkeeping between touch events.
+ */
 package com.spherify.app;
 
 import android.content.Context;
@@ -54,10 +95,25 @@ public class GLProjectionView extends GLSurfaceView {
     private float lastPointerFocusY;
     private boolean rotatingGesture;
 
+    /*
+     * Function: GLProjectionView(Context)
+     * Arguments: context is the Android owner used for resources and files.
+     * Calls: the two-argument constructor with attrs set to null.
+     * Flow: convenience constructor for programmatic creation from MainActivity.
+     */
     public GLProjectionView(Context context) {
         this(context, null);
     }
 
+    /*
+     * Function: GLProjectionView(Context, AttributeSet)
+     * Arguments: context supplies Android services; attrs would contain XML
+     * attributes if inflated from a layout.
+     * Calls: GLSurfaceView setup methods, ProjectionRenderer constructor,
+     * setRenderer(), setRenderMode(), and ScaleGestureDetector.
+     * Flow: configure an OpenGL ES 2 view, preserve context on pause, install the
+     * renderer, use on-demand rendering, and create pinch-zoom handling.
+     */
     public GLProjectionView(Context context, AttributeSet attrs) {
         super(context, attrs);
         setEGLContextClientVersion(2);
@@ -68,6 +124,13 @@ public class GLProjectionView extends GLSurfaceView {
         setFocusable(true);
 
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            /*
+             * Function: onScale
+             * Arguments: detector provides the pinch scale factor.
+             * Calls: clamp(), getMinimumZoom(), and pushStateToRenderer().
+             * Flow: multiply zoom by the pinch factor, keep it within valid
+             * limits for the current mode, and redraw with the new state.
+             */
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
                 zoom = clamp(zoom * detector.getScaleFactor(), getMinimumZoom(), 5f);
@@ -77,6 +140,15 @@ public class GLProjectionView extends GLSurfaceView {
         });
     }
 
+    /*
+     * Function: setPanorama
+     * Arguments: panorama is the source bitmap; sourceProjection describes how
+     * the app should interpret it ("sphere", "tinyplanet", or "flat").
+     * Calls: Bitmap.getPixels(), isSquareish(), queueEvent(), renderer.setPanorama(),
+     * and pushStateToRenderer().
+     * Flow: store dimensions and CPU pixels for export, infer source projection,
+     * reset orientation state, queue texture upload on the GL thread, and redraw.
+     */
     public void setPanorama(Bitmap panorama, String sourceProjection) {
         this.panorama = panorama;
         panoramaWidth = panorama.getWidth();
@@ -96,10 +168,24 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: getMode
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return the current projection mode for MainActivity labels and save
+     * decisions.
+     */
     public Mode getMode() {
         return mode;
     }
 
+    /*
+     * Function: saveProjectionState
+     * Arguments: outState receives values; prefix namespaces keys within Bundle.
+     * Calls: Bundle.putString() and Bundle.putFloat().
+     * Flow: write every user-adjustable projection value so Android recreation
+     * can restore the same view.
+     */
     public void saveProjectionState(Bundle outState, String prefix) {
         outState.putString(prefix + "mode", mode.name());
         outState.putFloat(prefix + "centerYaw", centerYaw);
@@ -112,6 +198,14 @@ public class GLProjectionView extends GLSurfaceView {
         outState.putFloat(prefix + "zoom", zoom);
     }
 
+    /*
+     * Function: restoreProjectionState
+     * Arguments: savedState is a Bundle from Android; prefix matches the save key
+     * namespace.
+     * Calls: Bundle getters, Mode.valueOf(), getMinimumZoom(), and pushStateToRenderer().
+     * Flow: read saved projection values with defaults, tolerate unknown mode
+     * strings, clamp zoom to valid mode limits, and redraw.
+     */
     public void restoreProjectionState(Bundle savedState, String prefix) {
         String modeName = savedState.getString(prefix + "mode");
         if (modeName != null) {
@@ -132,6 +226,13 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: setMode
+     * Arguments: mode is the requested output projection.
+     * Calls: getMinimumZoom() and pushStateToRenderer().
+     * Flow: switch projection, ensure zoom remains valid, clear roll adjustment,
+     * and redraw.
+     */
     public void setMode(Mode mode) {
         this.mode = mode;
         zoom = Math.max(zoom, getMinimumZoom());
@@ -139,10 +240,23 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: getStatusText
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: provide a short user-facing description of the active mode.
+     */
     public String getStatusText() {
         return mode == Mode.SPHERE ? "Photo Sphere" : "Tiny Planet";
     }
 
+    /*
+     * Function: toggleMode
+     * Arguments: none.
+     * Calls: getMinimumZoom() and pushStateToRenderer().
+     * Flow: flip between sphere and tiny-planet rendering, normalize zoom/roll,
+     * and redraw for MainActivity's mode button.
+     */
     public void toggleMode() {
         mode = mode == Mode.SPHERE ? Mode.TINY_PLANET : Mode.SPHERE;
         zoom = Math.max(zoom, getMinimumZoom());
@@ -150,6 +264,13 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: recentre
+     * Arguments: none.
+     * Calls: normalizeDegrees(), clamp(), and pushStateToRenderer().
+     * Flow: fold current interactive yaw/pitch/roll into the center offsets and
+     * reset live deltas, making the current view the new neutral reference.
+     */
     public void recentre() {
         centerYaw = normalizeDegrees(centerYaw + yaw);
         centerPitch = mode == Mode.SPHERE
@@ -162,6 +283,13 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: resetView
+     * Arguments: none.
+     * Calls: pushStateToRenderer().
+     * Flow: clear live orientation, horizon, and zoom adjustments without
+     * changing the currently loaded panorama or mode.
+     */
     public void resetView() {
         yaw = 0f;
         pitch = 0f;
@@ -171,33 +299,79 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: getFieldOfViewDegrees
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: convert zoom back into an approximate field-of-view value for the
+     * Adjust dialog.
+     */
     public float getFieldOfViewDegrees() {
         return BASE_FIELD_OF_VIEW_DEGREES / zoom;
     }
 
+    /*
+     * Function: setFieldOfViewDegrees
+     * Arguments: degrees is the requested field of view from the Adjust dialog.
+     * Calls: clamp(), getMinimumZoom(), and pushStateToRenderer().
+     * Flow: convert FOV to zoom, bound it to valid limits, and redraw.
+     */
     public void setFieldOfViewDegrees(float degrees) {
         zoom = clamp(BASE_FIELD_OF_VIEW_DEGREES / clamp(degrees, 30f, 180f), getMinimumZoom(), 5f);
         pushStateToRenderer();
     }
 
+    /*
+     * Function: getImageRotationDegrees
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: expose the current roll adjustment for the Adjust dialog.
+     */
     public float getImageRotationDegrees() {
         return roll;
     }
 
+    /*
+     * Function: setImageRotationDegrees
+     * Arguments: degrees is a roll angle from the Adjust dialog.
+     * Calls: normalizeDegrees() and pushStateToRenderer().
+     * Flow: normalize the angle to -180..180 degrees and redraw.
+     */
     public void setImageRotationDegrees(float degrees) {
         roll = normalizeDegrees(degrees);
         pushStateToRenderer();
     }
 
+    /*
+     * Function: getEyeElevationDegrees
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: expose the horizon/elevation offset for the Adjust dialog.
+     */
     public float getEyeElevationDegrees() {
         return horizonOffset;
     }
 
+    /*
+     * Function: setEyeElevationDegrees
+     * Arguments: degrees is the desired horizon offset.
+     * Calls: clamp() and pushStateToRenderer().
+     * Flow: limit the horizon offset to a usable range and redraw.
+     */
     public void setEyeElevationDegrees(float degrees) {
         horizonOffset = clamp(degrees, -75f, 75f);
         pushStateToRenderer();
     }
 
+    /*
+     * Function: exportProjection
+     * Arguments: none.
+     * Calls: renderProjectionOnCpu(), Bitmap.createScaledBitmap(), getExternalFilesDir(),
+     * writeBitmap(), and ProjectionExport constructor.
+     * Flow: render the current projection to a full-size bitmap, derive a
+     * thumbnail, write both to export files, recycle temporary bitmaps, and
+     * return their File handles.
+     */
     public ProjectionExport exportProjection() throws IOException {
         Bitmap image = renderProjectionOnCpu(EXPORT_SIZE, EXPORT_SIZE);
         Bitmap thumbnail = Bitmap.createScaledBitmap(image, THUMBNAIL_SIZE, THUMBNAIL_SIZE, true);
@@ -222,6 +396,15 @@ public class GLProjectionView extends GLSurfaceView {
         return new ProjectionExport(imageFile, thumbnailFile);
     }
 
+    /*
+     * Function: onTouchEvent
+     * Arguments: event is an Android touch event containing pointer positions.
+     * Calls: ScaleGestureDetector.onTouchEvent(), handleTwoFingerGesture(),
+     * applyDragDelta(), and MotionEvent accessors.
+     * Flow: let pinch zoom process first, handle pointer changes, route two-
+     * finger movement to rotation/drag logic, and route one-finger drag to pan or
+     * tiny-planet spin depending on mode.
+     */
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         scaleDetector.onTouchEvent(event);
@@ -265,6 +448,13 @@ public class GLProjectionView extends GLSurfaceView {
         }
     }
 
+    /*
+     * Function: handleTwoFingerGesture
+     * Arguments: event contains two active pointer positions.
+     * Calls: Math.atan2(), Math.toDegrees(), normalizeDegrees(), and applyDragDelta().
+     * Flow: track the angle and midpoint between two fingers so the user can
+     * rotate the projection while also dragging its focus.
+     */
     private void handleTwoFingerGesture(MotionEvent event) {
         float pointerDx = event.getX(1) - event.getX(0);
         float pointerDy = event.getY(1) - event.getY(0);
@@ -288,6 +478,14 @@ public class GLProjectionView extends GLSurfaceView {
         applyDragDelta(focusDx, focusDy);
     }
 
+    /*
+     * Function: applyDragDelta
+     * Arguments: dx/dy are screen-space movement deltas in pixels.
+     * Calls: getWidth(), getHeight(), normalizeDegrees(), clamp(), and
+     * pushStateToRenderer().
+     * Flow: translate touch movement into yaw/pitch/roll changes; sphere mode
+     * behaves like looking around, while tiny planet mode rotates/spins the map.
+     */
     private void applyDragDelta(float dx, float dy) {
         float verticalDragReference = Math.max(1f, Math.min(getWidth(), getHeight()));
         if (mode == Mode.SPHERE) {
@@ -301,6 +499,14 @@ public class GLProjectionView extends GLSurfaceView {
         pushStateToRenderer();
     }
 
+    /*
+     * Function: pushStateToRenderer
+     * Arguments: none.
+     * Calls: getEffectiveYaw/Pitch/Roll(), queueEvent(), renderer.setState(), and
+     * requestRender().
+     * Flow: snapshot UI-thread projection state, send it safely to the GL thread,
+     * then ask GLSurfaceView to draw a new frame.
+     */
     private void pushStateToRenderer() {
         Mode currentMode = mode;
         float currentYaw = getEffectiveYaw();
@@ -318,6 +524,14 @@ public class GLProjectionView extends GLSurfaceView {
         requestRender();
     }
 
+    /*
+     * Function: renderProjectionOnCpu
+     * Arguments: width/height are output bitmap dimensions.
+     * Calls: sampleSphere(), sampleTinyPlanet(), samplePanorama(),
+     * sampleTinyPlanetSource(), and Bitmap.setPixels().
+     * Flow: for every output pixel, compute the 3D sample direction for the
+     * active mode, sample the source image pixels, and write the final bitmap.
+     */
     private Bitmap renderProjectionOnCpu(int width, int height) {
         Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         int[] pixels = new int[width * height];
@@ -349,6 +563,14 @@ public class GLProjectionView extends GLSurfaceView {
         return output;
     }
 
+    /*
+     * Function: sampleSphere
+     * Arguments: nx/ny are normalized screen coordinates; yawRad/pitchRad are
+     * camera angles in radians.
+     * Calls: getEffectiveRoll(), Math trig helpers, and directionToSample().
+     * Flow: construct a viewing ray through the virtual camera plane and convert
+     * that ray into source texture coordinates.
+     */
     private Sample sampleSphere(double nx, double ny, double yawRad, double pitchRad) {
         double rollRad = Math.toRadians(getEffectiveRoll());
         double cosRoll = Math.cos(rollRad);
@@ -375,6 +597,14 @@ public class GLProjectionView extends GLSurfaceView {
         return directionToSample(x / length, y / length, z / length);
     }
 
+    /*
+     * Function: sampleTinyPlanet
+     * Arguments: nx/ny are normalized screen coordinates; yawRad/pitchRad adjust
+     * orientation; cosRoll/sinRoll are precomputed roll values.
+     * Calls: Math trig helpers and directionToSample().
+     * Flow: map a 2D point through stereographic tiny-planet math into a 3D
+     * direction, apply yaw/pitch, then convert to sampling coordinates.
+     */
     private Sample sampleTinyPlanet(
             double nx,
             double ny,
@@ -405,6 +635,13 @@ public class GLProjectionView extends GLSurfaceView {
         return directionToSample(x1, y2, z2);
     }
 
+    /*
+     * Function: directionToSample
+     * Arguments: x/y/z are a normalized 3D direction vector.
+     * Calls: Math.atan2(), Math.asin(), and clamp().
+     * Flow: convert direction to longitude/latitude, then to equirectangular u/v
+     * coordinates while preserving the vector for tiny-planet source sampling.
+     */
     private Sample directionToSample(double x, double y, double z) {
         double longitude = Math.atan2(x, z);
         double latitude = Math.asin(clamp(y, -1.0, 1.0));
@@ -413,6 +650,13 @@ public class GLProjectionView extends GLSurfaceView {
         return new Sample(u, v, x, y, z);
     }
 
+    /*
+     * Function: samplePanorama
+     * Arguments: u/v are source coordinates; horizonOffsetRad shifts vertical
+     * sampling; flipSourceVertically handles mode/source orientation.
+     * Calls: wrap() and clamp().
+     * Flow: map u/v into integer source pixels and return the panorama color.
+     */
     private int samplePanorama(double u, double v, double horizonOffsetRad, boolean flipSourceVertically) {
         int sourceX = wrap((int) (u * panoramaWidth), panoramaWidth);
         v += horizonOffsetRad / Math.PI;
@@ -423,6 +667,14 @@ public class GLProjectionView extends GLSurfaceView {
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
     }
 
+    /*
+     * Function: sampleTinyPlanetSource
+     * Arguments: x/y/z are a direction vector; horizonOffsetRad adjusts polar
+     * sampling; flipSourceVertically controls vertical orientation.
+     * Calls: Math.acos(), Math.tan(), Math.atan2(), clamp().
+     * Flow: reverse-map a 3D direction into a square tiny-planet source image and
+     * return the nearest source pixel.
+     */
     private int sampleTinyPlanetSource(
             double x,
             double y,
@@ -442,10 +694,23 @@ public class GLProjectionView extends GLSurfaceView {
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
     }
 
+    /*
+     * Function: getEffectiveYaw
+     * Arguments: none.
+     * Calls: normalizeDegrees().
+     * Flow: combine recentered yaw with live yaw and normalize it for rendering.
+     */
     private float getEffectiveYaw() {
         return normalizeDegrees(centerYaw + yaw);
     }
 
+    /*
+     * Function: getEffectivePitch
+     * Arguments: none.
+     * Calls: clamp() or normalizeDegrees().
+     * Flow: combine recentered and live pitch; sphere pitch clamps near poles,
+     * while tiny planet pitch can wrap around.
+     */
     private float getEffectivePitch() {
         if (mode == Mode.SPHERE) {
             return clamp(centerPitch + pitch, -89f, 89f);
@@ -453,15 +718,35 @@ public class GLProjectionView extends GLSurfaceView {
         return normalizeDegrees(centerPitch + pitch);
     }
 
+    /*
+     * Function: getEffectiveRoll
+     * Arguments: none.
+     * Calls: normalizeDegrees().
+     * Flow: combine a sphere-specific base roll with center and live roll so
+     * Photo Sphere images appear upright while still allowing user rotation.
+     */
     private float getEffectiveRoll() {
         float baseRoll = mode == Mode.SPHERE ? PHOTOSPHERE_BASE_ROLL_DEGREES : 0f;
         return normalizeDegrees(baseRoll + centerRoll + roll);
     }
 
+    /*
+     * Function: getMinimumZoom
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return mode-specific zoom lower bounds so projections remain useful.
+     */
     private float getMinimumZoom() {
         return mode == Mode.TINY_PLANET ? 0.1f : 0.45f;
     }
 
+    /*
+     * Function: normalizeDegrees
+     * Arguments: value is any angle in degrees.
+     * Calls: modulo arithmetic only.
+     * Flow: fold an angle into the -180..180 range for stable gesture math and
+     * shader uniforms.
+     */
     private static float normalizeDegrees(float value) {
         float normalized = value % 360f;
         if (normalized > 180f) {
@@ -472,6 +757,14 @@ public class GLProjectionView extends GLSurfaceView {
         return normalized;
     }
 
+    /*
+     * Function: writeBitmap
+     * Arguments: bitmap supplies pixels; format and quality choose compression;
+     * destination is the output file.
+     * Calls: FileOutputStream and Bitmap.compress().
+     * Flow: write compressed bitmap bytes and throw IOException if Android
+     * reports compression failure.
+     */
     private static void writeBitmap(
             Bitmap bitmap,
             Bitmap.CompressFormat format,
@@ -484,23 +777,55 @@ public class GLProjectionView extends GLSurfaceView {
         }
     }
 
+    /*
+     * Function: wrap
+     * Arguments: value is an index; maximum is the repeating range size.
+     * Calls: modulo arithmetic only.
+     * Flow: wrap horizontal panorama coordinates so longitude repeats cleanly.
+     */
     private static int wrap(int value, int maximum) {
         int wrapped = value % maximum;
         return wrapped < 0 ? wrapped + maximum : wrapped;
     }
 
+    /*
+     * Function: clamp(float)
+     * Arguments: value is bounded between minimum and maximum.
+     * Calls: Math.max() and Math.min().
+     * Flow: keep float parameters such as zoom, pitch, and horizon inside usable
+     * ranges.
+     */
     private static float clamp(float value, float minimum, float maximum) {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    /*
+     * Function: clamp(int)
+     * Arguments: value is bounded between minimum and maximum.
+     * Calls: Math.max() and Math.min().
+     * Flow: keep pixel indices inside source image bounds.
+     */
     private static int clamp(int value, int minimum, int maximum) {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    /*
+     * Function: clamp(double)
+     * Arguments: value is bounded between minimum and maximum.
+     * Calls: Math.max() and Math.min().
+     * Flow: keep projection math values inside valid trig and texture ranges.
+     */
     private static double clamp(double value, double minimum, double maximum) {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    /*
+     * Function: isSquareish
+     * Arguments: width and height are source image dimensions.
+     * Calls: Math.max() and Math.min().
+     * Flow: infer tiny-planet-like source images by checking whether the aspect
+     * ratio is close to square.
+     */
     private static boolean isSquareish(int width, int height) {
         int larger = Math.max(width, height);
         int smaller = Math.min(width, height);
@@ -514,6 +839,14 @@ public class GLProjectionView extends GLSurfaceView {
         final double y;
         final double z;
 
+        /*
+         * Function: Sample constructor
+         * Arguments: u/v are source texture coordinates; x/y/z preserve the 3D
+         * direction that produced those coordinates.
+         * Calls: no external functions.
+         * Flow: store sampling coordinates so CPU export can choose between
+         * equirectangular and tiny-planet source lookup.
+         */
         Sample(double u, double v, double x, double y, double z) {
             this.u = u;
             this.v = v;
@@ -630,10 +963,25 @@ public class GLProjectionView extends GLSurfaceView {
         private float horizonOffset;
         private float zoom = 1f;
 
+        /*
+         * Function: ProjectionRenderer constructor
+         * Arguments: none.
+         * Calls: FloatBuffer.position().
+         * Flow: rewind the full-screen quad vertex buffer so OpenGL reads it from
+         * the first coordinate during draw calls.
+         */
         ProjectionRenderer() {
             vertices.position(0);
         }
 
+        /*
+         * Function: setPanorama
+         * Arguments: panorama is the bitmap to upload; sourceTinyPlanet records
+         * how shader sampling should interpret that texture.
+         * Calls: uploadPendingPanorama() when the GL program already exists.
+         * Flow: save the bitmap for GL-thread texture upload and immediately
+         * upload it if the surface has already been created.
+         */
         void setPanorama(Bitmap panorama, boolean sourceTinyPlanet) {
             pendingPanorama = panorama;
             this.sourceTinyPlanet = sourceTinyPlanet;
@@ -642,6 +990,14 @@ public class GLProjectionView extends GLSurfaceView {
             }
         }
 
+        /*
+         * Function: setState
+         * Arguments: mode, yaw, pitch, roll, horizonOffset, and zoom are the
+         * latest projection controls from GLProjectionView.
+         * Calls: no external functions.
+         * Flow: copy UI-thread state into renderer fields. pushStateToRenderer()
+         * calls this on the GL thread through queueEvent().
+         */
         void setState(Mode mode, float yaw, float pitch, float roll, float horizonOffset, float zoom) {
             this.mode = mode;
             this.yaw = yaw;
@@ -651,6 +1007,15 @@ public class GLProjectionView extends GLSurfaceView {
             this.zoom = zoom;
         }
 
+        /*
+         * Function: onSurfaceCreated
+         * Arguments: gl/config are provided by GLSurfaceView when an OpenGL
+         * context is ready.
+         * Calls: GLES20 clear/program/uniform lookups, buildProgram(), and
+         * uploadPendingPanorama().
+         * Flow: compile/link shaders, cache all attribute/uniform handles, set a
+         * clear color, and upload any bitmap that arrived before the surface.
+         */
         @Override
         public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             GLES20.glClearColor(0.02f, 0.04f, 0.06f, 1f);
@@ -668,6 +1033,12 @@ public class GLProjectionView extends GLSurfaceView {
             uploadPendingPanorama();
         }
 
+        /*
+         * Function: onSurfaceChanged
+         * Arguments: width/height are the new GL viewport dimensions.
+         * Calls: Math.max() and GLES20.glViewport().
+         * Flow: store nonzero viewport dimensions and tell OpenGL where to draw.
+         */
         @Override
         public void onSurfaceChanged(GL10 gl, int width, int height) {
             viewportWidth = Math.max(1, width);
@@ -675,6 +1046,14 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
         }
 
+        /*
+         * Function: onDrawFrame
+         * Arguments: gl is the OpenGL interface supplied by GLSurfaceView.
+         * Calls: GLES20 binding/uniform/attribute/draw APIs and Math.toRadians().
+         * Flow: clear the frame, bind the panorama texture, push projection state
+         * into shader uniforms, draw the full-screen quad, and disable the vertex
+         * attribute afterward.
+         */
         @Override
         public void onDrawFrame(GL10 gl) {
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
@@ -701,6 +1080,14 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glDisableVertexAttribArray(positionHandle);
         }
 
+        /*
+         * Function: uploadPendingPanorama
+         * Arguments: none.
+         * Calls: GLES20 texture allocation/parameter APIs and GLUtils.texImage2D().
+         * Flow: if a bitmap is waiting, create a texture if needed, configure
+         * filtering/wrapping, upload pixels to the GPU, and clear the pending
+         * reference.
+         */
         private void uploadPendingPanorama() {
             if (pendingPanorama == null) {
                 return;
@@ -719,6 +1106,13 @@ public class GLProjectionView extends GLSurfaceView {
             pendingPanorama = null;
         }
 
+        /*
+         * Function: buildProgram
+         * Arguments: vertexSource and fragmentSource are GLSL shader strings.
+         * Calls: compileShader(), GLES20 program attach/link/status APIs.
+         * Flow: compile both shaders, link them into an OpenGL program, verify
+         * link success, and return the program id.
+         */
         private static int buildProgram(String vertexSource, String fragmentSource) {
             int vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexSource);
             int fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource);
@@ -737,6 +1131,14 @@ public class GLProjectionView extends GLSurfaceView {
             return program;
         }
 
+        /*
+         * Function: compileShader
+         * Arguments: type is GLES20.GL_VERTEX_SHADER or GL_FRAGMENT_SHADER;
+         * source is the GLSL source text.
+         * Calls: GLES20 shader create/source/compile/status APIs.
+         * Flow: compile one shader, throw a detailed exception on failure, and
+         * return the shader id on success.
+         */
         private static int compileShader(int type, String source) {
             int shader = GLES20.glCreateShader(type);
             GLES20.glShaderSource(shader, source);

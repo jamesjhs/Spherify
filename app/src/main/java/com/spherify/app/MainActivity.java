@@ -1,3 +1,53 @@
+/*
+ * MainActivity.java
+ *
+ * Educational overview:
+ * MainActivity is the app's home screen and coordinator. It owns the main
+ * projection viewer, setup dialogs, library browsing, import/export choices,
+ * permission flow, metadata dialogs, and deletion/rename actions. Rendering
+ * itself lives in GLProjectionView, while file persistence lives in
+ * SpherifyLibrary. MainActivity's job is to connect user actions to those
+ * specialized classes.
+ *
+ * Data flow:
+ * On launch, SpherifyLibrary loads metadata and ensures the bundled demo image.
+ * MainActivity chooses a current LibraryItem, decodes its image into a Bitmap,
+ * and passes it to GLProjectionView. User adjustments update GLProjectionView.
+ * Export asks GLProjectionView for a ProjectionExport, then SpherifyLibrary
+ * stores the variant. Import uses Android photo/file picker Uris, then
+ * SpherifyLibrary copies the selected image into the local library. Capture
+ * starts CaptureActivity after camera permission. Gallery actions mutate
+ * LibraryItem records through SpherifyLibrary.
+ *
+ * External files/functions:
+ * Reads app asset tinyplanet.jpg through AssetManager.
+ * Opens Android photo picker or document picker for user imports.
+ * Uses FileProvider to share/open local files outside the app.
+ * Uses Android permissions for camera and location setup.
+ * Uses Android SensorManager only for readiness summaries; live sensor reading
+ * happens in CaptureActivity.
+ *
+ * Imports/dependencies:
+ * Android Activity/Dialog/Intent/View widgets build the UI programmatically.
+ * BitmapFactory decodes current images and gallery thumbnails.
+ * MediaStore and Uri support photo import.
+ * FileProvider converts local files to shareable content:// Uris.
+ * GLProjectionView, SpherifyLibrary, LibraryItem, ProjectionExport, and
+ * FlatImageActivity are the app-local collaborators.
+ *
+ * Key variables:
+ * REQUEST_* constants: request codes for activity/permission callbacks.
+ * PREFS/PREF_SETUP_COMPLETE: first-run setup completion storage.
+ * STATE_* constants: keys for preserving selected item and projection state.
+ * projectionView: OpenGL viewer for sphere/tiny-planet projections.
+ * library: local persistence helper.
+ * currentItem: selected LibraryItem currently shown or acted on.
+ * statusText/modeButton/adjustButton: primary UI labels/controls.
+ * activeLibraryDialog: currently displayed gallery dialog, if any.
+ * startCaptureAfterCameraPermission/continueSetupAfterLocationPermission:
+ * booleans that remember why a permission request was launched.
+ * GALLERY_DELETE_* constants: swipe threshold tuning for gallery row deletion.
+ */
 package com.spherify.app;
 
 import android.Manifest;
@@ -59,6 +109,17 @@ public class MainActivity extends Activity {
     private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
     private static final float GALLERY_DELETE_VERTICAL_SLOP = 90f;
 
+    /*
+     * Function: onCreate
+     * Arguments: savedInstanceState is Android lifecycle state containing the
+     * selected item id and projection controls after recreation.
+     * Calls: SpherifyLibrary, AssetManager.open(), restoreCurrentItem(),
+     * loadCurrentItem(), many Android view constructors, setup dialog functions,
+     * and updateLabels().
+     * Flow: initialize the library/demo asset, create the GL viewer, build the
+     * whole home UI programmatically, wire button listeners, restore content,
+     * apply window insets, update labels, and optionally start first-run setup.
+     */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -202,6 +263,13 @@ public class MainActivity extends Activity {
         showSetupFlowIfNeeded();
     }
 
+    /*
+     * Function: onSaveInstanceState
+     * Arguments: outState is the Bundle Android will retain across recreation.
+     * Calls: Bundle.putString() and GLProjectionView.saveProjectionState().
+     * Flow: preserve which library item is selected and the current projection
+     * orientation/zoom so rotation or process recreation keeps the view stable.
+     */
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
@@ -213,6 +281,15 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: onRequestPermissionsResult
+     * Arguments: requestCode identifies the permission request; permissions and
+     * grantResults describe Android's response.
+     * Calls: super, Toast, startActivity(), showSensorSetup(), and
+     * showLocalStorageSetup().
+     * Flow: continue the capture/setup branch that requested permission, or show
+     * user feedback when camera/location permission is denied.
+     */
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
@@ -239,18 +316,38 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: onPause
+     * Arguments: none beyond Android lifecycle dispatch.
+     * Calls: super.onPause() and projectionView.onPause().
+     * Flow: pause the GL surface when the Activity leaves foreground.
+     */
     @Override
     protected void onPause() {
         super.onPause();
         projectionView.onPause();
     }
 
+    /*
+     * Function: onResume
+     * Arguments: none beyond Android lifecycle dispatch.
+     * Calls: super.onResume() and projectionView.onResume().
+     * Flow: resume the GL surface when returning to the foreground.
+     */
     @Override
     protected void onResume() {
         super.onResume();
         projectionView.onResume();
     }
 
+    /*
+     * Function: onActivityResult
+     * Arguments: requestCode/resultCode identify picker completion; data holds
+     * the selected image Uri.
+     * Calls: super, Intent.getData(), Toast, and chooseImportedImageType().
+     * Flow: receive photo/file picker output, validate a Uri exists, and ask the
+     * user which projection type to assign before importing.
+     */
     @Override
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -265,6 +362,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: makeButton
+     * Arguments: text is the visible button label.
+     * Calls: Button setters and LinearLayout.LayoutParams.
+     * Flow: create an equal-width button with consistent text/capitalization for
+     * the hand-built control rows.
+     */
     private Button makeButton(String text) {
         Button button = new Button(this);
         button.setText(text);
@@ -279,6 +383,14 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    /*
+     * Function: showSetupFlowIfNeeded
+     * Arguments: none.
+     * Calls: getSharedPreferences(), AlertDialog.Builder, markSetupComplete(),
+     * and showReadinessSetup().
+     * Flow: if first-run setup is incomplete, show the opening setup dialog and
+     * route the user either into setup or directly into browsing.
+     */
     private void showSetupFlowIfNeeded() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (prefs.getBoolean(PREF_SETUP_COMPLETE, false)) {
@@ -292,6 +404,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showReadinessSetup
+     * Arguments: none.
+     * Calls: AlertDialog.Builder, showSensorSetup(), and requestCameraSetup().
+     * Flow: explain the major capture capabilities and let the user either grant
+     * essentials first or walk through setup one item at a time.
+     */
     private void showReadinessSetup() {
         new AlertDialog.Builder(this)
                 .setTitle("A few things make the sphere work")
@@ -301,6 +420,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: requestCameraSetup
+     * Arguments: none.
+     * Calls: ContextCompat.checkSelfPermission(), AlertDialog.Builder,
+     * requestPermissions(), and showSensorSetup().
+     * Flow: if camera permission is already present, advance setup; otherwise
+     * explain why camera helps and request permission if the user agrees.
+     */
     private void requestCameraSetup() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -318,6 +445,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showSensorSetup
+     * Arguments: none.
+     * Calls: sensorSummary(), AlertDialog.Builder, and requestLocationSetup().
+     * Flow: display hardware readiness for motion sensors before continuing to
+     * location setup.
+     */
     private void showSensorSetup() {
         new AlertDialog.Builder(this)
                 .setTitle("Motion tracking")
@@ -327,6 +461,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: requestLocationSetup
+     * Arguments: none.
+     * Calls: ContextCompat.checkSelfPermission(), AlertDialog.Builder,
+     * requestPermissions(), and showLocalStorageSetup().
+     * Flow: request optional fine location permission for future map-ready
+     * metadata, or continue without it.
+     */
     private void requestLocationSetup() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -344,6 +486,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showLocalStorageSetup
+     * Arguments: none.
+     * Calls: AlertDialog.Builder and showAccountSetup().
+     * Flow: explain that the app uses local device storage first, then continue
+     * to the future cloud-account step.
+     */
     private void showLocalStorageSetup() {
         new AlertDialog.Builder(this)
                 .setTitle("Local library")
@@ -352,6 +501,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showAccountSetup
+     * Arguments: none.
+     * Calls: AlertDialog.Builder and showSetupComplete().
+     * Flow: describe future cloud publishing and finish setup regardless of
+     * whether the user chooses Continue or Skip.
+     */
     private void showAccountSetup() {
         new AlertDialog.Builder(this)
                 .setTitle("Google setup")
@@ -361,6 +517,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showSetupComplete
+     * Arguments: none.
+     * Calls: markSetupComplete(), permissionStatus(), sensorSummaryCompact(),
+     * AlertDialog.Builder, startCaptureFlow(), and showBrowseFilters().
+     * Flow: persist setup completion, summarize readiness, then let the user
+     * start capture or open the library.
+     */
     private void showSetupComplete() {
         markSetupComplete();
         new AlertDialog.Builder(this)
@@ -374,6 +538,12 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: markSetupComplete
+     * Arguments: none.
+     * Calls: getSharedPreferences().edit().putBoolean().apply().
+     * Flow: store the setup-complete flag so first-run dialogs do not repeat.
+     */
     private void markSetupComplete() {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
@@ -381,6 +551,13 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
+    /*
+     * Function: sensorSummary
+     * Arguments: none.
+     * Calls: getSystemService(SENSOR_SERVICE) and sensorStatus().
+     * Flow: query core motion/orientation sensor availability for the setup
+     * dialog.
+     */
     private String sensorSummary() {
         SensorManager manager = (SensorManager) getSystemService(SENSOR_SERVICE);
         if (manager == null) {
@@ -392,6 +569,12 @@ public class MainActivity extends Activity {
                 + "\nRotation vector: " + sensorStatus(manager, Sensor.TYPE_ROTATION_VECTOR);
     }
 
+    /*
+     * Function: sensorSummaryCompact
+     * Arguments: none.
+     * Calls: getSystemService(SENSOR_SERVICE) and sensorStatus().
+     * Flow: produce the short readiness summary used in the final setup dialog.
+     */
     private String sensorSummaryCompact() {
         SensorManager manager = (SensorManager) getSystemService(SENSOR_SERVICE);
         if (manager == null) {
@@ -401,16 +584,37 @@ public class MainActivity extends Activity {
                 + sensorStatus(manager, Sensor.TYPE_ROTATION_VECTOR) + " rotation";
     }
 
+    /*
+     * Function: sensorStatus
+     * Arguments: manager is Android's SensorManager; type is a Sensor.TYPE_* id.
+     * Calls: SensorManager.getDefaultSensor().
+     * Flow: return "ready" when the device has the requested sensor, otherwise
+     * "missing".
+     */
     private String sensorStatus(SensorManager manager, int type) {
         return manager.getDefaultSensor(type) == null ? "missing" : "ready";
     }
 
+    /*
+     * Function: permissionStatus
+     * Arguments: permission is an Android manifest permission string.
+     * Calls: ContextCompat.checkSelfPermission().
+     * Flow: convert permission grant state into compact setup status text.
+     */
     private String permissionStatus(String permission) {
         return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
                 ? "ready"
                 : "skipped";
     }
 
+    /*
+     * Function: startCaptureFlow
+     * Arguments: none.
+     * Calls: ContextCompat.checkSelfPermission(), startActivity(),
+     * AlertDialog.Builder, and requestPermissions().
+     * Flow: launch CaptureActivity immediately when camera permission exists, or
+     * request camera permission and remember to launch after approval.
+     */
     private void startCaptureFlow() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -428,6 +632,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: exportCurrentView
+     * Arguments: none.
+     * Calls: openFlatViewer(), Toast, AlertDialog.Builder, shareCurrentExport(),
+     * and saveCurrentExport().
+     * Flow: flat images are opened rather than reprojected; projected images ask
+     * the user whether to share or save the current GLProjectionView render.
+     */
     private void exportCurrentView() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
@@ -446,6 +658,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showAdjustDialog
+     * Arguments: none.
+     * Calls: openFlatViewer(), addAdjustmentControl(), projectionView getters and
+     * setters, AlertDialog.Builder, resetView(), and updateLabels().
+     * Flow: build a dialog of SeekBar controls that directly update projection
+     * field of view, image rotation, and horizon offset.
+     */
     private void showAdjustDialog() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
@@ -493,6 +713,16 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: addAdjustmentControl
+     * Arguments: parent receives the UI; label names the control; min/max bound
+     * values; current initializes the SeekBar; suffix labels units; handler
+     * receives value changes.
+     * Calls: TextView/SeekBar constructors, clamp(), handler.onValueChanged(),
+     * updateLabels(), and LinearLayout.addView().
+     * Flow: create a label and SeekBar pair, translate SeekBar progress into the
+     * requested value range, update the label, and invoke the provided callback.
+     */
     private void addAdjustmentControl(
             LinearLayout parent,
             String label,
@@ -522,6 +752,16 @@ public class MainActivity extends Activity {
         updateValueLabel.run();
 
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            /*
+             * Function: onProgressChanged
+             * Arguments: seekBar is the changed control; progress is zero-based
+             * within min/max; fromUser identifies user-initiated changes.
+             * Calls: TextView.setText(), AdjustmentHandler.onValueChanged(), and
+             * updateLabels().
+             * Flow: map progress back to a real value, update visible text, pass
+             * that value into GLProjectionView through the handler, and refresh
+             * the main status label.
+             */
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 int value = min + progress;
@@ -530,16 +770,38 @@ public class MainActivity extends Activity {
                 updateLabels();
             }
 
+            /*
+             * Function: onStartTrackingTouch
+             * Arguments: seekBar is the touched control.
+             * Calls: no external functions.
+             * Flow: required by the SeekBar listener interface; no custom work is
+             * needed when dragging starts.
+             */
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
             }
 
+            /*
+             * Function: onStopTrackingTouch
+             * Arguments: seekBar is the released control.
+             * Calls: no external functions.
+             * Flow: required by the SeekBar listener interface; updates already
+             * happen during progress changes.
+             */
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
             }
         });
     }
 
+    /*
+     * Function: saveCurrentExport
+     * Arguments: none.
+     * Calls: projectionView.exportProjection(), library.saveVariant(),
+     * openFlatViewer(), and Toast.
+     * Flow: render the current projection, persist it as a local variant in the
+     * library, make it current, open the flat viewer, and report success/failure.
+     */
     private void saveCurrentExport() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
@@ -561,6 +823,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: shareCurrentExport
+     * Arguments: none.
+     * Calls: projectionView.exportProjection(), shareFile(), and Toast.
+     * Flow: render the current projection to a temporary app file and launch
+     * Android's share sheet for the generated image.
+     */
     private void shareCurrentExport() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
@@ -574,6 +843,12 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: importImage
+     * Arguments: none.
+     * Calls: AlertDialog.Builder, importFromPhotos(), and importFromDeviceFiles().
+     * Flow: ask which Android picker source to use before requesting an image.
+     */
     private void importImage() {
         new AlertDialog.Builder(this)
                 .setTitle("Import")
@@ -587,6 +862,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: chooseImportedImageType
+     * Arguments: uri is the selected image from Android's picker.
+     * Calls: AlertDialog.Builder and finishImageImport().
+     * Flow: ask the user how to interpret the imported image and pass the
+     * selected projection label into the library import step.
+     */
     private void chooseImportedImageType(Uri uri) {
         String[] labels = {"Photo Sphere", "Tiny Planet", "Flat"};
         String[] projections = {"sphere", "tinyplanet", "flat"};
@@ -596,6 +878,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: finishImageImport
+     * Arguments: uri points to the selected image; projection is the chosen
+     * interpretation string.
+     * Calls: library.importImage(), openCurrentItem(), and Toast.
+     * Flow: copy the selected image into the local library, make it current, and
+     * open it in the appropriate viewer.
+     */
     private void finishImageImport(Uri uri, String projection) {
         try {
             currentItem = library.importImage(uri, projection);
@@ -606,6 +896,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: importFromPhotos
+     * Arguments: none.
+     * Calls: Intent constructors, MediaStore.ACTION_PICK_IMAGES on Android 13+,
+     * ACTION_PICK fallback on older versions, and startActivityForResult().
+     * Flow: launch the best available Android photo picker for image selection.
+     */
     private void importFromPhotos() {
         Intent intent;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -618,6 +915,13 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQUEST_IMPORT_IMAGE);
     }
 
+    /*
+     * Function: importFromDeviceFiles
+     * Arguments: none.
+     * Calls: ACTION_OPEN_DOCUMENT Intent setup and startActivityForResult().
+     * Flow: launch Android's document picker for image files and request read
+     * access to the chosen Uri.
+     */
     private void importFromDeviceFiles() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
@@ -626,6 +930,13 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQUEST_IMPORT_IMAGE);
     }
 
+    /*
+     * Function: showBrowseFilters
+     * Arguments: none.
+     * Calls: AlertDialog.Builder, showDraftFrames(), and showLibrary().
+     * Flow: present gallery filter choices and route the selection to either
+     * draft frame browsing or LibraryItem browsing.
+     */
     private void showBrowseFilters() {
         String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Saved", "Draft Frames"};
         String[] filters = {
@@ -648,6 +959,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showDraftFrames
+     * Arguments: none.
+     * Calls: library.listDraftFrames(), Toast, AlertDialog.Builder, and
+     * openExternalApp().
+     * Flow: list CameraX draft JPEGs captured by CaptureActivity and let the
+     * user open one in any installed image app.
+     */
     private void showDraftFrames() {
         List<File> drafts = library.listDraftFrames();
         if (drafts.isEmpty()) {
@@ -664,6 +983,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: showLibrary
+     * Arguments: filter is a LibraryItem.FILTER_* value; title labels the dialog.
+     * Calls: library.list(), ListView/LibraryAdapter setup, AlertDialog.Builder,
+     * and Toast.
+     * Flow: fetch filtered library records, render them through LibraryAdapter,
+     * keep a reference to the dialog for dismissal, and teach swipe deletion.
+     */
     private void showLibrary(String filter, String title) {
         List<LibraryItem> items = library.list(filter);
         if (items.isEmpty()) {
@@ -683,6 +1010,13 @@ public class MainActivity extends Activity {
         Toast.makeText(this, "Swipe left on a gallery entry to delete it", Toast.LENGTH_SHORT).show();
     }
 
+    /*
+     * Function: openGalleryItem
+     * Arguments: item is the selected row's LibraryItem.
+     * Calls: AlertDialog.dismiss(), showSavedOpenChoices(), and openCurrentItem().
+     * Flow: close the gallery dialog, then either ask how to open saved variants
+     * or select/open master images directly.
+     */
     private void openGalleryItem(LibraryItem item) {
         if (activeLibraryDialog != null) {
             activeLibraryDialog.dismiss();
@@ -696,6 +1030,14 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: showSavedOpenChoices
+     * Arguments: item is a saved variant LibraryItem.
+     * Calls: AlertDialog.Builder, openFlatViewer(), openExternalApp(), and
+     * LibraryItem.imageFile().
+     * Flow: variants are already rendered images, so offer either the in-app flat
+     * viewer or an external Android image app.
+     */
     private void showSavedOpenChoices(LibraryItem item) {
         new AlertDialog.Builder(this)
                 .setTitle(item.title)
@@ -709,12 +1051,25 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: openFlatViewer
+     * Arguments: item supplies the imagePath extra.
+     * Calls: Intent constructor, Intent.putExtra(), and startActivity().
+     * Flow: launch FlatImageActivity with the selected image path.
+     */
     private void openFlatViewer(LibraryItem item) {
         Intent intent = new Intent(this, FlatImageActivity.class);
         intent.putExtra(FlatImageActivity.EXTRA_IMAGE_PATH, item.imagePath);
         startActivity(intent);
     }
 
+    /*
+     * Function: openExternalApp
+     * Arguments: file is the local image to view externally.
+     * Calls: contentUriFor(), Intent.createChooser(), startActivity(), and Toast.
+     * Flow: convert a private file path to a content Uri with read permission and
+     * let Android route it to an installed image viewer.
+     */
     private void openExternalApp(File file) {
         Intent intent = new Intent(Intent.ACTION_VIEW);
         intent.setDataAndType(contentUriFor(file), "image/*");
@@ -726,6 +1081,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: shareFile
+     * Arguments: file is the generated PNG to share.
+     * Calls: contentUriFor(), Intent.createChooser(), and startActivity().
+     * Flow: create an ACTION_SEND Intent with a FileProvider Uri so other apps
+     * can receive the export without direct filesystem access.
+     */
     private void shareFile(File file) {
         Intent intent = new Intent(Intent.ACTION_SEND);
         intent.setType("image/png");
@@ -734,14 +1096,35 @@ public class MainActivity extends Activity {
         startActivity(Intent.createChooser(intent, "Share export"));
     }
 
+    /*
+     * Function: contentUriFor
+     * Arguments: file is an app-private file.
+     * Calls: FileProvider.getUriForFile() and getPackageName().
+     * Flow: translate a File into the content:// Uri authorized by AndroidManifest
+     * FileProvider configuration.
+     */
     private Uri contentUriFor(File file) {
         return FileProvider.getUriForFile(this, getPackageName() + ".files", file);
     }
 
+    /*
+     * Function: clamp
+     * Arguments: value is bounded between minimum and maximum.
+     * Calls: Math.max() and Math.min().
+     * Flow: keep integer UI values inside SeekBar-supported ranges.
+     */
     private static int clamp(int value, int minimum, int maximum) {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    /*
+     * Function: restoreCurrentItem
+     * Arguments: items is the current library list; savedInstanceState may carry
+     * STATE_CURRENT_ITEM_ID.
+     * Calls: Bundle.getString() and LibraryItem id comparisons.
+     * Flow: restore the previously selected item when possible, otherwise choose
+     * the first available library item.
+     */
     private LibraryItem restoreCurrentItem(List<LibraryItem> items, Bundle savedInstanceState) {
         if (items.isEmpty()) {
             return null;
@@ -759,6 +1142,13 @@ public class MainActivity extends Activity {
         return items.get(0);
     }
 
+    /*
+     * Function: showMetadata
+     * Arguments: none.
+     * Calls: library.describe(), AlertDialog.Builder, and Toast.
+     * Flow: show metadata for the current item or explain that nothing is
+     * selected.
+     */
     private void showMetadata() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -771,6 +1161,13 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: openCurrentItem
+     * Arguments: none.
+     * Calls: updateLabels(), openFlatViewer(), and loadCurrentItem().
+     * Flow: route flat images to FlatImageActivity; otherwise load the current
+     * item into GLProjectionView.
+     */
     private void openCurrentItem() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             updateLabels();
@@ -780,6 +1177,13 @@ public class MainActivity extends Activity {
         loadCurrentItem(null);
     }
 
+    /*
+     * Function: showCurrentItemActions
+     * Arguments: none.
+     * Calls: AlertDialog.Builder, renameCurrentItem(), deleteCurrentItem(), and
+     * Toast.
+     * Flow: present long-press actions for the current status item.
+     */
     private void showCurrentItemActions() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -797,6 +1201,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: renameCurrentItem
+     * Arguments: none.
+     * Calls: EditText setup, AlertDialog.Builder, library.rename(), updateLabels(),
+     * and Toast.
+     * Flow: collect a new non-empty title for currentItem, persist it through the
+     * library, and refresh UI labels.
+     */
     private void renameCurrentItem() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -824,6 +1236,14 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: deleteCurrentItem
+     * Arguments: none.
+     * Calls: AlertDialog.Builder, library.delete(), library.list(), loadCurrentItem(),
+     * and Toast.
+     * Flow: confirm deletion, remove the current item and files, select a fallback
+     * library item, and reload the viewer.
+     */
     private void deleteCurrentItem() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -847,10 +1267,26 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: deleteGalleryItem overload
+     * Arguments: item is the target; adapter/visibleItems back the gallery list.
+     * Calls: the full deleteGalleryItem overload with no swiped row.
+     * Flow: convenience wrapper for delete actions that do not need row reset
+     * animation context.
+     */
     private void deleteGalleryItem(LibraryItem item, BaseAdapter adapter, List<LibraryItem> visibleItems) {
         deleteGalleryItem(item, adapter, visibleItems, null);
     }
 
+    /*
+     * Function: deleteGalleryItem
+     * Arguments: item is the target; adapter refreshes the ListView; visibleItems
+     * is the mutable list shown by the adapter; swipedRow is the animated row
+     * view to reset if deletion is canceled.
+     * Calls: AlertDialog.Builder, resetSwipedRow(), and performGalleryDelete().
+     * Flow: ask for confirmation after a swipe/delete action, reset UI on cancel,
+     * and perform the actual library deletion on confirmation.
+     */
     private void deleteGalleryItem(
             LibraryItem item,
             BaseAdapter adapter,
@@ -865,12 +1301,28 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /*
+     * Function: resetSwipedRow
+     * Arguments: row is the gallery row view that had been translated left.
+     * Calls: View.animate() chain.
+     * Flow: if a delete is canceled, animate the row back to normal position and
+     * opacity.
+     */
     private void resetSwipedRow(View row) {
         if (row != null) {
             row.animate().translationX(0f).alpha(1f).setDuration(120).start();
         }
     }
 
+    /*
+     * Function: performGalleryDelete
+     * Arguments: item is the record to remove; adapter and visibleItems keep the
+     * displayed ListView in sync.
+     * Calls: library.delete(), adapter.notifyDataSetChanged(), library.list(),
+     * loadCurrentItem(), AlertDialog.dismiss(), and Toast.
+     * Flow: delete files/metadata, remove the row from the visible list, close an
+     * empty gallery, update the main selected item if needed, and show feedback.
+     */
     private void performGalleryDelete(LibraryItem item, BaseAdapter adapter, List<LibraryItem> visibleItems) {
         try {
             boolean deletingCurrent = currentItem != null && currentItem.id.equals(item.id);
@@ -892,10 +1344,27 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: loadCurrentItem overload
+     * Arguments: none.
+     * Calls: loadCurrentItem(null).
+     * Flow: convenience entry point when there is no saved projection state to
+     * restore.
+     */
     private void loadCurrentItem() {
         loadCurrentItem(null);
     }
 
+    /*
+     * Function: loadCurrentItem
+     * Arguments: savedProjectionState optionally contains GLProjectionView state.
+     * Calls: updateLabels(), openFlatViewer(), BitmapFactory.decodeFile(),
+     * projectionView.setMode(), projectionView.setPanorama(), resetView(),
+     * restoreProjectionState(), and Toast.
+     * Flow: validate a current item, route flat images away from GL, decode source
+     * pixels for projected images, load them into GLProjectionView, restore or
+     * reset projection controls, and refresh labels.
+     */
     private void loadCurrentItem(Bundle savedProjectionState) {
         if (currentItem == null) {
             updateLabels();
@@ -926,6 +1395,14 @@ public class MainActivity extends Activity {
         }
     }
 
+    /*
+     * Function: updateLabels
+     * Arguments: none.
+     * Calls: Button.setText(), TextView.setText(), projectionView.getMode(), and
+     * projectionView.getStatusText().
+     * Flow: keep mode/adjust/status UI synchronized with currentItem and the
+     * active projection mode.
+     */
     private void updateLabels() {
         if (modeButton == null || adjustButton == null || statusText == null) {
             return;
@@ -944,32 +1421,98 @@ public class MainActivity extends Activity {
         statusText.setText(title + "  |  " + projectionView.getStatusText());
     }
 
+    /*
+     * Interface: AdjustmentHandler
+     * Function: onValueChanged
+     * Arguments: value is the integer selected in an adjustment SeekBar.
+     * Calls: implemented by lambdas in showAdjustDialog().
+     * Flow: lets addAdjustmentControl remain generic while callers decide which
+     * GLProjectionView setter receives the value.
+     */
     private interface AdjustmentHandler {
+        /*
+         * Function: onValueChanged
+         * Arguments: value is the integer selected in the adjustment control.
+         * Calls: caller-provided GLProjectionView setter implementations.
+         * Flow: addAdjustmentControl invokes this whenever a SeekBar changes so
+         * the generic control can update a specific projection property.
+         */
         void onValueChanged(int value);
     }
 
+    /*
+     * Class: LibraryAdapter
+     * Educational overview:
+     * Adapter that converts LibraryItem records into ListView rows for the Browse
+     * dialog. Each row contains a thumbnail, title, metadata text, tap-to-open
+     * behavior, and custom left-swipe deletion behavior.
+     *
+     * Data flow:
+     * showLibrary() provides a mutable item list -> getView() renders each row ->
+     * tap opens via openGalleryItem() -> left swipe calls deleteGalleryItem() ->
+     * performGalleryDelete() mutates the same list and notifies this adapter.
+     *
+     * Key variables:
+     * items: mutable list currently visible in the Browse dialog.
+     */
     private final class LibraryAdapter extends BaseAdapter {
         private final List<LibraryItem> items;
 
+        /*
+         * Function: LibraryAdapter constructor
+         * Arguments: items is the visible gallery list.
+         * Calls: no external functions.
+         * Flow: store the list reference so row rendering and deletion stay in
+         * sync with showLibrary().
+         */
         LibraryAdapter(List<LibraryItem> items) {
             this.items = items;
         }
 
+        /*
+         * Function: getCount
+         * Arguments: none.
+         * Calls: List.size().
+         * Flow: tell ListView how many rows to request.
+         */
         @Override
         public int getCount() {
             return items.size();
         }
 
+        /*
+         * Function: getItem
+         * Arguments: position is the row index requested by ListView.
+         * Calls: List.get().
+         * Flow: return the LibraryItem for a row.
+         */
         @Override
         public LibraryItem getItem(int position) {
             return items.get(position);
         }
 
+        /*
+         * Function: getItemId
+         * Arguments: position is the row index requested by ListView.
+         * Calls: no external functions.
+         * Flow: use the row position as a simple stable-enough id for this small
+         * in-memory dialog list.
+         */
         @Override
         public long getItemId(int position) {
             return position;
         }
 
+        /*
+         * Function: getView
+         * Arguments: position identifies the row; convertView is unused because
+         * this custom row is rebuilt; parent is the ListView container.
+         * Calls: getItem(), BitmapFactory.decodeFile(), Android view constructors,
+         * openGalleryItem(), deleteGalleryItem(), and animation APIs.
+         * Flow: build a thumbnail/title/detail row layered over a red delete
+         * background, track touch deltas, open on tap, reveal delete on left swipe,
+         * and request confirmation once the swipe passes the threshold.
+         */
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
             LibraryItem item = getItem(position);

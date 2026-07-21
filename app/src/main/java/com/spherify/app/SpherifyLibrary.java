@@ -1,3 +1,46 @@
+/*
+ * SpherifyLibrary.java
+ *
+ * Educational overview:
+ * SpherifyLibrary is the app's local persistence layer. Activities ask it to
+ * import images, create bundled demo content, save exported variants, list
+ * gallery items, rename/delete entries, create draft capture files, and record
+ * draft metadata. The class deliberately keeps storage details out of
+ * MainActivity and CaptureActivity so those screens can focus on UI flow.
+ *
+ * Data flow:
+ * External/bundled image input -> copied into app-private library folders ->
+ * thumbnail generated -> LibraryItem added to the in-memory list -> metadata
+ * written to metadata.json. For exports, GLProjectionView creates temporary
+ * files and MainActivity passes a ProjectionExport here; this class copies the
+ * files into the library and optionally publishes the image to Android
+ * MediaStore. For capture drafts, CaptureActivity asks for a destination JPEG
+ * File, CameraX writes it, and recordDraftFrame() appends path/location data to
+ * drafts.json.
+ *
+ * External files/functions:
+ * Reads the bundled asset stream supplied by MainActivity.
+ * Reads images from user-selected Uri values through ContentResolver.
+ * Writes files below context.getFilesDir()/library.
+ * Writes metadata.json and drafts.json as JSON arrays.
+ * Writes saved variants to MediaStore on Android Q+ so exports appear in Photos.
+ *
+ * Imports/dependencies:
+ * Android ContentResolver/ContentValues/MediaStore publish saved variants.
+ * Bitmap/BitmapFactory decode images and create thumbnails.
+ * File/InputStream/OutputStream classes copy bytes and create directories.
+ * org.json classes serialize library and draft metadata.
+ * UUID creates collision-resistant ids for image records.
+ *
+ * Key variables:
+ * THUMBNAIL_SIZE: square thumbnail dimension in pixels.
+ * context: application context used for files, ContentResolver, and MediaStore.
+ * root: app-private library root directory.
+ * mastersDir/variantsDir/draftsDir/thumbnailsDir: content subfolders.
+ * metadataFile: JSON index of LibraryItem records.
+ * draftMetadataFile: JSON index of CameraX draft frames.
+ * items: in-memory LibraryItem list loaded from metadataFile.
+ */
 package com.spherify.app;
 
 import android.content.ContentResolver;
@@ -40,6 +83,13 @@ final class SpherifyLibrary {
     private final File draftMetadataFile;
     private final ArrayList<LibraryItem> items = new ArrayList<>();
 
+    /*
+     * Function: SpherifyLibrary constructor
+     * Arguments: context supplies Android filesystem and resolver access.
+     * Calls: getApplicationContext(), getFilesDir(), ensureDirs(), and load().
+     * Flow: resolve all library paths, create missing directories, then hydrate
+     * the in-memory items list from metadata.json.
+     */
     SpherifyLibrary(Context context) throws IOException {
         this.context = context.getApplicationContext();
         root = new File(context.getFilesDir(), "library");
@@ -53,6 +103,14 @@ final class SpherifyLibrary {
         load();
     }
 
+    /*
+     * Function: ensureBundledMaster
+     * Arguments: assetStream is an InputStream for the bundled demo image.
+     * Calls: copy(), makeThumbnail(), save(), and LibraryItem constructor.
+     * Flow: if a bundled master already exists, refresh its file/thumbnail and
+     * metadata; otherwise copy the asset into masters, create a thumbnail, add a
+     * new master record, and persist metadata.json.
+     */
     LibraryItem ensureBundledMaster(InputStream assetStream) throws IOException {
         for (LibraryItem item : items) {
             if (LibraryItem.TYPE_MASTER.equals(item.type) && "bundled".equals(item.source)) {
@@ -86,6 +144,15 @@ final class SpherifyLibrary {
         return item;
     }
 
+    /*
+     * Function: importImage
+     * Arguments: uri points to a user-selected image; projection records whether
+     * the user treats it as sphere, tinyplanet, or flat.
+     * Calls: ContentResolver.openInputStream(), copy(), BitmapFactory.decodeFile(),
+     * makeThumbnail(), LibraryItem constructor, and save().
+     * Flow: copy the selected image into masters, verify it decodes, generate a
+     * thumbnail, create a master LibraryItem, append it to items, and persist.
+     */
     LibraryItem importImage(Uri uri, String projection) throws IOException {
         long now = System.currentTimeMillis();
         String id = newId();
@@ -126,6 +193,15 @@ final class SpherifyLibrary {
         return item;
     }
 
+    /*
+     * Function: saveVariant
+     * Arguments: parent is the source LibraryItem, export holds generated files,
+     * and projection names the exported view type.
+     * Calls: copy(), LibraryItem constructor, saveToMediaStore(), and save().
+     * Flow: copy export image/thumbnail into managed folders, record a variant
+     * item linked to its parent, publish the image to Pictures/Spherify on
+     * supported Android versions, then persist metadata.json.
+     */
     LibraryItem saveVariant(LibraryItem parent, ProjectionExport export, String projection) throws IOException {
         long now = System.currentTimeMillis();
         String id = newId();
@@ -151,6 +227,13 @@ final class SpherifyLibrary {
         return item;
     }
 
+    /*
+     * Function: list
+     * Arguments: filter is a LibraryItem.FILTER_* value requested by MainActivity.
+     * Calls: LibraryItem.imageFile(), LibraryItem.matchesFilter(), and Collections.sort().
+     * Flow: return existing image records matching the filter, newest updated
+     * first, so the gallery never shows missing deleted files.
+     */
     List<LibraryItem> list(String filter) {
         ArrayList<LibraryItem> result = new ArrayList<>();
         for (LibraryItem item : items) {
@@ -162,6 +245,13 @@ final class SpherifyLibrary {
         return result;
     }
 
+    /*
+     * Function: listDraftFrames
+     * Arguments: none.
+     * Calls: File.listFiles() and Collections.sort().
+     * Flow: scan the drafts directory for JPEG files written by CameraX and
+     * return them newest first for the Draft Frames browser.
+     */
     List<File> listDraftFrames() {
         ArrayList<File> result = new ArrayList<>();
         File[] files = draftsDir.listFiles((dir, name) -> name.endsWith(".jpg"));
@@ -172,12 +262,27 @@ final class SpherifyLibrary {
         return result;
     }
 
+    /*
+     * Function: rename
+     * Arguments: item is the LibraryItem to mutate; title is the replacement
+     * user-visible label.
+     * Calls: save().
+     * Flow: trim and store the title, update the timestamp, then rewrite the
+     * metadata index.
+     */
     void rename(LibraryItem item, String title) throws IOException {
         item.title = title.trim();
         item.updatedAt = System.currentTimeMillis();
         save();
     }
 
+    /*
+     * Function: delete
+     * Arguments: item is the library record selected for deletion.
+     * Calls: deleteFile() for image and thumbnail, then save().
+     * Flow: remove the record from memory, delete local files if present, and
+     * persist the changed item list.
+     */
     void delete(LibraryItem item) throws IOException {
         items.remove(item);
         deleteFile(item.imageFile());
@@ -185,6 +290,13 @@ final class SpherifyLibrary {
         save();
     }
 
+    /*
+     * Function: describe
+     * Arguments: item is the library record to display.
+     * Calls: String concatenation only.
+     * Flow: produce the multiline metadata text shown by MainActivity's Info
+     * dialog.
+     */
     String describe(LibraryItem item) {
         return "Title: " + item.title
                 + "\nType: " + item.type
@@ -195,11 +307,26 @@ final class SpherifyLibrary {
                 + "\nCreated: " + item.createdAt;
     }
 
+    /*
+     * Function: createDraftFrameFile
+     * Arguments: none.
+     * Calls: mkdir() and File constructor.
+     * Flow: ensure the drafts folder exists and return a timestamped JPEG path
+     * where CaptureActivity/CameraX can write the next frame.
+     */
     File createDraftFrameFile() throws IOException {
         mkdir(draftsDir);
         return new File(draftsDir, "draft-frame-" + System.currentTimeMillis() + ".jpg");
     }
 
+    /*
+     * Function: recordDraftFrame
+     * Arguments: imageFile is the CameraX-written draft JPEG; locationSummary is
+     * an optional lat/long string from CaptureActivity.
+     * Calls: JSONArray/JSONObject parsing and FileOutputStream.
+     * Flow: load existing drafts.json if present, append a new path/timestamp/
+     * location object, and rewrite the formatted JSON file.
+     */
     void recordDraftFrame(File imageFile, String locationSummary) throws IOException {
         JSONArray array = new JSONArray();
         if (draftMetadataFile.exists()) {
@@ -227,6 +354,13 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: ensureDirs
+     * Arguments: none.
+     * Calls: mkdir() for each managed folder.
+     * Flow: create the library root and all content subdirectories before any
+     * import, export, draft, thumbnail, or metadata operation runs.
+     */
     private void ensureDirs() throws IOException {
         mkdir(root);
         mkdir(mastersDir);
@@ -235,6 +369,13 @@ final class SpherifyLibrary {
         mkdir(thumbnailsDir);
     }
 
+    /*
+     * Function: load
+     * Arguments: none.
+     * Calls: FileInputStream, JSONArray parser, and LibraryItem.fromJson().
+     * Flow: clear the in-memory list, read metadata.json if it exists, decode
+     * each JSON object into a LibraryItem, and surface corrupt JSON as IOException.
+     */
     private void load() throws IOException {
         items.clear();
         if (!metadataFile.exists()) {
@@ -256,6 +397,13 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: save
+     * Arguments: none.
+     * Calls: LibraryItem.toJson(), JSONArray.toString(), and FileOutputStream.
+     * Flow: encode every in-memory item into a JSON array and rewrite
+     * metadata.json atomically from the app's point of view.
+     */
     private void save() throws IOException {
         JSONArray array = new JSONArray();
         try {
@@ -272,6 +420,14 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: makeThumbnail
+     * Arguments: imageFile is the source image; id names the thumbnail file.
+     * Calls: BitmapFactory.decodeFile(), Bitmap.createScaledBitmap(), and
+     * Bitmap.compress().
+     * Flow: decode the source image, scale it to THUMBNAIL_SIZE square, write a
+     * JPEG thumbnail, recycle temporary bitmaps, and return the thumbnail File.
+     */
     private File makeThumbnail(File imageFile, String id) throws IOException {
         Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath());
         if (bitmap == null) {
@@ -290,6 +446,13 @@ final class SpherifyLibrary {
         return thumbnailFile;
     }
 
+    /*
+     * Function: saveToMediaStore
+     * Arguments: imageFile is a local PNG; title becomes a sanitized display name.
+     * Calls: ContentResolver.insert/openOutputStream/update/delete and copy().
+     * Flow: on Android Q+, create a pending image row in Pictures/Spherify, copy
+     * bytes into it, mark it complete, or delete the row if copying fails.
+     */
     private void saveToMediaStore(File imageFile, String title) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return;
@@ -318,18 +481,38 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: mkdir
+     * Arguments: file is the directory to ensure.
+     * Calls: File.exists() and File.mkdirs().
+     * Flow: create a directory tree if absent, otherwise throw IOException so the
+     * caller can stop before writing into a missing path.
+     */
     private static void mkdir(File file) throws IOException {
         if (!file.exists() && !file.mkdirs()) {
             throw new IOException("could not create " + file.getAbsolutePath());
         }
     }
 
+    /*
+     * Function: copy(InputStream, File)
+     * Arguments: input supplies bytes; destination is the target file.
+     * Calls: FileOutputStream constructor and copy(InputStream, OutputStream).
+     * Flow: open an output stream for the destination and delegate byte copying
+     * to the shared stream-to-stream helper.
+     */
     private static void copy(InputStream input, File destination) throws IOException {
         try (OutputStream output = new FileOutputStream(destination)) {
             copy(input, output);
         }
     }
 
+    /*
+     * Function: copy(File, File)
+     * Arguments: source and destination are filesystem paths.
+     * Calls: FileInputStream, FileOutputStream, and copy(InputStream, OutputStream).
+     * Flow: open streams for both files and delegate the buffered copy loop.
+     */
     private static void copy(File source, File destination) throws IOException {
         try (InputStream input = new FileInputStream(source);
              OutputStream output = new FileOutputStream(destination)) {
@@ -337,6 +520,12 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: copy(InputStream, OutputStream)
+     * Arguments: input is any readable stream; output is any writable stream.
+     * Calls: InputStream.read() and OutputStream.write().
+     * Flow: transfer bytes in 8 KB chunks until read() returns end-of-stream.
+     */
     private static void copy(InputStream input, OutputStream output) throws IOException {
         byte[] buffer = new byte[8192];
         int read;
@@ -345,12 +534,24 @@ final class SpherifyLibrary {
         }
     }
 
+    /*
+     * Function: deleteFile
+     * Arguments: file is the path to remove if it exists.
+     * Calls: File.exists() and File.delete().
+     * Flow: best-effort deletion used for local image and thumbnail cleanup.
+     */
     private static void deleteFile(File file) {
         if (file.exists()) {
             file.delete();
         }
     }
 
+    /*
+     * Function: newId
+     * Arguments: none.
+     * Calls: UUID.randomUUID() and String.replace().
+     * Flow: create a compact id without dashes for file names and metadata keys.
+     */
     private static String newId() {
         return UUID.randomUUID().toString().replace("-", "");
     }
