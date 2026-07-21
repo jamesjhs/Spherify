@@ -44,6 +44,8 @@ public class MainActivity extends Activity {
     private static final int REQUEST_LOCATION_PERMISSION = 1003;
     private static final String PREFS = "spherify";
     private static final String PREF_SETUP_COMPLETE = "setupComplete";
+    private static final String STATE_CURRENT_ITEM_ID = "currentItemId";
+    private static final String STATE_PROJECTION_PREFIX = "projection.";
 
     private GLProjectionView projectionView;
     private SpherifyLibrary library;
@@ -67,25 +69,44 @@ public class MainActivity extends Activity {
                 library.ensureBundledMaster(input);
             }
             List<LibraryItem> items = library.list(LibraryItem.FILTER_ALL);
-            currentItem = items.isEmpty() ? null : items.get(0);
+            currentItem = restoreCurrentItem(items, savedInstanceState);
         } catch (IOException e) {
             throw new IllegalStateException("could not initialize Spherify library", e);
         }
 
         projectionView = new GLProjectionView(this);
-        loadCurrentItem();
+        loadCurrentItem(savedInstanceState);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF071018);
 
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        titleRow.setPadding(18, 14, 18, 8);
+
         TextView title = new TextView(this);
-        title.setText("Spherify 0.2.3");
+        title.setText("Spherify");
         title.setTextColor(0xFFF8FAFC);
         title.setTextSize(20);
         title.setGravity(Gravity.CENTER_VERTICAL);
-        title.setPadding(18, 14, 18, 8);
-        root.addView(title, new LinearLayout.LayoutParams(
+        titleRow.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView version = new TextView(this);
+        version.setText("0.2.4");
+        version.setTextColor(0x8894A3B8);
+        version.setTextSize(12);
+        version.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams versionParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        versionParams.setMargins(8, 3, 0, 0);
+        titleRow.addView(version, versionParams);
+
+        root.addView(titleRow, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -179,6 +200,17 @@ public class MainActivity extends Activity {
         root.requestApplyInsets();
         updateLabels();
         showSetupFlowIfNeeded();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        if (currentItem != null) {
+            outState.putString(STATE_CURRENT_ITEM_ID, currentItem.id);
+        }
+        if (projectionView != null) {
+            projectionView.saveProjectionState(outState, STATE_PROJECTION_PREFIX);
+        }
     }
 
     @Override
@@ -710,6 +742,23 @@ public class MainActivity extends Activity {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
+    private LibraryItem restoreCurrentItem(List<LibraryItem> items, Bundle savedInstanceState) {
+        if (items.isEmpty()) {
+            return null;
+        }
+        if (savedInstanceState != null) {
+            String savedItemId = savedInstanceState.getString(STATE_CURRENT_ITEM_ID);
+            if (savedItemId != null) {
+                for (LibraryItem item : items) {
+                    if (savedItemId.equals(item.id)) {
+                        return item;
+                    }
+                }
+            }
+        }
+        return items.get(0);
+    }
+
     private void showMetadata() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -728,7 +777,7 @@ public class MainActivity extends Activity {
             openFlatViewer(currentItem);
             return;
         }
-        loadCurrentItem();
+        loadCurrentItem(null);
     }
 
     private void showCurrentItemActions() {
@@ -790,7 +839,7 @@ public class MainActivity extends Activity {
                         library.delete(item);
                         List<LibraryItem> items = library.list(LibraryItem.FILTER_ALL);
                         currentItem = items.isEmpty() ? null : items.get(0);
-                        loadCurrentItem();
+                        loadCurrentItem(null);
                     } catch (IOException e) {
                         Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                     }
@@ -835,7 +884,7 @@ public class MainActivity extends Activity {
             if (deletingCurrent) {
                 List<LibraryItem> allItems = library.list(LibraryItem.FILTER_ALL);
                 currentItem = allItems.isEmpty() ? null : allItems.get(0);
-                loadCurrentItem();
+                loadCurrentItem(null);
             }
             Toast.makeText(this, "Deleted " + item.title, Toast.LENGTH_SHORT).show();
         } catch (IOException e) {
@@ -844,6 +893,10 @@ public class MainActivity extends Activity {
     }
 
     private void loadCurrentItem() {
+        loadCurrentItem(null);
+    }
+
+    private void loadCurrentItem(Bundle savedProjectionState) {
         if (currentItem == null) {
             updateLabels();
             Toast.makeText(this, "The local library is empty", Toast.LENGTH_SHORT).show();
@@ -863,7 +916,11 @@ public class MainActivity extends Activity {
                 ? GLProjectionView.Mode.TINY_PLANET
                 : GLProjectionView.Mode.SPHERE);
         projectionView.setPanorama(bitmap, currentItem.projection);
-        projectionView.resetView();
+        if (savedProjectionState == null) {
+            projectionView.resetView();
+        } else {
+            projectionView.restoreProjectionState(savedProjectionState, STATE_PROJECTION_PREFIX);
+        }
         if (modeButton != null) {
             updateLabels();
         }

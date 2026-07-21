@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.opengl.GLUtils;
+import android.os.Bundle;
 import android.os.Environment;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
@@ -16,8 +17,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-import java.util.Locale;
-
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -101,6 +100,38 @@ public class GLProjectionView extends GLSurfaceView {
         return mode;
     }
 
+    public void saveProjectionState(Bundle outState, String prefix) {
+        outState.putString(prefix + "mode", mode.name());
+        outState.putFloat(prefix + "centerYaw", centerYaw);
+        outState.putFloat(prefix + "centerPitch", centerPitch);
+        outState.putFloat(prefix + "centerRoll", centerRoll);
+        outState.putFloat(prefix + "yaw", yaw);
+        outState.putFloat(prefix + "pitch", pitch);
+        outState.putFloat(prefix + "roll", roll);
+        outState.putFloat(prefix + "horizonOffset", horizonOffset);
+        outState.putFloat(prefix + "zoom", zoom);
+    }
+
+    public void restoreProjectionState(Bundle savedState, String prefix) {
+        String modeName = savedState.getString(prefix + "mode");
+        if (modeName != null) {
+            try {
+                mode = Mode.valueOf(modeName);
+            } catch (IllegalArgumentException ignored) {
+                mode = Mode.SPHERE;
+            }
+        }
+        centerYaw = savedState.getFloat(prefix + "centerYaw", 0f);
+        centerPitch = savedState.getFloat(prefix + "centerPitch", 0f);
+        centerRoll = savedState.getFloat(prefix + "centerRoll", 0f);
+        yaw = savedState.getFloat(prefix + "yaw", 0f);
+        pitch = savedState.getFloat(prefix + "pitch", 0f);
+        roll = savedState.getFloat(prefix + "roll", 0f);
+        horizonOffset = savedState.getFloat(prefix + "horizonOffset", 0f);
+        zoom = Math.max(savedState.getFloat(prefix + "zoom", 1f), getMinimumZoom());
+        pushStateToRenderer();
+    }
+
     public void setMode(Mode mode) {
         this.mode = mode;
         zoom = Math.max(zoom, getMinimumZoom());
@@ -109,11 +140,7 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     public String getStatusText() {
-        String modeName = mode == Mode.SPHERE ? "Photo Sphere" : "Tiny Planet";
-        return String.format(Locale.US, "%s  |  GPU preview  |  FOV %.0f  |  horizon %.0f",
-                modeName,
-                getFieldOfViewDegrees(),
-                getEyeElevationDegrees());
+        return mode == Mode.SPHERE ? "Photo Sphere" : "Tiny Planet";
     }
 
     public void toggleMode() {
@@ -302,6 +329,7 @@ public class GLProjectionView extends GLSurfaceView {
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
         double aspect = width / (double) height;
+        boolean flipSourceVertically = mode == Mode.TINY_PLANET;
 
         for (int y = 0; y < height; y++) {
             double rowPosition = 2.0 * y / Math.max(1, height - 1);
@@ -312,8 +340,8 @@ public class GLProjectionView extends GLSurfaceView {
                         ? sampleSphere(nx, ny, yawRad, pitchRad)
                         : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
                 pixels[y * width + x] = sourceTinyPlanet
-                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad)
-                        : samplePanorama(sample.u, sample.v, horizonOffsetRad);
+                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad, flipSourceVertically)
+                        : samplePanorama(sample.u, sample.v, horizonOffsetRad, flipSourceVertically);
             }
         }
 
@@ -385,19 +413,30 @@ public class GLProjectionView extends GLSurfaceView {
         return new Sample(u, v, x, y, z);
     }
 
-    private int samplePanorama(double u, double v, double horizonOffsetRad) {
+    private int samplePanorama(double u, double v, double horizonOffsetRad, boolean flipSourceVertically) {
         int sourceX = wrap((int) (u * panoramaWidth), panoramaWidth);
         v += horizonOffsetRad / Math.PI;
+        if (flipSourceVertically) {
+            v = 1.0 - v;
+        }
         int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
     }
 
-    private int sampleTinyPlanetSource(double x, double y, double z, double horizonOffsetRad) {
+    private int sampleTinyPlanetSource(
+            double x,
+            double y,
+            double z,
+            double horizonOffsetRad,
+            boolean flipSourceVertically) {
         double polar = clamp(Math.acos(clamp(y, -1.0, 1.0)) + horizonOffsetRad, 0.0, Math.PI - 0.001);
         double radius = Math.tan(polar * 0.5);
         double angle = Math.atan2(z, x);
         double u = 0.5 + Math.cos(angle) * radius * 0.5;
         double v = 0.5 + Math.sin(angle) * radius * 0.5;
+        if (flipSourceVertically) {
+            v = 1.0 - v;
+        }
         int sourceX = clamp((int) (u * panoramaWidth), 0, panoramaWidth - 1);
         int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
