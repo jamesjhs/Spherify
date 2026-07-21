@@ -25,6 +25,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -32,6 +33,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
 import java.util.List;
+import java.util.Locale;
 
 import androidx.core.content.FileProvider;
 import androidx.core.content.ContextCompat;
@@ -48,13 +50,12 @@ public class MainActivity extends Activity {
     private LibraryItem currentItem;
     private TextView statusText;
     private Button modeButton;
-    private Button recenterButton;
+    private Button adjustButton;
     private AlertDialog activeLibraryDialog;
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
     private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
     private static final float GALLERY_DELETE_VERTICAL_SLOP = 90f;
-    private static final int GALLERY_DELETE_HANDLE_WIDTH = 110;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -79,7 +80,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(0xFF071018);
 
         TextView title = new TextView(this);
-        title.setText("Spherify 0.2.2");
+        title.setText("Spherify 0.2.3");
         title.setTextColor(0xFFF8FAFC);
         title.setTextSize(20);
         title.setGravity(Gravity.CENTER_VERTICAL);
@@ -120,12 +121,8 @@ public class MainActivity extends Activity {
             updateLabels();
         });
 
-        recenterButton = makeButton("Recentre");
-        recenterButton.setOnClickListener(v -> {
-            projectionView.recentre();
-            updateLabels();
-            Toast.makeText(this, "Current alignment is now the centre", Toast.LENGTH_SHORT).show();
-        });
+        adjustButton = makeButton("Adjust");
+        adjustButton.setOnClickListener(v -> showAdjustDialog());
 
         Button resetButton = makeButton("Reset");
         resetButton.setOnClickListener(v -> {
@@ -137,7 +134,7 @@ public class MainActivity extends Activity {
         exportButton.setOnClickListener(v -> exportCurrentView());
 
         controls.addView(modeButton);
-        controls.addView(recenterButton);
+        controls.addView(adjustButton);
         controls.addView(resetButton);
         controls.addView(exportButton);
         root.addView(controls, new LinearLayout.LayoutParams(
@@ -417,6 +414,100 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void showAdjustDialog() {
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            openFlatViewer(currentItem);
+            return;
+        }
+
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.VERTICAL);
+        controls.setPadding(28, 14, 28, 0);
+
+        addAdjustmentControl(
+                controls,
+                "Field of view",
+                30,
+                180,
+                Math.round(projectionView.getFieldOfViewDegrees()),
+                "deg",
+                value -> projectionView.setFieldOfViewDegrees(value));
+        addAdjustmentControl(
+                controls,
+                "Image rotation",
+                -180,
+                180,
+                Math.round(projectionView.getImageRotationDegrees()),
+                "deg",
+                value -> projectionView.setImageRotationDegrees(value));
+
+        addAdjustmentControl(
+                controls,
+                "Horizon reference",
+                -75,
+                75,
+                Math.round(projectionView.getEyeElevationDegrees()),
+                "deg",
+                value -> projectionView.setEyeElevationDegrees(value));
+
+        new AlertDialog.Builder(this)
+                .setTitle("Adjust")
+                .setView(controls)
+                .setNegativeButton("Reset", (dialog, which) -> {
+                    projectionView.resetView();
+                    updateLabels();
+                })
+                .setPositiveButton("Done", (dialog, which) -> updateLabels())
+                .show();
+    }
+
+    private void addAdjustmentControl(
+            LinearLayout parent,
+            String label,
+            int min,
+            int max,
+            int current,
+            String suffix,
+            AdjustmentHandler handler) {
+        TextView valueLabel = new TextView(this);
+        valueLabel.setTextColor(0xFF0F172A);
+        valueLabel.setTextSize(14);
+        parent.addView(valueLabel);
+
+        SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(max - min);
+        seekBar.setProgress(clamp(current, min, max) - min);
+        parent.addView(seekBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        Runnable updateValueLabel = () -> valueLabel.setText(String.format(
+                Locale.US,
+                "%s: %d %s",
+                label,
+                min + seekBar.getProgress(),
+                suffix));
+        updateValueLabel.run();
+
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int value = min + progress;
+                valueLabel.setText(String.format(Locale.US, "%s: %d %s", label, value, suffix));
+                handler.onValueChanged(value);
+                updateLabels();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+    }
+
     private void saveCurrentExport() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
@@ -465,7 +556,7 @@ public class MainActivity extends Activity {
     }
 
     private void chooseImportedImageType(Uri uri) {
-        String[] labels = {"PhotoSphere", "Tiny Planet", "Flat"};
+        String[] labels = {"Photo Sphere", "Tiny Planet", "Flat"};
         String[] projections = {"sphere", "tinyplanet", "flat"};
         new AlertDialog.Builder(this)
                 .setTitle("Image type")
@@ -615,6 +706,10 @@ public class MainActivity extends Activity {
         return FileProvider.getUriForFile(this, getPackageName() + ".files", file);
     }
 
+    private static int clamp(int value, int minimum, int maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
+    }
+
     private void showMetadata() {
         if (currentItem == null) {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
@@ -685,13 +780,14 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "No selected library item", Toast.LENGTH_SHORT).show();
             return;
         }
+        LibraryItem item = currentItem;
         new AlertDialog.Builder(this)
-                .setTitle("Delete")
-                .setMessage("Delete " + currentItem.title + " from the local Spherify library?")
+                .setTitle("Delete image")
+                .setMessage("Are you sure you want to delete? This action cannot be undone.\n\n" + item.title)
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Delete", (dialog, which) -> {
                     try {
-                        library.delete(currentItem);
+                        library.delete(item);
                         List<LibraryItem> items = library.list(LibraryItem.FILTER_ALL);
                         currentItem = items.isEmpty() ? null : items.get(0);
                         loadCurrentItem();
@@ -703,6 +799,30 @@ public class MainActivity extends Activity {
     }
 
     private void deleteGalleryItem(LibraryItem item, BaseAdapter adapter, List<LibraryItem> visibleItems) {
+        deleteGalleryItem(item, adapter, visibleItems, null);
+    }
+
+    private void deleteGalleryItem(
+            LibraryItem item,
+            BaseAdapter adapter,
+            List<LibraryItem> visibleItems,
+            View swipedRow) {
+        new AlertDialog.Builder(this)
+                .setTitle("Delete image")
+                .setMessage("Are you sure you want to delete? This action cannot be undone.\n\n" + item.title)
+                .setNegativeButton("Cancel", (dialog, which) -> resetSwipedRow(swipedRow))
+                .setOnCancelListener(dialog -> resetSwipedRow(swipedRow))
+                .setPositiveButton("Delete", (dialog, which) -> performGalleryDelete(item, adapter, visibleItems))
+                .show();
+    }
+
+    private void resetSwipedRow(View row) {
+        if (row != null) {
+            row.animate().translationX(0f).alpha(1f).setDuration(120).start();
+        }
+    }
+
+    private void performGalleryDelete(LibraryItem item, BaseAdapter adapter, List<LibraryItem> visibleItems) {
         try {
             boolean deletingCurrent = currentItem != null && currentItem.id.equals(item.id);
             library.delete(item);
@@ -750,21 +870,25 @@ public class MainActivity extends Activity {
     }
 
     private void updateLabels() {
-        if (modeButton == null || recenterButton == null || statusText == null) {
+        if (modeButton == null || adjustButton == null || statusText == null) {
             return;
         }
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             modeButton.setText("Open Flat");
-            recenterButton.setText("Recentre");
+            adjustButton.setText("Adjust");
             statusText.setText(currentItem.title + "  |  Flat image");
             return;
         }
         modeButton.setText(projectionView.getMode() == GLProjectionView.Mode.SPHERE
                 ? "Tiny Planet"
-                : "PhotoSphere");
-        recenterButton.setText("Recentre");
+                : "Photo Sphere");
+        adjustButton.setText("Adjust");
         String title = currentItem == null ? "No item selected" : currentItem.title;
         statusText.setText(title + "  |  " + projectionView.getStatusText());
+    }
+
+    private interface AdjustmentHandler {
+        void onValueChanged(int value);
     }
 
     private final class LibraryAdapter extends BaseAdapter {
@@ -802,6 +926,7 @@ public class MainActivity extends Activity {
             deleteLabel.setTextSize(15);
             deleteLabel.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
             deleteLabel.setPadding(18, 0, 24, 0);
+            deleteLabel.setAlpha(0f);
             container.addView(deleteLabel, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT));
@@ -844,7 +969,6 @@ public class MainActivity extends Activity {
             FrameLayout.LayoutParams rowParams = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT);
-            rowParams.setMargins(0, 0, GALLERY_DELETE_HANDLE_WIDTH, 0);
             container.addView(row, rowParams);
 
             float[] downX = new float[1];
@@ -858,6 +982,7 @@ public class MainActivity extends Activity {
                         downY[0] = event.getRawY();
                         swiping[0] = false;
                         deleted[0] = false;
+                        deleteLabel.setAlpha(0f);
                         row.setAlpha(1f);
                         row.setTranslationX(0f);
                         return true;
@@ -868,10 +993,11 @@ public class MainActivity extends Activity {
                             swiping[0] = true;
                             view.getParent().requestDisallowInterceptTouchEvent(true);
                             row.setTranslationX(Math.max(dx, -GALLERY_DELETE_SWIPE_DISTANCE));
+                            deleteLabel.setAlpha(Math.min(1f, Math.max(0f, (-dx - 24f) / 80f)));
                             if (!deleted[0] && dx <= -GALLERY_DELETE_SWIPE_DISTANCE) {
                                 deleted[0] = true;
-                                row.animate().translationX(-view.getWidth()).alpha(0.2f).setDuration(120).start();
-                                deleteGalleryItem(item, LibraryAdapter.this, items);
+                                row.animate().translationX(-GALLERY_DELETE_SWIPE_DISTANCE).alpha(0.9f).setDuration(120).start();
+                                deleteGalleryItem(item, LibraryAdapter.this, items, row);
                             }
                         }
                         return true;
@@ -885,6 +1011,7 @@ public class MainActivity extends Activity {
                             openGalleryItem(item);
                         } else if (!deleted[0]) {
                             row.animate().translationX(0f).alpha(1f).setDuration(120).start();
+                            deleteLabel.animate().alpha(0f).setDuration(120).start();
                         }
                         return true;
                     default:

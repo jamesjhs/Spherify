@@ -30,6 +30,7 @@ public class GLProjectionView extends GLSurfaceView {
     private static final int EXPORT_SIZE = 1600;
     private static final int THUMBNAIL_SIZE = 320;
     private static final float PHOTOSPHERE_BASE_ROLL_DEGREES = 180f;
+    private static final float BASE_FIELD_OF_VIEW_DEGREES = 92f;
 
     private final ProjectionRenderer renderer;
     private final ScaleGestureDetector scaleDetector;
@@ -45,6 +46,7 @@ public class GLProjectionView extends GLSurfaceView {
     private float yaw;
     private float pitch;
     private float roll;
+    private float horizonOffset;
     private float zoom = 1f;
     private float lastX;
     private float lastY;
@@ -89,6 +91,7 @@ public class GLProjectionView extends GLSurfaceView {
         yaw = 0f;
         pitch = 0f;
         roll = 0f;
+        horizonOffset = 0f;
         boolean currentSourceTinyPlanet = sourceTinyPlanet;
         queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyPlanet));
         pushStateToRenderer();
@@ -106,12 +109,11 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     public String getStatusText() {
-        String modeName = mode == Mode.SPHERE ? "PhotoSphere" : "Tiny Planet";
-        return String.format(Locale.US, "%s  |  GPU preview  |  zoom %.2fx  |  centre %.0f/%.0f",
+        String modeName = mode == Mode.SPHERE ? "Photo Sphere" : "Tiny Planet";
+        return String.format(Locale.US, "%s  |  GPU preview  |  FOV %.0f  |  horizon %.0f",
                 modeName,
-                zoom,
-                centerYaw,
-                centerPitch);
+                getFieldOfViewDegrees(),
+                getEyeElevationDegrees());
     }
 
     public void toggleMode() {
@@ -137,7 +139,35 @@ public class GLProjectionView extends GLSurfaceView {
         yaw = 0f;
         pitch = 0f;
         roll = 0f;
+        horizonOffset = 0f;
         zoom = 1f;
+        pushStateToRenderer();
+    }
+
+    public float getFieldOfViewDegrees() {
+        return BASE_FIELD_OF_VIEW_DEGREES / zoom;
+    }
+
+    public void setFieldOfViewDegrees(float degrees) {
+        zoom = clamp(BASE_FIELD_OF_VIEW_DEGREES / clamp(degrees, 30f, 180f), getMinimumZoom(), 5f);
+        pushStateToRenderer();
+    }
+
+    public float getImageRotationDegrees() {
+        return roll;
+    }
+
+    public void setImageRotationDegrees(float degrees) {
+        roll = normalizeDegrees(degrees);
+        pushStateToRenderer();
+    }
+
+    public float getEyeElevationDegrees() {
+        return horizonOffset;
+    }
+
+    public void setEyeElevationDegrees(float degrees) {
+        horizonOffset = clamp(degrees, -75f, 75f);
         pushStateToRenderer();
     }
 
@@ -249,12 +279,14 @@ public class GLProjectionView extends GLSurfaceView {
         float currentYaw = getEffectiveYaw();
         float currentPitch = getEffectivePitch();
         float currentRoll = getEffectiveRoll();
+        float currentHorizonOffset = horizonOffset;
         float currentZoom = zoom;
         queueEvent(() -> renderer.setState(
                 currentMode,
                 currentYaw,
                 currentPitch,
                 currentRoll,
+                currentHorizonOffset,
                 currentZoom));
         requestRender();
     }
@@ -266,20 +298,22 @@ public class GLProjectionView extends GLSurfaceView {
         double yawRad = Math.toRadians(getEffectiveYaw());
         double pitchRad = Math.toRadians(getEffectivePitch());
         double rollRad = Math.toRadians(getEffectiveRoll());
+        double horizonOffsetRad = Math.toRadians(horizonOffset);
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
         double aspect = width / (double) height;
 
         for (int y = 0; y < height; y++) {
-            double ny = (2.0 * y / Math.max(1, height - 1)) - 1.0;
+            double rowPosition = 2.0 * y / Math.max(1, height - 1);
+            double ny = mode == Mode.TINY_PLANET ? 1.0 - rowPosition : rowPosition - 1.0;
             for (int x = 0; x < width; x++) {
                 double nx = ((2.0 * x / Math.max(1, width - 1)) - 1.0) * aspect;
                 Sample sample = mode == Mode.SPHERE
                         ? sampleSphere(nx, ny, yawRad, pitchRad)
                         : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
                 pixels[y * width + x] = sourceTinyPlanet
-                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z)
-                        : samplePanorama(sample.u, sample.v);
+                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad)
+                        : samplePanorama(sample.u, sample.v, horizonOffsetRad);
             }
         }
 
@@ -293,7 +327,7 @@ public class GLProjectionView extends GLSurfaceView {
         double sinRoll = Math.sin(rollRad);
         double rx = nx * cosRoll - ny * sinRoll;
         double ry = nx * sinRoll + ny * cosRoll;
-        double fov = Math.toRadians(92.0 / zoom);
+        double fov = Math.toRadians(BASE_FIELD_OF_VIEW_DEGREES / zoom);
         double spread = Math.tan(fov * 0.5);
 
         double forwardX = Math.sin(yawRad) * Math.cos(pitchRad);
@@ -330,17 +364,17 @@ public class GLProjectionView extends GLSurfaceView {
         double sy = Math.cos(polar);
         double sz = Math.sin(polar) * Math.sin(angle);
 
-        double cp = Math.cos(pitchRad);
-        double sp = Math.sin(pitchRad);
-        double y1 = cp * sy - sp * sz;
-        double z1 = sp * sy + cp * sz;
-
         double cy = Math.cos(yawRad);
         double syaw = Math.sin(yawRad);
-        double x2 = cy * sx + syaw * z1;
-        double z2 = -syaw * sx + cy * z1;
+        double x1 = cy * sx + syaw * sz;
+        double z1 = -syaw * sx + cy * sz;
 
-        return directionToSample(x2, y1, z2);
+        double cp = Math.cos(pitchRad);
+        double sp = Math.sin(pitchRad);
+        double y2 = cp * sy - sp * z1;
+        double z2 = sp * sy + cp * z1;
+
+        return directionToSample(x1, y2, z2);
     }
 
     private Sample directionToSample(double x, double y, double z) {
@@ -351,14 +385,15 @@ public class GLProjectionView extends GLSurfaceView {
         return new Sample(u, v, x, y, z);
     }
 
-    private int samplePanorama(double u, double v) {
+    private int samplePanorama(double u, double v, double horizonOffsetRad) {
         int sourceX = wrap((int) (u * panoramaWidth), panoramaWidth);
+        v += horizonOffsetRad / Math.PI;
         int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
     }
 
-    private int sampleTinyPlanetSource(double x, double y, double z) {
-        double polar = Math.acos(clamp(y, -1.0, 1.0));
+    private int sampleTinyPlanetSource(double x, double y, double z, double horizonOffsetRad) {
+        double polar = clamp(Math.acos(clamp(y, -1.0, 1.0)) + horizonOffsetRad, 0.0, Math.PI - 0.001);
         double radius = Math.tan(polar * 0.5);
         double angle = Math.atan2(z, x);
         double u = 0.5 + Math.cos(angle) * radius * 0.5;
@@ -468,6 +503,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "uniform float uRoll;\n" +
                 "uniform float uZoom;\n" +
                 "uniform float uAspect;\n" +
+                "uniform float uHorizonOffset;\n" +
                 "uniform int uSourceProjection;\n" +
                 "const float PI = 3.14159265358979323846;\n" +
                 "vec3 rotateYawPitch(vec3 d) {\n" +
@@ -485,11 +521,11 @@ public class GLProjectionView extends GLSurfaceView {
                 "  float longitude = atan(d.x, d.z);\n" +
                 "  float latitude = asin(clamp(d.y, -1.0, 1.0));\n" +
                 "  float u = fract(longitude / (2.0 * PI) + 0.5);\n" +
-                "  float v = clamp(0.5 - latitude / PI, 0.0, 1.0);\n" +
+                "  float v = clamp(0.5 - latitude / PI + uHorizonOffset / PI, 0.0, 1.0);\n" +
                 "  return vec2(u, v);\n" +
                 "}\n" +
                 "vec2 tinyPlanetUv(vec3 d) {\n" +
-                "  float polar = acos(clamp(d.y, -1.0, 1.0));\n" +
+                "  float polar = clamp(acos(clamp(d.y, -1.0, 1.0)) + uHorizonOffset, 0.0, PI - 0.001);\n" +
                 "  float radius = tan(polar * 0.5);\n" +
                 "  float angle = atan(d.z, d.x);\n" +
                 "  vec2 uv = vec2(0.5 + cos(angle) * radius * 0.5, 0.5 + sin(angle) * radius * 0.5);\n" +
@@ -543,6 +579,7 @@ public class GLProjectionView extends GLSurfaceView {
         private int rollHandle;
         private int zoomHandle;
         private int aspectHandle;
+        private int horizonOffsetHandle;
         private int sourceProjectionHandle;
         private int viewportWidth = 1;
         private int viewportHeight = 1;
@@ -551,6 +588,7 @@ public class GLProjectionView extends GLSurfaceView {
         private float yaw;
         private float pitch;
         private float roll;
+        private float horizonOffset;
         private float zoom = 1f;
 
         ProjectionRenderer() {
@@ -565,11 +603,12 @@ public class GLProjectionView extends GLSurfaceView {
             }
         }
 
-        void setState(Mode mode, float yaw, float pitch, float roll, float zoom) {
+        void setState(Mode mode, float yaw, float pitch, float roll, float horizonOffset, float zoom) {
             this.mode = mode;
             this.yaw = yaw;
             this.pitch = pitch;
             this.roll = roll;
+            this.horizonOffset = horizonOffset;
             this.zoom = zoom;
         }
 
@@ -585,6 +624,7 @@ public class GLProjectionView extends GLSurfaceView {
             rollHandle = GLES20.glGetUniformLocation(program, "uRoll");
             zoomHandle = GLES20.glGetUniformLocation(program, "uZoom");
             aspectHandle = GLES20.glGetUniformLocation(program, "uAspect");
+            horizonOffsetHandle = GLES20.glGetUniformLocation(program, "uHorizonOffset");
             sourceProjectionHandle = GLES20.glGetUniformLocation(program, "uSourceProjection");
             uploadPendingPanorama();
         }
@@ -613,6 +653,7 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glUniform1f(rollHandle, (float) Math.toRadians(roll));
             GLES20.glUniform1f(zoomHandle, zoom);
             GLES20.glUniform1f(aspectHandle, viewportWidth / (float) viewportHeight);
+            GLES20.glUniform1f(horizonOffsetHandle, (float) Math.toRadians(horizonOffset));
             GLES20.glUniform1i(sourceProjectionHandle, sourceTinyPlanet ? 1 : 0);
 
             GLES20.glEnableVertexAttribArray(positionHandle);

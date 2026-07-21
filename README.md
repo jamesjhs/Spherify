@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.2.0
+Version: 0.2.3
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.2.0 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, and a CameraX capture shell that saves draft frames.
+This repository now contains the first Android proof-of-concept application code. The 0.2.3 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, and a CameraX capture shell that saves draft frames.
 
 ## Developer Build and Run Runbook
 
@@ -992,7 +992,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.2.0, license, acknowledgements.
+- About: version 0.2.3, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 
