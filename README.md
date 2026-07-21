@@ -2,9 +2,9 @@
 
 Version: 0.2.0
 
-Spherify is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny World images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
+Spherify is an early-stage Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.2.0 build includes a GPU-backed PhotoSphere/Tiny World viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, and a CameraX capture shell that saves draft frames.
+This repository now contains the first Android proof-of-concept application code. The 0.2.0 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, and a CameraX capture shell that saves draft frames.
 
 ## Developer Build and Run Runbook
 
@@ -399,7 +399,7 @@ Use this path when testing:
 - Navigation.
 - Layout and Compose rendering.
 - PhotoSphere viewer rendering.
-- Tiny World reprojection controls.
+- Tiny Planet reprojection controls.
 - Import/export flows that do not require real camera behavior.
 - Permission copy and denial paths.
 - Different screen sizes, densities, orientations, and Android versions.
@@ -728,7 +728,7 @@ The app behaves differently on emulator and real phone:
 
 ### 2026-07-20: First Research Pass
 
-The original spark is nicely ambitious: make a free Android app that can guide a user through capturing a full 360 x 180 scene, use the camera plus accelerometer, gyroscope, compass, and location services to stabilize and orient the capture, stitch and exposure-balance the frames, save the result to device storage, and later browse or reproject the saved images between PhotoSphere and Tiny World views.
+The original spark is nicely ambitious: make a free Android app that can guide a user through capturing a full 360 x 180 scene, use the camera plus accelerometer, gyroscope, compass, and location services to stabilize and orient the capture, stitch and exposure-balance the frames, save the result to device storage, and later browse or reproject the saved images between PhotoSphere and Tiny Planet views.
 
 The core file format target should be an equirectangular JPEG master at a 2:1 aspect ratio. Google Maps' own Photo Sphere guidance expects 7.5 MP or larger, a 2:1 image, no more than 75 MB, no horizon gaps, and no major stitching errors. That makes a 3840 x 1920 output the minimum credible target, with higher resolutions desirable on modern phones.
 
@@ -736,7 +736,7 @@ The best product direction is probably not "one-click magic" at first. A realist
 
 ### Current Market Notes
 
-I did not find a clearly free current Android or PWA offering that does all of the desired pieces in one place: guided phone-only PhotoSphere capture, sensor-assisted stabilization/orientation, image matching and exposure compensation, Tiny World generation, local gallery, reversible reprojection browser, Google Photos integration, and Google Maps publishing.
+I did not find a clearly free current Android or PWA offering that does all of the desired pieces in one place: guided phone-only PhotoSphere capture, sensor-assisted stabilization/orientation, image matching and exposure compensation, Tiny Planet generation, local gallery, reversible reprojection browser, Google Photos integration, and Google Maps publishing.
 
 There are partial products:
 
@@ -746,7 +746,7 @@ There are partial products:
 - Tiny Planet - Global Photo focuses on turning photos/panoramas into Tiny Planet or wormhole-style images, with import/camera/export features.
 - Web libraries such as Photo Sphere Viewer, Pannellum, and Marzipano are excellent for viewing equirectangular panoramas in browsers, but they are viewers/toolkits rather than complete phone capture, stitch, local-gallery, and Google-publishing products.
 
-The gap seems real: the market has viewers, editors, uploaders, and capture apps, but not a polished free app that combines the whole workflow and treats Tiny World and PhotoSphere as two projections of the same saved master.
+The gap seems real: the market has viewers, editors, uploaders, and capture apps, but not a polished free app that combines the whole workflow and treats Tiny Planet and PhotoSphere as two projections of the same saved master.
 
 ### Google Platform Reality
 
@@ -776,7 +776,7 @@ The hard engineering work is the stitching pipeline:
 - Horizon correction and nadir/zenith handling.
 - Robust behavior across ultra-wide, wide, and telephoto lenses.
 
-The Tiny World feature is easier if it is treated as a reprojection of an equirectangular master using stereographic projection. The reverse direction is only lossless when the original equirectangular master is retained. A flattened Tiny World export alone does not contain enough information to reconstruct a full PhotoSphere.
+The Tiny Planet feature is easier if it is treated as a reprojection of an equirectangular master using stereographic projection. The reverse direction is only lossless when the original equirectangular master is retained. A flattened Tiny Planet export alone does not contain enough information to reconstruct a full PhotoSphere.
 
 ### PWA Versus Android Native
 
@@ -791,7 +791,7 @@ The first useful app could be:
 - Capture: guided sphere capture with orientation targets, overlap hints, exposure lock, and live progress.
 - Process: stitch source frames into an equirectangular PhotoSphere master, store source frames for later reprocessing, and generate preview thumbnails.
 - Browse: local gallery of Spherify captures and imports.
-- Reproject: interactive PhotoSphere view, Tiny World view, wormhole/inverted view, horizon rotation, zoom, roll, and export.
+- Reproject: interactive PhotoSphere view, Tiny Planet view, wormhole/inverted view, horizon rotation, zoom, roll, and export.
 - Save: write masters and exported projections to device storage.
 - Publish: upload app-created images to Google Photos, share/export to Google Maps manually, and later add Street View Publish API support.
 
@@ -799,7 +799,7 @@ The first useful app could be:
 
 Before the first line of app code, the product needs a few design decisions pinned down. These are not visual-polish questions; they determine whether the app can feel trustworthy, stable, and feasible.
 
-The app should be designed around a local-first library. Google Photos and Google Maps should feel like export destinations, not the place where the app's primary state lives. The local library should keep a durable record for every capture: source frame set, stitched equirectangular master, exported Tiny World variants, capture metadata, processing status, and publishing status. That gives the user confidence that a failed upload or later API change will not strand their work.
+The app should be designed around a local-first library. Google Photos and Google Maps should feel like export destinations, not the place where the app's primary state lives. The local library should keep a durable record for every capture: source frame set, stitched equirectangular master, exported Tiny Planet variants, capture metadata, processing status, and publishing status. That gives the user confidence that a failed upload or later API change will not strand their work.
 
 The permission model should be contextual and progressive. Android guidance says runtime permissions should be requested when the user starts the feature that needs them, not at app startup. For Spherify this means:
 
@@ -809,7 +809,7 @@ The permission model should be contextual and progressive. Android guidance says
 - Google account authorization appears only when the user chooses Google Photos upload or Google Maps/Street View publishing.
 - Motion sensors should be used while capture is visible and active, with no background collection.
 
-The app should also be useful when optional permissions are denied. Without location, the user can still create and save PhotoSpheres and Tiny Worlds, but exports will not be map-ready until location is added manually. Without Google sign-in, the user can still save locally and share files. Without photo-library access, the user can still use the Spherify library and select individual external images through the picker.
+The app should also be useful when optional permissions are denied. Without location, the user can still create and save PhotoSpheres and Tiny Planets, but exports will not be map-ready until location is added manually. Without Google sign-in, the user can still save locally and share files. Without photo-library access, the user can still use the Spherify library and select individual external images through the picker.
 
 The minimum viable technical surface should include:
 
@@ -818,7 +818,7 @@ The minimum viable technical surface should include:
 - Foreground-only location capture for optional geotagging.
 - Local storage with app-owned image access.
 - Equirectangular image viewer.
-- Stereographic Tiny World renderer/exporter.
+- Stereographic Tiny Planet renderer/exporter.
 - Processing queue with resumable stitch/reproject jobs.
 - Metadata editor for title, location, orientation, projection, and publishing readiness.
 
@@ -828,7 +828,7 @@ The minimum viable design surface should include:
 - One primary action: start capture or import image.
 - A capture screen that is mostly camera preview, with a sphere coverage guide and minimal controls.
 - A processing screen that explains progress without pretending stitching is instant.
-- A viewer/editor that treats PhotoSphere and Tiny World as modes of the same master image.
+- A viewer/editor that treats PhotoSphere and Tiny Planet as modes of the same master image.
 - A publish/export sheet that separates local save, Google Photos upload, Google Maps publish/share, and generic Android share.
 
 ### Workflow Investigation
@@ -927,15 +927,15 @@ The user should be able to fix what can be fixed:
 
 5. Local browsing and reprojection
 
-The gallery should be the emotional center of the app. It should make later re-use pleasant, not merely list files. Each item should show a thumbnail, projection badges, capture date, location status, and publish status. Filters should include Drafts, Masters, Tiny Worlds, Map-ready, Uploaded, Needs review, and Imports.
+The gallery should be the emotional center of the app. It should make later re-use pleasant, not merely list files. Each item should show a thumbnail, projection badges, capture date, location status, and publish status. Filters should include Drafts, Masters, Tiny Planets, Map-ready, Uploaded, Needs review, and Imports.
 
 Opening an item should launch the viewer/editor. The main viewer modes:
 
 - PhotoSphere: interactive immersive viewer with pan, tilt, zoom, gyro look-around toggle, compass overlay, and reset view.
-- Tiny World: stereographic projection with planet/wormhole toggle, roll, zoom, center point, horizon bend, rotation, and field-of-view controls.
+- Tiny Planet: stereographic projection with planet/wormhole toggle, roll, zoom, center point, horizon bend, rotation, and field-of-view controls.
 - Equirectangular: flat technical view for checking seams, metadata, and map readiness.
 
-The bonus "on-the-fly image browser" should be designed as a non-destructive projection workspace. The master image remains untouched. Each Tiny World or adjusted PhotoSphere is a saved variant linked back to the master. If the user imports a Tiny World-only flat image, the app should treat it as a flat image and not pretend it can reconstruct the original sphere.
+The bonus "on-the-fly image browser" should be designed as a non-destructive projection workspace. The master image remains untouched. Each Tiny Planet or adjusted PhotoSphere is a saved variant linked back to the master. If the user imports a Tiny Planet-only flat image, the app should treat it as a flat image and not pretend it can reconstruct the original sphere.
 
 6. Export and publish
 
@@ -981,7 +981,7 @@ The Capture screen should hide bottom navigation while active. It should use the
 
 The Processing screen should look like a job card list, not a modal trap. Users should be able to leave processing and return later. Each job shows thumbnail, current stage, elapsed time, estimated remaining time if meaningful, and actions for pause, cancel, or view draft.
 
-The Viewer/Editor screen should have a full-bleed image viewer with a compact mode switch: Sphere, Tiny World, Flat. Editing controls should slide up only when needed. For Tiny World, the most important controls are center, zoom, twist/roll, invert, and export. For PhotoSphere, the important controls are heading, horizon, gyro toggle, metadata, and export.
+The Viewer/Editor screen should have a full-bleed image viewer with a compact mode switch: Sphere, Tiny Planet, Flat. Editing controls should slide up only when needed. For Tiny Planet, the most important controls are center, zoom, twist/roll, invert, and export. For PhotoSphere, the important controls are heading, horizon, gyro toggle, metadata, and export.
 
 The Publish/Export UI should be conservative and explicit. It should never make a public upload feel like a casual save. Google Maps publishing especially needs a preflight page with a preview, location, account, visibility implication, and readiness warnings. Google Photos upload can be lighter, but still should clearly say which account is being used and whether the item is app-created.
 
@@ -1004,7 +1004,7 @@ The setup-first flow should use simple splash screens with one clear action per 
 
 Purpose: establish the app's promise in one glance.
 
-Primary text: Create PhotoSpheres and Tiny Worlds.
+Primary text: Create PhotoSpheres and Tiny Planets.
 
 Supporting text: Capture, reproject, save, and publish 360 images from your phone.
 
@@ -1140,7 +1140,7 @@ The home screen after setup should avoid clutter. A user should be able to under
 - Capture: start a guided PhotoSphere capture.
 - Import: choose an existing 360 image or panorama.
 - Browse: open the local Spherify library.
-- Create Tiny World: open the reprojection editor from a selected master or imported image.
+- Create Tiny Planet: open the reprojection editor from a selected master or imported image.
 
 Secondary actions can live behind smaller icons or menus:
 
@@ -1154,13 +1154,13 @@ The button language should remain concrete. Prefer Capture, Import, Browse, Crea
 
 ### Design Risks
 
-The biggest UX risk is over-promising capture quality. The app should be honest about draft, partial, and map-ready states. A beautiful Tiny World can tolerate flaws that Google Maps should reject, so the UI must separate creative exports from public 360 imagery.
+The biggest UX risk is over-promising capture quality. The app should be honest about draft, partial, and map-ready states. A beautiful Tiny Planet can tolerate flaws that Google Maps should reject, so the UI must separate creative exports from public 360 imagery.
 
 The second risk is permission fatigue. Asking for camera, location, media, motion, and Google account access in one clump would feel alarming. Contextual requests and graceful degradation are central to the design.
 
 The third risk is losing the user during capture. PhotoSphere capture is physical: the user is rotating, aiming, holding the phone steady, and trying not to lose their place. The UI should behave like a guide, not a control panel.
 
-The fourth risk is treating Tiny World and PhotoSphere as reversible when they are not always reversible. The app's data model and UI should make "master" and "exported variant" clear.
+The fourth risk is treating Tiny Planet and PhotoSphere as reversible when they are not always reversible. The app's data model and UI should make "master" and "exported variant" clear.
 
 The fifth risk is Google platform dependency. Direct publishing features should be modular, so a Google API policy change does not break local creation, browsing, and export.
 
@@ -1172,8 +1172,8 @@ The fifth risk is Google platform dependency. Direct publishing features should 
 - What minimum Android version should be supported? Android 13+ has better photo-picker behavior with Google Photos cloud media, but a wider minimum increases reach.
 - Should the app preserve all capture frames by default, or offer a storage-saving mode that keeps only the stitched master?
 - Should the first UI expose advanced stitching controls, or keep them behind a diagnostics/advanced panel?
-- Should the app include a bundled sample panorama so users can try Tiny World mode before granting camera permission?
-- Should incomplete captures be allowed as creative Tiny World drafts even when they are not valid PhotoSpheres?
+- Should the app include a bundled sample panorama so users can try Tiny Planet mode before granting camera permission?
+- Should incomplete captures be allowed as creative Tiny Planet drafts even when they are not valid PhotoSpheres?
 
 ## Research Sources
 
@@ -1214,7 +1214,7 @@ Work:
 - Choose the Android baseline: Kotlin, Jetpack Compose, CameraX/Camera2 decision, minimum Android version, and target Play Store requirements.
 - Choose a local image metadata model: capture session, source frame, equirectangular master, exported variant, location metadata, and publish status.
 - Decide whether stitching research starts with OpenCV or another native/image-processing library.
-- Define sample assets for testing equirectangular viewing and Tiny World reprojection.
+- Define sample assets for testing equirectangular viewing and Tiny Planet reprojection.
 - Create a privacy and permissions matrix before app code begins.
 
 Exit criteria:
@@ -1232,7 +1232,7 @@ Work:
 
 - Load a bundled equirectangular test image.
 - Display it in a basic interactive PhotoSphere viewer.
-- Reproject it into Tiny World/stereographic view.
+- Reproject it into Tiny Planet/stereographic view.
 - Allow simple manipulation: rotate, zoom, invert, reset.
 - Export the current projection as a JPEG or PNG into app storage.
 - Save a generated thumbnail.
@@ -1240,7 +1240,7 @@ Work:
 Exit criteria:
 
 - One test panorama can be viewed as PhotoSphere.
-- The same panorama can be transformed into Tiny World.
+- The same panorama can be transformed into Tiny Planet.
 - The transformed output can be saved and reopened.
 
 ### Phase 2: Local Storage and Image Library
@@ -1253,12 +1253,12 @@ Work:
 - Store masters, variants, thumbnails, and metadata.
 - Save app-created images through MediaStore where appropriate.
 - Import external images through the Android photo picker.
-- Add gallery filters for Masters, Tiny Worlds, Imports, Drafts, and Saved.
+- Add gallery filters for Masters, Tiny Planets, Imports, Drafts, and Saved.
 - Add delete, rename/title, duplicate/export variant, and metadata view.
 
 Exit criteria:
 
-- A user can import an image, create a Tiny World variant, save it, close the app, reopen, and continue working.
+- A user can import an image, create a Tiny Planet variant, save it, close the app, reopen, and continue working.
 - App-created images are visible in the device gallery when exported.
 - The app does not require broad photo-library permission for normal use.
 
@@ -1333,13 +1333,13 @@ Work:
 - Add heading/north adjustment.
 - Add horizon rotation and simple leveling.
 - Add nadir/zenith patch or blur options if feasible.
-- Add alternate Tiny World controls: center, zoom, roll, planet/wormhole, field of view.
+- Add alternate Tiny Planet controls: center, zoom, roll, planet/wormhole, field of view.
 - Add non-destructive saved variants linked to the master.
 
 Exit criteria:
 
 - Users can fix common metadata/orientation issues without reprocessing the whole session.
-- Creative Tiny World export is reliable even when Google Maps readiness is not.
+- Creative Tiny Planet export is reliable even when Google Maps readiness is not.
 - Master and variant relationships are clear in the UI.
 
 ### Phase 7: Google Photos Upload
@@ -1356,7 +1356,7 @@ Work:
 
 Exit criteria:
 
-- A user can upload an app-created master or Tiny World export to Google Photos.
+- A user can upload an app-created master or Tiny Planet export to Google Photos.
 - The app clearly shows which account was used.
 - Failed uploads remain safely available locally.
 
@@ -1425,7 +1425,7 @@ Work:
 
 - Release a conservative 1.0 focused on local creation, save/export, reprojection, Google Photos upload, and Maps-ready export or direct Maps publishing if stable.
 - Improve stitching based on real-world failures.
-- Add capture presets for indoor, outdoor, low light, and fast creative Tiny World.
+- Add capture presets for indoor, outdoor, low light, and fast creative Tiny Planet.
 - Add batch export and cloud backup options only if privacy and API limits permit.
 - Explore web/PWA companion for viewing and sharing if useful.
 

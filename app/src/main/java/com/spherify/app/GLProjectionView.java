@@ -24,7 +24,7 @@ import javax.microedition.khronos.opengles.GL10;
 public class GLProjectionView extends GLSurfaceView {
     enum Mode {
         SPHERE,
-        TINY_WORLD
+        TINY_PLANET
     }
 
     private static final int EXPORT_SIZE = 1600;
@@ -37,7 +37,7 @@ public class GLProjectionView extends GLSurfaceView {
     private int[] panoramaPixels = new int[0];
     private int panoramaWidth;
     private int panoramaHeight;
-    private boolean sourceTinyWorld;
+    private boolean sourceTinyPlanet;
     private Mode mode = Mode.SPHERE;
     private float centerYaw;
     private float centerPitch;
@@ -76,11 +76,11 @@ public class GLProjectionView extends GLSurfaceView {
         });
     }
 
-    public void setPanorama(Bitmap panorama) {
+    public void setPanorama(Bitmap panorama, String sourceProjection) {
         this.panorama = panorama;
         panoramaWidth = panorama.getWidth();
         panoramaHeight = panorama.getHeight();
-        sourceTinyWorld = isSquareish(panoramaWidth, panoramaHeight);
+        sourceTinyPlanet = "tinyplanet".equals(sourceProjection) || isSquareish(panoramaWidth, panoramaHeight);
         panoramaPixels = new int[panoramaWidth * panoramaHeight];
         panorama.getPixels(panoramaPixels, 0, panoramaWidth, 0, 0, panoramaWidth, panoramaHeight);
         centerYaw = 0f;
@@ -89,8 +89,8 @@ public class GLProjectionView extends GLSurfaceView {
         yaw = 0f;
         pitch = 0f;
         roll = 0f;
-        boolean currentSourceTinyWorld = sourceTinyWorld;
-        queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyWorld));
+        boolean currentSourceTinyPlanet = sourceTinyPlanet;
+        queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyPlanet));
         pushStateToRenderer();
     }
 
@@ -98,8 +98,15 @@ public class GLProjectionView extends GLSurfaceView {
         return mode;
     }
 
+    public void setMode(Mode mode) {
+        this.mode = mode;
+        zoom = Math.max(zoom, getMinimumZoom());
+        roll = 0f;
+        pushStateToRenderer();
+    }
+
     public String getStatusText() {
-        String modeName = mode == Mode.SPHERE ? "PhotoSphere" : "Tiny World";
+        String modeName = mode == Mode.SPHERE ? "PhotoSphere" : "Tiny Planet";
         return String.format(Locale.US, "%s  |  GPU preview  |  zoom %.2fx  |  centre %.0f/%.0f",
                 modeName,
                 zoom,
@@ -108,7 +115,7 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     public void toggleMode() {
-        mode = mode == Mode.SPHERE ? Mode.TINY_WORLD : Mode.SPHERE;
+        mode = mode == Mode.SPHERE ? Mode.TINY_PLANET : Mode.SPHERE;
         zoom = Math.max(zoom, getMinimumZoom());
         roll = 0f;
         pushStateToRenderer();
@@ -146,7 +153,7 @@ public class GLProjectionView extends GLSurfaceView {
         }
 
         String stamp = String.valueOf(System.currentTimeMillis());
-        String prefix = mode == Mode.SPHERE ? "photosphere" : "tinyworld";
+        String prefix = mode == Mode.SPHERE ? "photosphere" : "tinyplanet";
         File imageFile = new File(directory, prefix + "-" + stamp + ".png");
         File thumbnailFile = new File(directory, prefix + "-" + stamp + "-thumb.jpg");
 
@@ -269,9 +276,9 @@ public class GLProjectionView extends GLSurfaceView {
                 double nx = ((2.0 * x / Math.max(1, width - 1)) - 1.0) * aspect;
                 Sample sample = mode == Mode.SPHERE
                         ? sampleSphere(nx, ny, yawRad, pitchRad)
-                        : sampleTinyWorld(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
-                pixels[y * width + x] = sourceTinyWorld
-                        ? sampleTinyWorldSource(sample.x, sample.y, sample.z)
+                        : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
+                pixels[y * width + x] = sourceTinyPlanet
+                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z)
                         : samplePanorama(sample.u, sample.v);
             }
         }
@@ -306,7 +313,7 @@ public class GLProjectionView extends GLSurfaceView {
         return directionToSample(x / length, y / length, z / length);
     }
 
-    private Sample sampleTinyWorld(
+    private Sample sampleTinyPlanet(
             double nx,
             double ny,
             double yawRad,
@@ -350,7 +357,7 @@ public class GLProjectionView extends GLSurfaceView {
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
     }
 
-    private int sampleTinyWorldSource(double x, double y, double z) {
+    private int sampleTinyPlanetSource(double x, double y, double z) {
         double polar = Math.acos(clamp(y, -1.0, 1.0));
         double radius = Math.tan(polar * 0.5);
         double angle = Math.atan2(z, x);
@@ -378,7 +385,7 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     private float getMinimumZoom() {
-        return mode == Mode.TINY_WORLD ? 0.1f : 0.45f;
+        return mode == Mode.TINY_PLANET ? 0.1f : 0.45f;
     }
 
     private static float normalizeDegrees(float value) {
@@ -481,7 +488,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "  float v = clamp(0.5 - latitude / PI, 0.0, 1.0);\n" +
                 "  return vec2(u, v);\n" +
                 "}\n" +
-                "vec2 tinyWorldUv(vec3 d) {\n" +
+                "vec2 tinyPlanetUv(vec3 d) {\n" +
                 "  float polar = acos(clamp(d.y, -1.0, 1.0));\n" +
                 "  float radius = tan(polar * 0.5);\n" +
                 "  float angle = atan(d.z, d.x);\n" +
@@ -489,7 +496,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "  return clamp(uv, 0.0, 1.0);\n" +
                 "}\n" +
                 "vec4 sampleSource(vec3 d) {\n" +
-                "  vec2 uv = uSourceProjection == 1 ? tinyWorldUv(d) : equirectUv(d);\n" +
+                "  vec2 uv = uSourceProjection == 1 ? tinyPlanetUv(d) : equirectUv(d);\n" +
                 "  return texture2D(uTexture, vec2(uv.x, 1.0 - uv.y));\n" +
                 "}\n" +
                 "vec2 rollScreen(vec2 p) {\n" +
@@ -505,7 +512,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "  vec3 up = cross(forward, right);\n" +
                 "  return normalize(forward + right * r.x * spread + up * r.y * spread);\n" +
                 "}\n" +
-                "vec3 tinyWorldDirection(vec2 p) {\n" +
+                "vec3 tinyPlanetDirection(vec2 p) {\n" +
                 "  vec2 r = rollScreen(p) / uZoom;\n" +
                 "  float radius = length(r);\n" +
                 "  float angle = atan(r.y, r.x);\n" +
@@ -515,7 +522,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "}\n" +
                 "void main() {\n" +
                 "  vec2 p = vec2(vPosition.x * uAspect, vPosition.y);\n" +
-                "  vec3 d = uMode == 0 ? sphereDirection(p) : rotateYawPitch(tinyWorldDirection(p));\n" +
+                "  vec3 d = uMode == 0 ? sphereDirection(p) : rotateYawPitch(tinyPlanetDirection(p));\n" +
                 "  gl_FragColor = sampleSource(d);\n" +
                 "}\n";
 
@@ -539,7 +546,7 @@ public class GLProjectionView extends GLSurfaceView {
         private int sourceProjectionHandle;
         private int viewportWidth = 1;
         private int viewportHeight = 1;
-        private boolean sourceTinyWorld;
+        private boolean sourceTinyPlanet;
         private Mode mode = Mode.SPHERE;
         private float yaw;
         private float pitch;
@@ -550,9 +557,9 @@ public class GLProjectionView extends GLSurfaceView {
             vertices.position(0);
         }
 
-        void setPanorama(Bitmap panorama, boolean sourceTinyWorld) {
+        void setPanorama(Bitmap panorama, boolean sourceTinyPlanet) {
             pendingPanorama = panorama;
-            this.sourceTinyWorld = sourceTinyWorld;
+            this.sourceTinyPlanet = sourceTinyPlanet;
             if (program != 0) {
                 uploadPendingPanorama();
             }
@@ -606,7 +613,7 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glUniform1f(rollHandle, (float) Math.toRadians(roll));
             GLES20.glUniform1f(zoomHandle, zoom);
             GLES20.glUniform1f(aspectHandle, viewportWidth / (float) viewportHeight);
-            GLES20.glUniform1i(sourceProjectionHandle, sourceTinyWorld ? 1 : 0);
+            GLES20.glUniform1i(sourceProjectionHandle, sourceTinyPlanet ? 1 : 0);
 
             GLES20.glEnableVertexAttribArray(positionHandle);
             GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertices);

@@ -15,13 +15,16 @@ import android.provider.MediaStore;
 import android.hardware.Sensor;
 import android.hardware.SensorManager;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -46,8 +49,12 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private Button modeButton;
     private Button recenterButton;
+    private AlertDialog activeLibraryDialog;
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
+    private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
+    private static final float GALLERY_DELETE_VERTICAL_SLOP = 90f;
+    private static final int GALLERY_DELETE_HANDLE_WIDTH = 110;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,7 +62,7 @@ public class MainActivity extends Activity {
 
         try {
             library = new SpherifyLibrary(this);
-            try (InputStream input = getAssets().open("tinyworld.jpg")) {
+            try (InputStream input = getAssets().open("tinyplanet.jpg")) {
                 library.ensureBundledMaster(input);
             }
             List<LibraryItem> items = library.list(LibraryItem.FILTER_ALL);
@@ -72,7 +79,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(0xFF071018);
 
         TextView title = new TextView(this);
-        title.setText("Spherify 0.2.0");
+        title.setText("Spherify 0.2.2");
         title.setTextColor(0xFFF8FAFC);
         title.setTextSize(20);
         title.setGravity(Gravity.CENTER_VERTICAL);
@@ -103,8 +110,12 @@ public class MainActivity extends Activity {
         controls.setGravity(Gravity.CENTER);
         controls.setPadding(10, 10, 10, 14);
 
-        modeButton = makeButton("Tiny World");
+        modeButton = makeButton("Tiny Planet");
         modeButton.setOnClickListener(v -> {
+            if (currentItem != null && "flat".equals(currentItem.projection)) {
+                openFlatViewer(currentItem);
+                return;
+            }
             projectionView.toggleMode();
             updateLabels();
         });
@@ -221,13 +232,7 @@ public class MainActivity extends Activity {
                 Toast.makeText(this, "No image selected", Toast.LENGTH_SHORT).show();
                 return;
             }
-            try {
-                currentItem = library.importImage(uri);
-                loadCurrentItem();
-                Toast.makeText(this, "Imported to local library", Toast.LENGTH_SHORT).show();
-            } catch (IOException e) {
-                Toast.makeText(this, "Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-            }
+            chooseImportedImageType(uri);
         }
     }
 
@@ -251,7 +256,7 @@ public class MainActivity extends Activity {
             return;
         }
         new AlertDialog.Builder(this)
-                .setTitle("Create PhotoSpheres and Tiny Worlds")
+                .setTitle("Create PhotoSpheres and Tiny Planets")
                 .setMessage("Capture, reproject, save, and share 360 images from your phone.")
                 .setNegativeButton("Browse without setup", (dialog, which) -> markSetupComplete())
                 .setPositiveButton("Set up Spherify", (dialog, which) -> showReadinessSetup())
@@ -395,6 +400,11 @@ public class MainActivity extends Activity {
     }
 
     private void exportCurrentView() {
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            openFlatViewer(currentItem);
+            Toast.makeText(this, "Flat images open in the flat viewer", Toast.LENGTH_SHORT).show();
+            return;
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Export")
                 .setItems(new String[]{"Share", "Save"}, (dialog, which) -> {
@@ -408,10 +418,14 @@ public class MainActivity extends Activity {
     }
 
     private void saveCurrentExport() {
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            openFlatViewer(currentItem);
+            return;
+        }
         try {
             ProjectionExport export = projectionView.exportProjection();
-            String projection = projectionView.getMode() == GLProjectionView.Mode.TINY_WORLD
-                    ? "tinyworld"
+            String projection = projectionView.getMode() == GLProjectionView.Mode.TINY_PLANET
+                    ? "tinyplanet"
                     : "sphere";
             currentItem = library.saveVariant(currentItem, export, projection);
             Toast.makeText(
@@ -425,6 +439,10 @@ public class MainActivity extends Activity {
     }
 
     private void shareCurrentExport() {
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            openFlatViewer(currentItem);
+            return;
+        }
         try {
             ProjectionExport export = projectionView.exportProjection();
             shareFile(export.imageFile);
@@ -444,6 +462,25 @@ public class MainActivity extends Activity {
                     }
                 })
                 .show();
+    }
+
+    private void chooseImportedImageType(Uri uri) {
+        String[] labels = {"PhotoSphere", "Tiny Planet", "Flat"};
+        String[] projections = {"sphere", "tinyplanet", "flat"};
+        new AlertDialog.Builder(this)
+                .setTitle("Image type")
+                .setItems(labels, (dialog, which) -> finishImageImport(uri, projections[which]))
+                .show();
+    }
+
+    private void finishImageImport(Uri uri, String projection) {
+        try {
+            currentItem = library.importImage(uri, projection);
+            openCurrentItem();
+            Toast.makeText(this, "Imported to local library", Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private void importFromPhotos() {
@@ -467,11 +504,11 @@ public class MainActivity extends Activity {
     }
 
     private void showBrowseFilters() {
-        String[] labels = {"All", "Masters", "Tiny Worlds", "Imports", "Saved", "Draft Frames"};
+        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Saved", "Draft Frames"};
         String[] filters = {
                 LibraryItem.FILTER_ALL,
                 LibraryItem.FILTER_MASTERS,
-                LibraryItem.FILTER_TINY_WORLDS,
+                LibraryItem.FILTER_TINY_PLANETS,
                 LibraryItem.FILTER_IMPORTS,
                 LibraryItem.FILTER_SAVED
         };
@@ -511,18 +548,29 @@ public class MainActivity extends Activity {
             return;
         }
 
-        new AlertDialog.Builder(this)
-                .setTitle(title)
-                .setAdapter(new LibraryAdapter(items), (dialog, which) -> {
-                    LibraryItem selectedItem = items.get(which);
-                    if (LibraryItem.TYPE_VARIANT.equals(selectedItem.type)) {
-                        showSavedOpenChoices(selectedItem);
-                    } else {
-                        currentItem = selectedItem;
-                        loadCurrentItem();
-                    }
-                })
+        ListView listView = new ListView(this);
+        LibraryAdapter adapter = new LibraryAdapter(items);
+        listView.setAdapter(adapter);
+        listView.setDividerHeight(1);
+
+        activeLibraryDialog = new AlertDialog.Builder(this)
+                .setTitle(title + " - swipe left to delete")
+                .setView(listView)
                 .show();
+        Toast.makeText(this, "Swipe left on a gallery entry to delete it", Toast.LENGTH_SHORT).show();
+    }
+
+    private void openGalleryItem(LibraryItem item) {
+        if (activeLibraryDialog != null) {
+            activeLibraryDialog.dismiss();
+            activeLibraryDialog = null;
+        }
+        if (LibraryItem.TYPE_VARIANT.equals(item.type)) {
+            showSavedOpenChoices(item);
+        } else {
+            currentItem = item;
+            openCurrentItem();
+        }
     }
 
     private void showSavedOpenChoices(LibraryItem item) {
@@ -577,6 +625,15 @@ public class MainActivity extends Activity {
                 .setMessage(library.describe(currentItem))
                 .setPositiveButton("Close", null)
                 .show();
+    }
+
+    private void openCurrentItem() {
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            updateLabels();
+            openFlatViewer(currentItem);
+            return;
+        }
+        loadCurrentItem();
     }
 
     private void showCurrentItemActions() {
@@ -645,9 +702,36 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void deleteGalleryItem(LibraryItem item, BaseAdapter adapter, List<LibraryItem> visibleItems) {
+        try {
+            boolean deletingCurrent = currentItem != null && currentItem.id.equals(item.id);
+            library.delete(item);
+            visibleItems.remove(item);
+            adapter.notifyDataSetChanged();
+            if (visibleItems.isEmpty() && activeLibraryDialog != null) {
+                activeLibraryDialog.dismiss();
+                activeLibraryDialog = null;
+            }
+            if (deletingCurrent) {
+                List<LibraryItem> allItems = library.list(LibraryItem.FILTER_ALL);
+                currentItem = allItems.isEmpty() ? null : allItems.get(0);
+                loadCurrentItem();
+            }
+            Toast.makeText(this, "Deleted " + item.title, Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void loadCurrentItem() {
         if (currentItem == null) {
+            updateLabels();
             Toast.makeText(this, "The local library is empty", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if ("flat".equals(currentItem.projection)) {
+            updateLabels();
+            openFlatViewer(currentItem);
             return;
         }
         Bitmap bitmap = BitmapFactory.decodeFile(currentItem.imagePath);
@@ -655,7 +739,10 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Could not load " + currentItem.title, Toast.LENGTH_LONG).show();
             return;
         }
-        projectionView.setPanorama(bitmap);
+        projectionView.setMode("tinyplanet".equals(currentItem.projection)
+                ? GLProjectionView.Mode.TINY_PLANET
+                : GLProjectionView.Mode.SPHERE);
+        projectionView.setPanorama(bitmap, currentItem.projection);
         projectionView.resetView();
         if (modeButton != null) {
             updateLabels();
@@ -663,8 +750,17 @@ public class MainActivity extends Activity {
     }
 
     private void updateLabels() {
+        if (modeButton == null || recenterButton == null || statusText == null) {
+            return;
+        }
+        if (currentItem != null && "flat".equals(currentItem.projection)) {
+            modeButton.setText("Open Flat");
+            recenterButton.setText("Recentre");
+            statusText.setText(currentItem.title + "  |  Flat image");
+            return;
+        }
         modeButton.setText(projectionView.getMode() == GLProjectionView.Mode.SPHERE
-                ? "Tiny World"
+                ? "Tiny Planet"
                 : "PhotoSphere");
         recenterButton.setText("Recentre");
         String title = currentItem == null ? "No item selected" : currentItem.title;
@@ -696,10 +792,26 @@ public class MainActivity extends Activity {
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
             LibraryItem item = getItem(position);
+            FrameLayout container = new FrameLayout(MainActivity.this);
+            container.setBackgroundColor(0xFFB91C1C);
+            container.setMinimumHeight(92);
+
+            TextView deleteLabel = new TextView(MainActivity.this);
+            deleteLabel.setText("Delete");
+            deleteLabel.setTextColor(0xFFFFFFFF);
+            deleteLabel.setTextSize(15);
+            deleteLabel.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+            deleteLabel.setPadding(18, 0, 24, 0);
+            container.addView(deleteLabel, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+
             LinearLayout row = new LinearLayout(MainActivity.this);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(18, 10, 18, 10);
+            row.setBackgroundColor(0xFFFFFFFF);
+            row.setMinimumHeight(92);
 
             ImageView thumbnail = new ImageView(MainActivity.this);
             thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -729,7 +841,57 @@ public class MainActivity extends Activity {
             row.addView(labels, new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT));
-            return row;
+            FrameLayout.LayoutParams rowParams = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT);
+            rowParams.setMargins(0, 0, GALLERY_DELETE_HANDLE_WIDTH, 0);
+            container.addView(row, rowParams);
+
+            float[] downX = new float[1];
+            float[] downY = new float[1];
+            boolean[] swiping = new boolean[1];
+            boolean[] deleted = new boolean[1];
+            container.setOnTouchListener((view, event) -> {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX[0] = event.getRawX();
+                        downY[0] = event.getRawY();
+                        swiping[0] = false;
+                        deleted[0] = false;
+                        row.setAlpha(1f);
+                        row.setTranslationX(0f);
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getRawX() - downX[0];
+                        float dy = event.getRawY() - downY[0];
+                        if (dx < 0 && Math.abs(dy) < GALLERY_DELETE_VERTICAL_SLOP) {
+                            swiping[0] = true;
+                            view.getParent().requestDisallowInterceptTouchEvent(true);
+                            row.setTranslationX(Math.max(dx, -GALLERY_DELETE_SWIPE_DISTANCE));
+                            if (!deleted[0] && dx <= -GALLERY_DELETE_SWIPE_DISTANCE) {
+                                deleted[0] = true;
+                                row.animate().translationX(-view.getWidth()).alpha(0.2f).setDuration(120).start();
+                                deleteGalleryItem(item, LibraryAdapter.this, items);
+                            }
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        float totalDx = event.getRawX() - downX[0];
+                        float totalDy = event.getRawY() - downY[0];
+                        if (!swiping[0] && !deleted[0]
+                                && Math.abs(totalDx) < 24f
+                                && Math.abs(totalDy) < 24f) {
+                            openGalleryItem(item);
+                        } else if (!deleted[0]) {
+                            row.animate().translationX(0f).alpha(1f).setDuration(120).start();
+                        }
+                        return true;
+                    default:
+                        return true;
+                }
+            });
+            return container;
         }
     }
 }

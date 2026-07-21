@@ -10,7 +10,7 @@ final class LibraryItem {
     static final String TYPE_VARIANT = "variant";
     static final String FILTER_ALL = "all";
     static final String FILTER_MASTERS = "masters";
-    static final String FILTER_TINY_WORLDS = "tiny_worlds";
+    static final String FILTER_TINY_PLANETS = "tiny_planets";
     static final String FILTER_IMPORTS = "imports";
     static final String FILTER_SAVED = "saved";
 
@@ -63,8 +63,8 @@ final class LibraryItem {
         if (FILTER_MASTERS.equals(filter)) {
             return TYPE_MASTER.equals(type);
         }
-        if (FILTER_TINY_WORLDS.equals(filter)) {
-            return "tinyworld".equals(projection);
+        if (FILTER_TINY_PLANETS.equals(filter)) {
+            return "tinyplanet".equals(projection);
         }
         if (FILTER_IMPORTS.equals(filter)) {
             return "import".equals(source);

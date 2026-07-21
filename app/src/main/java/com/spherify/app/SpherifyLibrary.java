@@ -86,7 +86,7 @@ final class SpherifyLibrary {
         return item;
     }
 
-    LibraryItem importImage(Uri uri) throws IOException {
+    LibraryItem importImage(Uri uri, String projection) throws IOException {
         long now = System.currentTimeMillis();
         String id = newId();
         File imageFile = new File(mastersDir, id + ".jpg");
@@ -105,12 +105,17 @@ final class SpherifyLibrary {
         }
 
         File thumbnailFile = makeThumbnail(imageFile, id);
+        String title = "flat".equals(projection)
+                ? "Imported Flat " + items.size()
+                : "tinyplanet".equals(projection)
+                ? "Imported Tiny Planet " + items.size()
+                : "Imported PhotoSphere " + items.size();
         LibraryItem item = new LibraryItem(
                 id,
-                "Imported " + items.size(),
+                title,
                 LibraryItem.TYPE_MASTER,
                 "import",
-                "sphere",
+                projection,
                 "",
                 imageFile.getAbsolutePath(),
                 thumbnailFile.getAbsolutePath(),
@@ -131,7 +136,7 @@ final class SpherifyLibrary {
 
         LibraryItem item = new LibraryItem(
                 id,
-                projection.equals("tinyworld") ? "Tiny World Variant" : "PhotoSphere Variant",
+                projection.equals("tinyplanet") ? "Tiny Planet Variant" : "PhotoSphere Variant",
                 LibraryItem.TYPE_VARIANT,
                 "local",
                 projection,
