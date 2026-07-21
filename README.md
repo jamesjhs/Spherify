@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.2.5
+Version: 0.2.6
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.2.5 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, and mandatory compass calibration.
+This repository now contains the first Android proof-of-concept application code. The 0.2.6 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, and simplified capture status messaging.
 
 ## Developer Build and Run Runbook
 
@@ -16,6 +16,14 @@ Current status:
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
 - The current Phase 3 prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, and draft frame capture.
+
+### Version 0.2.6 Progress
+
+This bugfix build tightens the capture-mode status experience:
+
+- Simplifies the capture status bar to only show `Calibration needed`, `Capture ready`, or `Image captured`.
+- Keeps detailed calibration data out of the status bar and in the graphical calibration panel or optional sensor overlay.
+- Preserves `Image captured` after a successful frame instead of immediately overwriting it with live sensor updates.
 
 ### Version 0.2.5 Progress
 
@@ -54,22 +62,22 @@ Windows PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force preview-apks
-Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.2.5-debug.apk
+Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.2.6-debug.apk
 ```
 
 macOS/Linux:
 
 ```bash
 mkdir -p preview-apks
-cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.2.5-debug.apk
+cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.2.6-debug.apk
 ```
 
 3. Commit the copied APK only when you intentionally want previewers to download that exact build from the repository.
 
-Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.2.5-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
+Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.2.6-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
 
 ```powershell
-adb install -r preview-apks\spherify-0.2.5-debug.apk
+adb install -r preview-apks\spherify-0.2.6-debug.apk
 ```
 
 The repository contains:
@@ -1047,7 +1055,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.2.5, license, acknowledgements.
+- About: version 0.2.6, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 

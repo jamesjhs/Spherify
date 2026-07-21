@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.2.5");
+        version.setText("0.2.6");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);

@@ -175,7 +175,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         statusText.setTextColor(0xFFE2E8F0);
         statusText.setTextSize(14);
         statusText.setPadding(16, 14, 16, 10);
-        statusText.setText("Capture draft frames");
+        statusText.setText("Calibration needed");
         root.addView(statusText);
 
         previewView = new PreviewView(this);
@@ -540,6 +540,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         resetCompassCalibration();
         calibrationStarted = true;
         calibrationStartedAt = System.currentTimeMillis();
+        statusText.setText("Calibration needed");
         Toast.makeText(
                 this,
                 "Move in figure-eights, rotate fully, and tilt through several angles.",
@@ -768,8 +769,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     headingProgress(),
                     tiltProgress());
         }
-        if (statusText != null && imageCapture != null && !ready) {
-            statusText.setText("Compass calibration required before capture. " + compassCalibrationProgress());
+        if (statusText != null) {
+            if (!ready) {
+                statusText.setText("Calibration needed");
+            } else if (!"Image captured".contentEquals(statusText.getText())) {
+                statusText.setText("Capture ready");
+            }
         }
     }
 
@@ -991,7 +996,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private void startCamera() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
-            statusText.setText("Camera permission is needed for capture.");
+            statusText.setText("Calibration needed");
             return;
         }
 
@@ -1011,10 +1016,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                         CameraSelector.DEFAULT_BACK_CAMERA,
                         preview,
                         imageCapture);
-                statusText.setText("Preview ready. Capture frames for a draft session.");
                 updateCompassUi();
             } catch (Exception e) {
-                statusText.setText("Camera failed: " + e.getMessage());
+                statusText.setText("Calibration needed");
+                Toast.makeText(this, "Camera failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
             }
         }, ContextCompat.getMainExecutor(this));
     }
@@ -1032,7 +1037,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (!isCompassCalibrationReady()) {
             String message = "Capture locked until compass calibration completes. "
                     + compassCalibrationProgress();
-            statusText.setText(message);
+            statusText.setText("Calibration needed");
             Toast.makeText(this, message, Toast.LENGTH_LONG).show();
             return;
         }
@@ -1067,7 +1072,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 try {
                     library.recordDraftFrame(outputFile, location);
                     runOnUiThread(() -> {
-                        statusText.setText("Saved draft frame: " + outputFile.getName());
+                        statusText.setText("Image captured");
                         Toast.makeText(CaptureActivity.this, "Draft frame saved", Toast.LENGTH_SHORT).show();
                     });
                 } catch (IOException e) {
