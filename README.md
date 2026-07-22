@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.4.5
+Version: 0.4.33
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.4.5 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, simplified capture status messaging, smoother guided PhotoSphere target tracking, default auto-capture, draft-frame deletion, and confirmed bulk draft removal.
+This repository now contains the first Android proof-of-concept application code. The 0.4.33 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, pitch-only one-shot polar capture, polar Capture/Next/Spherify button flow, polar-only guide overlay, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class draft-session library records, structured draft exposure metadata with non-blocking capture fallback, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, and confirmed bulk draft removal.
 
 ## Developer Build and Run Runbook
 
@@ -15,7 +15,261 @@ Current status:
 - The repository has a Gradle wrapper, Android app module, launcher activity, bundled test panorama, and debug build.
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
-- The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, draft frame capture, an initial guided target grid for Phase 4 capture sessions, auto-capture on locked targets, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+- The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, ARCore draft frame capture, an iterated Phase 4 guided capture flow that evolved from target dots into sweep-first paint layers, auto-capture for new sweep slices, first-class draft-session library records, structured exposure metadata for draft frames, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+
+### Version 0.4.33 Progress
+
+This bugfix build separates compass readiness from capture reference imagery:
+
+- Removes the ARCore-targeting sentence from the Capture intro popup.
+- Adds a dedicated 360-degree horizon compass calibration sweep before the actual capture-reference horizon sweep can begin.
+- Widens the shared Capture/Start/Next/Spherify overlay button so longer labels fit without wrapping.
+
+### Version 0.4.32 Progress
+
+This bugfix build protects the ARCore camera preview while keeping Phase 5 capture references:
+
+- Makes ARCore exposure metadata reads non-blocking so missing/device-specific metadata cannot drop the camera preview to a black frame.
+- Keeps draft-frame exposure references structured, with unavailable metadata recorded explicitly instead of as a prose placeholder.
+- Promotes capture drafts into first-class draft-session library records so Phase 5 can select a coherent input set.
+
+### Version 0.4.31 Progress
+
+This build simplifies the final polar capture controls:
+
+- Changes polar layers to use a single `Capture` button press instead of Start/Stop.
+- Shows `Next` after the upper polar photograph and `Spherify!` after the lower polar photograph.
+- Removes the separate `Finish` button from Capture.
+- Moves `Cancel` into the secondary controls where `Finish` used to be.
+
+### Version 0.4.30 Progress
+
+This build packages the current polar-capture cleanup for preview testing:
+
+- Carries forward pitch-only one-shot polar capture.
+- Carries forward the always-visible vertical alignment line.
+- Carries forward tap-to-recapture without drag-to-realign.
+
+### Version 0.4.29 Progress
+
+This build removes the remaining unreliable roll dependency from polar capture:
+
+- Captures each pole from pitch alignment only, assuming the user has faced the origin as instructed.
+- Removes the polar center dot and roll arrows from the pole guide.
+- Keeps a vertical alignment line visible at all times in Capture.
+- Disables drag-to-realign for painted panoramas; tapping a painted row can still prompt re-capture.
+
+### Version 0.4.28 Progress
+
+This build simplifies polar capture for reliability:
+
+- Changes each polar layer to capture one vertical center frame instead of left/middle/right roll frames.
+- Removes painted preview imagery during polar capture so the cylindrical row preview no longer misrepresents pole motion.
+- Draws a polar-only overlay: the `80 deg` target line, left/right correction arrows, and a central alignment dot.
+- Uses the adjacent `+30/-30` sweeps as overlap support for the single pole cap.
+- Notes the apparent sensor stoppage near vertical is the yaw/roll singularity around the optical axis, not Android screen orientation taking over.
+
+### Version 0.4.27 Progress
+
+This build makes upper/lower polar capture independent of unstable polar yaw:
+
+- Projects the original horizon start direction into the current ARCore camera screen plane for polar roll detection.
+- Treats the upper pole origin as the bottom screen edge and the lower pole origin as the top screen edge.
+- Avoids using compass/AR yaw to decide polar left/middle/right slots, preventing 180-degree behind-the-user flips near vertical.
+- Confirms Android screen orientation is locked to portrait and Android rotation-vector/compass paths are bypassed while ARCore is running; the observed failure mode is yaw singularity near the pole, not competing screen-orientation sensors.
+
+### Version 0.4.26 Progress
+
+This build refreshes the compass draw frame:
+
+- Keeps the normal yaw draw direction while the phone is vertical or pitched downward.
+- Mirrors the compass only after the phone is pitched more than 30 degrees above the horizon, matching the user's upward-looking screen interpretation.
+
+### Version 0.4.25 Progress
+
+This build corrects capture orientation and improves the painted preview geometry:
+
+- Flips the compass needle vertically at all times so north points toward magnetic north.
+- Restores a stable vertical projection so `+30` capture rows appear above the horizon and `-30` rows appear below it.
+- Keeps polar pitch fixed after `Start`, using the reported pitch-plane drift as the left/middle/right polar roll input near vertical.
+- Records polar draft metadata with the intended fixed pitch and polar slot rather than noisy vertical-pose pitch drift.
+- Narrows preview rows by latitude as a spherical approximation; a true future upgrade would draw the painted preview as a textured sphere or equirectangular remap instead of flat row bands.
+
+### Version 0.4.24 Progress
+
+This build corrects polar orientation and below-horizon projection:
+
+- Treats the user's polar `Start` posture as the middle roll reference instead of using absolute roll.
+- Mirrors down-looking polar left/right handedness so the origin point is treated as the top edge when looking down.
+- Updates the polar information popup to explain that the origin is bottom-screen when looking up and top-screen when looking down.
+- Reflects the compass and vertical guide projection whenever the camera is below the horizon.
+
+### Version 0.4.23 Progress
+
+This build makes top and bottom polar capture a special case:
+
+- Changes uppermost and lowermost capture layers to near-vertical `+80/-80` targets.
+- Shows a polar-capture popup explaining that yaw is unreliable at the poles.
+- Captures polar layers from three roll positions: left, middle, and right.
+- Keeps polar completion independent of yaw sweep speed or ARCore yaw bins.
+
+### Version 0.4.22 Progress
+
+This build fixes draft frame orientation and keeps draft review inside Spherify:
+
+- Rotates landscape ARCore draft JPEGs clockwise before saving so new captured frames open upright.
+- Opens draft-frame rows in the in-app flat viewer instead of sending them to an external Android image app.
+
+### Version 0.4.21 Progress
+
+This build improves painted preview alignment and drag clarity:
+
+- Centers the painted preview on the Start-relative yaw bin as soon as the first horizon sample is available.
+- Uses the composite painted photosphere preview for immediate horizon updates instead of a one-row strip path.
+- Makes the painted overlay more opaque while dragging.
+- Zooms the preview window while dragging to make alignment easier.
+- Draws a vertical center line during drag alignment.
+
+### Version 0.4.20 Progress
+
+This build simplifies Capture controls and moves recapture into the painted preview:
+
+- Removes visible `Auto Paint`, `Pause`, and `Capture Block` buttons.
+- Keeps auto-paint as the default behaviour during each Start/Stop layer sweep.
+- Keeps drag-to-align for preview recovery, but removes individual block editing from the main controls.
+- Lets the user tap a painted layer row and choose `Re-capture` to clear and sweep that layer again.
+
+### Version 0.4.19 Progress
+
+This build adds recovery tools for AR orientation blips:
+
+- Allows horizontal dragging of the painted preview to realign it with the real-world view.
+- Applies the drag as a yaw-origin reset using the latest/current AR pose as valid.
+- Lets `Capture Block` manually fill or replace the current upper/lower layer block after preview realignment.
+- Stores manual recovery captures as `manual-block` metadata.
+- Keeps auto-paint restricted to active Start/Stop sweeps while allowing manual block repair outside the sweep window.
+
+### Version 0.4.18 Progress
+
+This build aligns preview rows around the shared sweep start point and improves vertical overlap:
+
+- Remaps the horizon preview row into the same Start-origin yaw coordinate system as later layers.
+- Centers preview windows using the active Start-origin yaw bin so prior start points line up in the middle while preparing the next layer.
+- Increases painted preview row height to better reflect real camera vertical overlap between horizon and upper/lower layers.
+- Keeps the current five-layer capture plan for now; the visible gap was addressed as a preview projection issue rather than adding another layer.
+
+### Version 0.4.17 Progress
+
+This build improves sweep preview persistence and adds optional pole infill:
+
+- Adds a `Skip Poles` control to fill high upper/high lower layers from average captured colours.
+- Uses the top third of the upper layer and bottom third of the lower layer for pole infill colour.
+- Maintains a composite painted-photosphere preview instead of showing only the active layer.
+- Draws captured preview rows at their actual pitch lines so previews align with the layer they came from.
+- Keeps previously captured preview imagery visible as the user moves through later layers.
+
+### Version 0.4.16 Progress
+
+This build trusts the user's layer Start/Stop actions and adds non-horizon image previews:
+
+- Treats each layer `Start` press as yaw zero for that layer.
+- Treats each layer `Stop` press as the 360-degree closure, without rejecting the user for AR yaw drift.
+- Records sweep draft metadata with layer-relative yaw instead of raw AR yaw.
+- Adds live captured-image preview strips for upper/lower layers, not only the horizon reference.
+- Keeps the active preview window aligned to the layer-relative yaw slice.
+
+### Version 0.4.15 Progress
+
+This build makes upper/lower sweep painting deliberate and visible:
+
+- Adds `Start` and `Stop` states for each upper/lower paint layer.
+- Requires each layer to start and stop at the original real-world horizon landmark.
+- Shows a horizontal target line at the required camera pitch for the active layer.
+- Shows a live 24-slice paint strip so users can see coverage filling as they pan.
+- Gates auto/manual painting so slices are saved only between `Start` and `Stop`.
+
+### Version 0.4.14 Progress
+
+This build fixes the transition from the initial horizon sweep into upper/lower layer painting:
+
+- Treats the initial 360-degree horizon reference sweep as the painted horizon layer.
+- Clears the return-to-start state after the reference sweep is closed.
+- Prompts the user to tap `Next` for the upper layer instead of requiring a second horizon pass.
+
+### Version 0.4.13 Progress
+
+This build shifts Capture from stop-start guide targets to sweep-first photosphere painting:
+
+- Hides the 24 visible point-target capture guides from the main overlay.
+- Tracks capture as five horizontal paint layers: horizon, upper, lower, high upper, and high lower.
+- Auto-paints unfilled yaw slices in the active layer as the user rotates slowly.
+- Replaces target-lock capture gating with pitch-layer alignment, yaw-bin coverage, and sweep-speed quality checks.
+- Changes Capture controls and session summaries from target language to painted sweep slices.
+
+### Version 0.4.12 Progress
+
+This build changes the horizon guide from a full 360-degree strip into a current-view reference:
+
+- Draws only the yaw-centered portion of the horizon panorama over the live preview.
+- Handles 0/360-degree wraparound so the guide remains continuous when looking back through the start direction.
+- Establishes continuous horizontal photo sweeps as the preferred capture direction for future work, with point targets retained as a fallback/debug guide until sweep coverage and stitching are fully reliable.
+
+### Version 0.4.11 Progress
+
+This build refines strip-mode capture feedback and the horizon reference preview:
+
+- Shows live sweep pace guidance so the user is told when they are moving too fast or too slow.
+- Adds top and bottom red fade warnings when pitch drifts away from the starting horizon plane.
+- Samples central vertical strips from portrait ARCore frames instead of squeezing full photos into each yaw bin.
+- Rebuilds the live horizon strip as a single panorama preview and feathers neighboring joins.
+
+### Version 0.4.10 Progress
+
+This build refines the ARCore horizon sweep flow:
+
+- Changes the initial horizon-sweep dialog action to `OK` so the user first sees the live camera crosshair.
+- Uses a live `Start` button to lock the starting landmark, then changes it to `End` when the sweep is ready to close.
+- Requires `End` to be pressed after re-aligning with the original landmark before capture unlocks.
+- Draws portrait horizon-reference samples side-by-side horizontally instead of stretching them into a rotated band.
+- Normalizes landscape ARCore CPU reference frames into portrait thumbnails before displaying them.
+
+### Version 0.4.9 Progress
+
+This build improves ARCore capture setup:
+
+- Rotates the ARCore camera texture mapping to correct the 90-degree preview orientation.
+- Lets the user point the crosshair at a fixed distant start landmark before beginning the horizon sweep.
+- Requires the user to return the crosshair to that same start landmark after the full sweep before capture unlocks.
+- Adds clearer sweep status text for start alignment, horizon sweep, and return-to-start phases.
+
+### Version 0.4.8 Progress
+
+This build fixes the blank ARCore capture preview:
+
+- Replaces the temporary ARCore CPU-frame `ImageView` preview with a `GLSurfaceView` camera renderer.
+- Creates an external OES camera texture and passes it to ARCore with `Session.setCameraTextureNames()`.
+- Runs `Session.update()` from the GL render loop so ARCore has an attached camera background target.
+- Keeps CPU camera images only for draft JPEG capture and horizon-reference thumbnails.
+
+### Version 0.4.7 Progress
+
+This build moves capture onto the ARCore session path:
+
+- Replaces the CaptureActivity CameraX preview/capture source with ARCore session CPU camera frames.
+- Creates the ARCore session with `Session.Feature.SHARED_CAMERA`.
+- Drives capture yaw, pitch, roll, target guidance, and draft metadata from `Frame.getCamera().getPose()`.
+- Writes draft JPEGs from the latest ARCore camera frame instead of CameraX `ImageCapture`.
+- Keeps the 360-degree horizon reference sweep tied to the same ARCore frame/pose stream.
+
+### Version 0.4.6 Progress
+
+This build makes ARCore the required capture target and adds the first horizon-reference pass:
+
+- Declares capture support as ARCore-required and adds the ARCore Android SDK.
+- Blocks unsupported or declined ARCore setups with a clear message instead of falling back silently.
+- Replaces the old compass calibration entry point with a 360-degree horizon sweep.
+- Samples low-resolution preview frames around the horizon and draws them back as a 50% opacity reference belt.
+- Keeps capture locked until enough horizon yaw sectors have been sampled near the horizon plane.
 
 ### Version 0.4.5 Progress
 
@@ -113,28 +367,28 @@ macOS/Linux:
 ./gradlew :app:assembleDebug
 ```
 
-2. Copy the generated APK into the repository preview folder with the current version in the filename.
+2. Copy the generated APK into the repository preview folder with the current version and a short one- or two-word edit description in the filename. Use `spherify-{version}-{description}.apk`, not a generic `-debug` suffix.
 
 Windows PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force preview-apks
-Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.4.5-debug.apk
+Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-{version}-{description}.apk
 ```
 
 macOS/Linux:
 
 ```bash
 mkdir -p preview-apks
-cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.4.5-debug.apk
+cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-{version}-{description}.apk
 ```
 
 3. Commit the copied APK only when you intentionally want previewers to download that exact build from the repository.
 
-Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.4.5-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
+Previewers can install the APK on an Android device by downloading the latest descriptive APK in `preview-apks/`, such as `preview-apks/spherify-{version}-{description}.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
 
 ```powershell
-adb install -r preview-apks\spherify-0.4.5-debug.apk
+adb install -r preview-apks\spherify-{version}-{description}.apk
 ```
 
 The repository contains:
@@ -1112,7 +1366,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.4.5, license, acknowledgements.
+- About: version 0.4.33, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 
@@ -1381,6 +1635,7 @@ Exit criteria:
 - A user can import an image, create a Tiny Planet variant, save it, close the app, reopen, and continue working.
 - App-created images are visible in the device gallery when exported.
 - The app does not require broad photo-library permission for normal use.
+- Draft capture sessions are represented as first-class local library records, not only as loose frame files.
 
 ### Phase 3: Capture Shell and Sensor Readiness
 
@@ -1408,33 +1663,42 @@ Goal: turn raw camera capture into a structured sphere capture experience.
 
 Work:
 
-- Add sphere target grid around yaw/pitch positions.
-- Add reticle alignment, stability detection, and coverage progress.
-- Support manual capture first, then auto-capture when alignment is good.
+- Add sphere guidance around yaw/pitch coverage positions.
+- Add reticle alignment, horizon/level feedback, stability/sweep-speed detection, and coverage progress.
+- Support manual capture first, then auto-capture when alignment and sweep pace are good.
 - Add undo, pause/resume, cancel, and finish.
-- Store each frame with approximate orientation, timestamp, exposure data, and location/session metadata.
+- Store each frame with approximate orientation, timestamp, exposure references, and location/session metadata.
 - Add draft recovery if capture is interrupted.
 
-Current inroads:
+Current implementation:
 
-- Implemented a 24-target yaw/pitch guide grid in the portrait CameraX capture screen.
-- Implemented a center reticle, nearest-target highlighting, target alignment checks, short steady-hold gating, and coverage progress.
-- Implemented default auto-capture with a one-second target-lock countdown, while keeping manual capture available.
-- Dampened guide-grid yaw/pitch movement so sensor noise is less visually distracting.
-- Implemented undo, pause/resume, cancel, and finish session controls.
-- Extended draft metadata with a persistent session id, approximate orientation, target orientation, timestamp, location summary, capture mode, and an exposure placeholder.
-- Persisted the active guided session id so an interrupted capture can resume into the same draft session.
-- Implemented left-swipe deletion for raw draft frames and matching draft metadata cleanup.
+- The first implementation used a 24-target yaw/pitch guide grid with target locking, reticle alignment, and auto-capture. Real-device experiments showed that discrete target chasing was less useful than broad, continuous overlap coverage, so Phase 4 iterated into an ARCore sweep-painting method rather than treating the original target grid as final.
+- Capture now runs through ARCore with an OpenGL camera preview, ARCore pose-derived yaw/pitch/roll, and ARCore CPU camera frames saved as upright draft JPEGs.
+- The sphere capture pattern is five paint layers: horizon, upper, lower, high upper, and high lower. The high upper/lower pole layers are treated as pitch-only one-shot captures because yaw/roll becomes unreliable near vertical.
+- The UI uses a start/end landmark horizon sweep, pitch target line, always-visible vertical alignment line, sweep-speed feedback, painted preview rows, coverage progress, tap-to-recapture rows, optional pole infill, and simplified polar Capture/Next/Spherify controls.
+- Auto-capture is now the default for unpainted sweep slices when ARCore is ready, pitch is aligned, and the sweep pace is acceptable; manual capture and manual recovery remain available.
+- Undo, pause/resume, cancel, finish, draft-frame deletion, and confirmed bulk draft removal are implemented.
+- Draft metadata now includes a persistent session id, frame path, approximate orientation, target yaw/pitch or polar slot reference, timestamp, location summary, capture mode, and structured ARCore camera exposure references instead of a placeholder.
+- Each capture session is promoted into a first-class Draft library record as soon as its first frame is saved. The raw "Draft Frames" browser remains as a diagnostic view, but normal browsing can treat draft captures as sessions.
+- The active guided session id is persisted, so interruption without explicit finish/cancel resumes into the same draft session.
 
 Exit criteria:
 
 - A user can complete a guided capture session with enough overlapping frames for stitching experiments.
 - The app can show missing/weak coverage areas.
 - Capture drafts survive app interruption.
+- Phase 5 can enumerate frames by draft session and read orientation/exposure references from metadata without guessing which frames belong together.
 
 ### Phase 5: Stitching and Equirectangular Master Generation
 
 Goal: produce the first real app-created PhotoSphere master.
+
+Prerequisites from Phase 4:
+
+- Draft sessions must be first-class library records with stable `sessionId` values.
+- Every draft frame must record enough references for stitching experiments: file path, timestamp, session id, capture mode, approximate heading/pitch/roll, target yaw/pitch, optional location, and camera exposure metadata such as exposure time, ISO/sensitivity, frame duration, sensor timestamp, aperture, focal length, AE state, AWB state, and exposure compensation.
+- The stitched input set should come from one selected draft session, not from the raw all-drafts frame list.
+- Missing exposure values must be stored explicitly as unavailable/null fields, not as prose placeholders, so Phase 5 can decide whether to compensate, warn, or skip a frame.
 
 Work:
 

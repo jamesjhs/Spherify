@@ -3,7 +3,7 @@
  *
  * Educational overview:
  * CaptureActivity is the Phase 3 capture shell with Phase 4 guided-capture
- * scaffolding. It shows a live CameraX preview, captures draft JPEG frames,
+ * scaffolding. It shows a live ARCore camera preview, captures draft JPEG frames,
  * reads available motion/orientation sensors, displays optional diagnostics, and
  * overlays a simple yaw/pitch target grid so a user can begin collecting sphere
  * coverage deliberately. It does not stitch a full Photo Sphere yet; instead it
@@ -12,26 +12,24 @@
  *
  * Data flow:
  * User taps Capture in MainActivity -> MainActivity opens this Activity after
- * camera permission -> CameraX streams preview pixels into PreviewView -> user
- * taps Capture Frame -> SpherifyLibrary creates a draft file -> ImageCapture
- * writes a JPEG -> readLocationSummary() optionally adds last-known location ->
+ * camera permission -> ARCore streams preview pixels into GLSurfaceView -> user
+ * taps Capture Frame -> SpherifyLibrary creates a draft file -> the latest
+ * ARCore frame JPEG is written -> readLocationSummary() optionally adds last-known location ->
  * SpherifyLibrary appends draft metadata to drafts.json. In parallel, Android's
  * SensorManager sends accelerometer/gyroscope/magnetometer/rotation-vector
  * events to onSensorChanged(), which refreshes both the diagnostic TextView and
  * the guided target overlay.
  *
  * External files/functions:
- * Uses CameraX classes from androidx.camera.* to bind preview and image capture.
+ * Uses ARCore session camera frames for preview, guidance pose, and capture.
  * Uses Android SensorManager for device motion/orientation readiness.
  * Uses SpherifyLibrary for local draft frame paths and metadata writes.
  * Uses LocationManager for optional coarse/fine last-known location summaries.
  *
  * Key variables:
- * previewView: CameraX preview surface shown inside the preview frame.
+ * previewView: ARCore camera frame preview shown inside the preview frame.
  * statusText: top status label for camera/capture progress.
  * sensorOverlayText/sensorOverlayButton: overlay UI and its toggle button.
- * imageCapture: CameraX still-image capture use case.
- * cameraExecutor: background thread for image capture callbacks.
  * library: local storage helper for draft files and metadata.
  * sensorManager and sensor fields: Android motion/orientation sensor handles.
  * sensorOverlayVisible: current overlay visibility state.
@@ -46,18 +44,32 @@ import android.Manifest;
 import android.app.AlertDialog;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.ImageFormat;
+import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.PorterDuff;
+import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Shader;
+import android.graphics.YuvImage;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationManager;
+import android.media.Image;
 import android.os.Bundle;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES20;
+import android.opengl.GLSurfaceView;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -66,23 +78,38 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.ComponentActivity;
-import androidx.camera.core.CameraSelector;
-import androidx.camera.core.ImageCapture;
-import androidx.camera.core.ImageCaptureException;
-import androidx.camera.core.Preview;
-import androidx.camera.lifecycle.ProcessCameraProvider;
-import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
-import com.google.common.util.concurrent.ListenableFuture;
+import com.google.ar.core.ArCoreApk;
+import com.google.ar.core.Config;
+import com.google.ar.core.Frame;
+import com.google.ar.core.ImageMetadata;
+import com.google.ar.core.Pose;
+import com.google.ar.core.Session;
+import com.google.ar.core.SharedCamera;
+import com.google.ar.core.TrackingState;
+import com.google.ar.core.exceptions.CameraNotAvailableException;
+import com.google.ar.core.exceptions.MetadataNotFoundException;
+import com.google.ar.core.exceptions.NotYetAvailableException;
+import com.google.ar.core.exceptions.UnavailableException;
+import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.util.EnumSet;
 import java.util.Locale;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
 
 public class CaptureActivity extends ComponentActivity implements SensorEventListener {
     private static final String PREFS = "spherify_capture";
@@ -92,6 +119,29 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private static final long REQUIRED_HEADING_STABILITY_MS = 1000L;
     private static final long REQUIRED_TARGET_LOCK_MS = 1000L;
     private static final int REQUIRED_HEADING_BINS = 8;
+    private static final int HORIZON_REFERENCE_BIN_COUNT = 24;
+    private static final int REQUIRED_HORIZON_REFERENCE_BINS = 22;
+    private static final int HORIZON_REFERENCE_SAMPLE_WIDTH = 96;
+    private static final int HORIZON_REFERENCE_SAMPLE_HEIGHT = 144;
+    private static final float MAX_HORIZON_SWEEP_PITCH_DEGREES = 18f;
+    private static final float MAX_SWEEP_CLOSE_YAW_DELTA_DEGREES = 5f;
+    private static final float MAX_SWEEP_CLOSE_PITCH_DELTA_DEGREES = 5f;
+    private static final long SWEEP_SPEED_SAMPLE_MIN_MS = 180L;
+    private static final float MIN_SWEEP_YAW_RATE_DEGREES_PER_SECOND = 8f;
+    private static final float MAX_SWEEP_YAW_RATE_DEGREES_PER_SECOND = 50f;
+    private static final float TILT_WARNING_START_DEGREES = 2f;
+    private static final float TILT_WARNING_FULL_DEGREES = 12f;
+    private static final float HORIZON_REFERENCE_VIEW_DEGREES = 82f;
+    private static final int SWEEP_CAPTURE_BIN_COUNT = 24;
+    private static final int REQUIRED_SWEEP_CAPTURE_BINS = 22;
+    private static final int[] SWEEP_LAYER_PITCH_DEGREES = {0, 30, -30, 80, -80};
+    private static final int SWEEP_LAYER_HIGH_UPPER_INDEX = 3;
+    private static final int SWEEP_LAYER_HIGH_LOWER_INDEX = 4;
+    private static final float MAX_SWEEP_LAYER_PITCH_DELTA_DEGREES = 12f;
+    private static final int[] POLAR_ROLL_SLOT_TARGETS = {0};
+    private static final int[] POLAR_ROLL_SLOT_SWEEP_BINS = {12};
+    private static final float COMPASS_SCREEN_FLIP_PITCH_DEGREES = 30f;
+    private static final long MIN_SWEEP_CAPTURE_INTERVAL_MS = 850L;
     private static final float MAX_STABLE_HEADING_DELTA_DEGREES = 4f;
     private static final float MAX_TARGET_YAW_DELTA_DEGREES = 10f;
     private static final float MAX_TARGET_PITCH_DELTA_DEGREES = 9f;
@@ -102,7 +152,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private static final float GUIDE_HEADING_SMOOTHING_ALPHA = 0.08f;
     private static final float GUIDE_PITCH_SMOOTHING_ALPHA = 0.10f;
 
-    private PreviewView previewView;
+    private GLSurfaceView previewView;
+    private ArCameraRenderer arRenderer;
     private TextView statusText;
     private TextView sensorOverlayText;
     private TextView compassStatusText;
@@ -114,8 +165,6 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private Button calibrationButton;
     private Button pauseButton;
     private Button autoCaptureButton;
-    private ImageCapture imageCapture;
-    private ExecutorService cameraExecutor;
     private SpherifyLibrary library;
     private SharedPreferences capturePrefs;
     private SensorManager sensorManager;
@@ -145,15 +194,28 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private boolean hasSmoothedHeadingReading;
     private boolean hasPitchRollReading;
     private boolean calibrationStarted;
+    private boolean compassCalibrationComplete;
+    private boolean arCoreReady;
+    private boolean horizonSweepStarted;
+    private boolean horizonSweepComplete;
+    private boolean horizonSweepAwaitingClose;
+    private boolean arCoreInstallRequested;
+    private boolean arCoreUnsupportedShown;
+    private boolean arSessionRunning;
     private boolean capturePaused;
     private boolean autoCaptureEnabled = true;
     private boolean captureInProgress;
+    private boolean sweepLayerPaintingActive;
+    private boolean polarCaptureInfoShown;
     private boolean guideRefreshPosted;
     private long calibrationStartedAt;
     private long highAccuracyStartedAt;
     private long stableHeadingStartedAt;
     private long targetAlignedStartedAt;
     private long lastAutoCaptureAt;
+    private float previewDragStartX;
+    private boolean previewDragActive;
+    private boolean previewDragMoved;
     private float compassHeadingDegrees;
     private float rawCompassHeadingDegrees;
     private float lastCompassHeadingDegrees;
@@ -161,12 +223,39 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private float rollDegrees;
     private float guideHeadingDegrees;
     private float guidePitchDegrees;
+    private float horizonStartHeadingDegrees;
+    private float horizonStartPitchDegrees;
+    private float sweepLayerStartHeadingDegrees;
+    private float[] latestArPoseMatrix = new float[16];
     private String sessionId;
     private int activeTargetIndex;
     private int lastCapturedTargetIndex = -1;
+    private int currentSweepLayerIndex;
+    private int lastCapturedSweepLayerIndex = -1;
+    private int lastCapturedSweepBin = -1;
     private boolean hasGuideHeadingReading;
     private boolean hasGuidePitchReading;
     private final CaptureTarget[] captureTargets = buildCaptureTargets();
+    private final boolean[] horizonReferenceBins = new boolean[HORIZON_REFERENCE_BIN_COUNT];
+    private final Bitmap[] horizonReferenceFrames = new Bitmap[HORIZON_REFERENCE_BIN_COUNT];
+    private final boolean[][] sweepCaptureBins =
+            new boolean[SWEEP_LAYER_PITCH_DEGREES.length][SWEEP_CAPTURE_BIN_COUNT];
+    private final Bitmap[][] sweepCapturePreviewFrames =
+            new Bitmap[SWEEP_LAYER_PITCH_DEGREES.length][SWEEP_CAPTURE_BIN_COUNT];
+    private Bitmap sweepLayerPreviewPanorama;
+    private Bitmap paintedPhotospherePreview;
+    private Bitmap horizonReferencePanorama;
+    private long lastSweepSpeedAt;
+    private float lastSweepSpeedHeadingDegrees;
+    private float sweepYawRateDegreesPerSecond;
+    private String sweepSpeedMessage = "";
+    private final Object arFrameLock = new Object();
+    private Session arSession;
+    private SharedCamera sharedCamera;
+    private int arCameraTextureId;
+    private byte[] latestArJpeg;
+    private String latestExposureMetadataJson;
+    private Bitmap latestArPreviewBitmap;
     private float minAccelX = Float.MAX_VALUE;
     private float maxAccelX = -Float.MAX_VALUE;
     private float minAccelY = Float.MAX_VALUE;
@@ -180,14 +269,13 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * currently builds fresh UI and does not restore custom state from it.
      * Calls: SpherifyLibrary constructor, SensorManager.getDefaultSensor(),
      * Android view constructors, toggle/capture click handlers, setContentView(),
-     * requestApplyInsets(), and startCamera().
+     * requestApplyInsets(), and startArCoreCapture().
      * Flow: initialize storage and sensors, build a vertical layout with status,
-     * camera preview, overlay, and controls, then start the CameraX preview.
+     * camera preview, overlay, and controls, then start the ARCore preview.
      */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        cameraExecutor = Executors.newSingleThreadExecutor();
         try {
             library = new SpherifyLibrary(this);
         } catch (IOException e) {
@@ -215,11 +303,15 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         statusText.setTextColor(0xFFE2E8F0);
         statusText.setTextSize(14);
         statusText.setPadding(16, 14, 16, 10);
-        statusText.setText("Calibration needed");
+        statusText.setText("Horizon sweep needed");
         root.addView(statusText);
 
-        previewView = new PreviewView(this);
-        previewView.setImplementationMode(PreviewView.ImplementationMode.PERFORMANCE);
+        previewView = new GLSurfaceView(this);
+        previewView.setEGLContextClientVersion(2);
+        previewView.setPreserveEGLContextOnPause(true);
+        arRenderer = new ArCameraRenderer();
+        previewView.setRenderer(arRenderer);
+        previewView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
 
         FrameLayout previewFrame = new FrameLayout(this);
         previewFrame.addView(previewView, new FrameLayout.LayoutParams(
@@ -253,9 +345,19 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         previewFrame.addView(calibrationProgressView, calibrationParams);
 
         guideView = new TargetGuideView(this);
+        guideView.setOnTouchListener((view, event) -> handlePreviewTouch(event));
         previewFrame.addView(guideView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
+
+        calibrationButton = makeButton("Start");
+        calibrationButton.setOnClickListener(v -> handleHorizonSweepButton());
+        FrameLayout.LayoutParams sweepButtonParams = new FrameLayout.LayoutParams(
+                240,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.RIGHT);
+        sweepButtonParams.setMargins(0, 0, 14, 182);
+        previewFrame.addView(calibrationButton, sweepButtonParams);
 
         sensorOverlayText = new TextView(this);
         sensorOverlayText.setTextColor(0xFFFFFFFF);
@@ -281,35 +383,20 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         controls.setGravity(Gravity.CENTER);
         controls.setPadding(10, 10, 10, 14);
 
-        captureButton = makeButton("Capture");
-        captureButton.setOnClickListener(v -> captureFrame());
-        Button undoButton = makeButton("Undo");
-        undoButton.setOnClickListener(v -> undoLastTarget());
-        pauseButton = makeButton("Pause");
-        pauseButton.setOnClickListener(v -> toggleCapturePaused());
-        autoCaptureButton = makeButton("Auto On");
-        autoCaptureButton.setOnClickListener(v -> toggleAutoCapture());
         sensorOverlayButton = makeButton("Show Sensors");
         sensorOverlayButton.setOnClickListener(v -> toggleSensorOverlay());
-        calibrationButton = makeButton("Calibrate");
-        calibrationButton.setOnClickListener(v -> startCompassCalibration());
-        Button finishButton = makeButton("Finish");
-        finishButton.setOnClickListener(v -> finishCaptureSession());
+        Button skipPolesButton = makeButton("Skip Poles");
+        skipPolesButton.setOnClickListener(v -> skipHighAndLowLayers());
         Button cancelButton = makeButton("Cancel");
         cancelButton.setOnClickListener(v -> cancelCaptureSession());
-        controls.addView(captureButton);
-        controls.addView(undoButton);
-        controls.addView(pauseButton);
-        controls.addView(autoCaptureButton);
-        controls.addView(cancelButton);
         root.addView(controls);
 
         LinearLayout secondaryControls = new LinearLayout(this);
         secondaryControls.setGravity(Gravity.CENTER);
         secondaryControls.setPadding(10, 0, 10, 14);
-        secondaryControls.addView(calibrationButton);
         secondaryControls.addView(sensorOverlayButton);
-        secondaryControls.addView(finishButton);
+        secondaryControls.addView(skipPolesButton);
+        secondaryControls.addView(cancelButton);
         root.addView(secondaryControls);
 
         setContentView(root);
@@ -322,9 +409,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return insets;
         });
         root.requestApplyInsets();
-        startCamera();
+        verifyArCoreSupport();
+        startArCoreCapture();
         updateCompassUi();
-        showCompassCalibrationInstructions();
+        showHorizonSweepInstructions();
     }
 
     /*
@@ -337,6 +425,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     @Override
     protected void onResume() {
         super.onResume();
+        verifyArCoreSupport();
+        previewView.onResume();
+        resumeArSession();
         registerSensors();
     }
 
@@ -350,19 +441,31 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     @Override
     protected void onPause() {
         unregisterSensors();
+        pauseArSession();
+        previewView.onPause();
         super.onPause();
     }
 
     /*
      * Function: onDestroy
      * Arguments: none beyond Android lifecycle dispatch.
-     * Calls: super.onDestroy() and ExecutorService.shutdown().
-     * Flow: release the capture callback executor when the Activity is ending.
+     * Calls: super.onDestroy() and Session.close().
+     * Flow: release ARCore native resources and frame callbacks when the
+     * Activity is ending.
      */
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        cameraExecutor.shutdown();
+        synchronized (arFrameLock) {
+            if (latestArPreviewBitmap != null) {
+                latestArPreviewBitmap.recycle();
+                latestArPreviewBitmap = null;
+            }
+        }
+        if (arSession != null) {
+            arSession.close();
+            arSession = null;
+        }
     }
 
     /*
@@ -397,6 +500,70 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         sensorOverlayText.setVisibility(sensorOverlayVisible ? TextView.VISIBLE : TextView.GONE);
         sensorOverlayButton.setText(sensorOverlayVisible ? "Hide Sensors" : "Show Sensors");
         updateSensorOverlay();
+    }
+
+    /*
+     * Function: verifyArCoreSupport
+     * Arguments: none.
+     * Calls: ArCoreApk.checkAvailability(), ArCoreApk.requestInstall(),
+     * updateCompassUi(), and showArCoreUnsupportedMessage().
+     * Flow: treat ARCore as the required capture backend. Supported devices may
+     * prompt for Google Play Services for AR; unsupported devices are blocked
+     * with a clear message instead of falling back to raw compass capture.
+     */
+    private void verifyArCoreSupport() {
+        ArCoreApk.Availability availability = ArCoreApk.getInstance().checkAvailability(this);
+        if (availability.isTransient()) {
+            previewView.postDelayed(this::verifyArCoreSupport, 250L);
+            return;
+        }
+        if (!availability.isSupported()) {
+            arCoreReady = false;
+            showArCoreUnsupportedMessage();
+            updateCompassUi();
+            return;
+        }
+
+        try {
+            ArCoreApk.InstallStatus installStatus = ArCoreApk.getInstance().requestInstall(
+                    this,
+                    !arCoreInstallRequested);
+            arCoreInstallRequested = true;
+            arCoreReady = installStatus == ArCoreApk.InstallStatus.INSTALLED;
+        } catch (UnavailableUserDeclinedInstallationException e) {
+            arCoreReady = false;
+            showArCoreUnsupportedMessage();
+        } catch (UnavailableException e) {
+            arCoreReady = false;
+            showArCoreUnsupportedMessage();
+        }
+        updateSensorOverlay();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: showArCoreUnsupportedMessage
+     * Arguments: none.
+     * Calls: AlertDialog.Builder and View setters.
+     * Flow: explain that ARCore support is unavailable and keep the capture
+     * workflow locked until the device can provide AR tracking.
+     */
+    private void showArCoreUnsupportedMessage() {
+        if (statusText != null) {
+            statusText.setText("ARCore unavailable");
+        }
+        if (captureButton != null) {
+            captureButton.setEnabled(false);
+        }
+        if (arCoreUnsupportedShown || isFinishing()) {
+            return;
+        }
+        arCoreUnsupportedShown = true;
+        new AlertDialog.Builder(this)
+                .setTitle("ARCore required")
+                .setMessage("This capture mode requires Google Play Services for AR on an ARCore-supported device.")
+                .setPositiveButton("Close", null)
+                .show();
     }
 
     /*
@@ -525,13 +692,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return;
         }
         sensorOverlayText.setText("Sensor overlay\n"
+                + "ARCore: " + (arCoreReady ? "ready" : "required") + "\n"
                 + "Accelerometer: " + sensorLine(accelerometer, accelerometerReading) + "\n"
                 + "Gyroscope: " + sensorLine(gyroscope, gyroscopeReading) + "\n"
                 + "Compass/magnetometer: " + sensorLine(magnetometer, magnetometerReading) + "\n"
                 + "Rotation vector: " + sensorLine(rotationVector, rotationVectorReading) + "\n"
                 + "Guide orientation: " + guideOrientationSummary() + "\n"
-                + "Compass calibration: " + compassCalibrationStatus() + "\n"
-                + "Calibration progress: " + compassCalibrationProgress());
+                + "Horizon reference: " + horizonReferenceProgressText() + "\n"
+                + "Compass fallback: " + compassCalibrationStatus());
     }
 
     /*
@@ -593,21 +761,527 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
-     * Function: startCompassCalibration
-     * Arguments: none; invoked by the Calibrate button.
-     * Calls: resetCompassCalibration(), updateCompassUi(), and Toast.
-     * Flow: begin the mandatory calibration session and reset the collected
-     * coverage data so only the current deliberate user motion can unlock capture.
+     * Function: handlePreviewTouch
+     * Arguments: event is the touch event from the painted preview overlay.
+     * Calls: handlePreviewTap().
+     * Flow: taps on existing painted rows can prompt re-capture. Drag alignment
+     * is intentionally disabled now that horizontal stability has improved.
      */
-    private void startCompassCalibration() {
+    private boolean handlePreviewTouch(MotionEvent event) {
+        if (!horizonSweepComplete || event == null || guideView == null) {
+            return false;
+        }
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                previewDragStartX = event.getX();
+                previewDragMoved = false;
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                previewDragMoved = previewDragMoved || Math.abs(event.getX() - previewDragStartX) > 18f;
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!previewDragMoved) {
+                    handlePreviewTap(event.getY());
+                }
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                previewDragMoved = false;
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    /*
+     * Function: handlePreviewTap
+     * Arguments: y is the tap position in the guide overlay.
+     * Calls: nearestPreviewLayerForY() and promptRecaptureLayer().
+     * Flow: let users tap an already-painted row and choose to recapture that
+     * whole layer rather than editing individual blocks.
+     */
+    private void handlePreviewTap(float y) {
+        int layer = nearestPreviewLayerForY(y);
+        if (layer < 0) {
+            return;
+        }
+        promptRecaptureLayer(layer);
+    }
+
+    /*
+     * Function: nearestPreviewLayerForY
+     * Arguments: y is a screen-space vertical coordinate.
+     * Calls: angularToScreenY().
+     * Flow: match a tap to the closest visible painted layer row.
+     */
+    private int nearestPreviewLayerForY(float y) {
+        float bestDistance = Float.MAX_VALUE;
+        int bestLayer = -1;
+        float bandHalfHeight = guideView == null ? 0f : guideView.getHeight() * 0.13f;
+        for (int layer = 0; layer < SWEEP_LAYER_PITCH_DEGREES.length; layer++) {
+            if (capturedSweepBinCount(layer) == 0) {
+                continue;
+            }
+            float layerY = angularToScreenY(SWEEP_LAYER_PITCH_DEGREES[layer] - pitchDegrees);
+            float distance = Math.abs(y - layerY);
+            if (distance < bestDistance && distance <= bandHalfHeight) {
+                bestDistance = distance;
+                bestLayer = layer;
+            }
+        }
+        return bestLayer;
+    }
+
+    /*
+     * Function: angularToScreenY
+     * Arguments: pitchDelta is signed angular distance from center.
+     * Calls: View.getHeight().
+     * Flow: mirror TargetGuideView's vertical projection for tap hit-testing.
+     */
+    private float angularToScreenY(float pitchDelta) {
+        float height = guideView == null ? 1f : guideView.getHeight();
+        return height * 0.5f - pitchDelta / 55f * height * 0.45f;
+    }
+
+    /*
+     * Function: promptRecaptureLayer
+     * Arguments: layer is the selected paint row.
+     * Calls: AlertDialog.Builder and recaptureLayer().
+     * Flow: ask for confirmation before discarding a completed layer.
+     */
+    private void promptRecaptureLayer(int layer) {
+        String layerName = layerName(layer);
+        new AlertDialog.Builder(this)
+                .setTitle("Re-capture " + layerName + "?")
+                .setMessage("This will clear that layer and make it the active sweep again.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Re-capture", (dialog, which) -> recaptureLayer(layer))
+                .show();
+    }
+
+    /*
+     * Function: recaptureLayer
+     * Arguments: layer is the paint row to reset.
+     * Calls: startHorizonReferenceSweep(), resetSweepLayer(), and updateCompassUi().
+     * Flow: reset a selected layer for a fresh Start/Stop sweep.
+     */
+    private void recaptureLayer(int layer) {
+        if (layer == 0) {
+            startHorizonReferenceSweep();
+            return;
+        }
+        resetSweepLayer(layer);
+        currentSweepLayerIndex = layer;
+        sweepLayerPaintingActive = false;
+        sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+        clearSweepLayerPreviewPanorama();
+        rebuildPaintedPhotospherePreview();
+        Toast.makeText(this, "Layer cleared. Align view and tap Start.", Toast.LENGTH_LONG).show();
+        showPolarCaptureInfoIfNeeded();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: handleHorizonSweepButton
+     * Arguments: none; invoked by the Start/End/Resweep button.
+     * Calls: startCompassCalibrationSweep(), completeCompassCalibrationSweep(),
+     * startHorizonReferenceSweep(), or endHorizonReferenceSweep().
+     * Flow: use one button for the capture gate. It first runs a compass
+     * calibration horizon sweep, then runs the separate horizon reference sweep,
+     * and finally advances through capture layers.
+     */
+    private void handleHorizonSweepButton() {
+        if (!compassCalibrationComplete) {
+            if (!calibrationStarted) {
+                startCompassCalibrationSweep();
+            } else if (isCompassCalibrationReady()) {
+                completeCompassCalibrationSweep();
+            } else {
+                Toast.makeText(this, compassCalibrationProgressText(), Toast.LENGTH_LONG).show();
+            }
+        } else if (horizonSweepAwaitingClose && !horizonSweepComplete) {
+            endHorizonReferenceSweep();
+        } else if (horizonSweepComplete) {
+            handleSweepLayerButton();
+        } else {
+            startHorizonReferenceSweep();
+        }
+    }
+
+    /*
+     * Function: startCompassCalibrationSweep
+     * Arguments: none.
+     * Calls: resetCompassCalibration(), updateCompassUi(), and Toast.
+     * Flow: begin a dedicated 360-degree horizon turn that warms up orientation
+     * readings before the app records the actual horizon reference imagery.
+     */
+    private void startCompassCalibrationSweep() {
         resetCompassCalibration();
         calibrationStarted = true;
+        compassCalibrationComplete = false;
         calibrationStartedAt = System.currentTimeMillis();
-        statusText.setText("Calibration needed");
+        statusText.setText("Calibrate compass");
         Toast.makeText(
                 this,
-                "Move in figure-eights, rotate fully, and tilt through several angles.",
+                "Slowly turn once around the horizon. Keep the phone level so the compass can settle before capture.",
                 Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: completeCompassCalibrationSweep
+     * Arguments: none.
+     * Calls: updateCompassUi() and Toast.
+     * Flow: close the calibration-only sweep once enough heading/time/stability
+     * coverage exists, unlocking the separate horizon reference pass.
+     */
+    private void completeCompassCalibrationSweep() {
+        compassCalibrationComplete = true;
+        statusText.setText("Horizon sweep needed");
+        Toast.makeText(
+                this,
+                "Compass calibrated. Point at a distant start landmark, then tap Start for the capture reference sweep.",
+                Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: startHorizonReferenceSweep
+     * Arguments: none.
+     * Calls: resetHorizonReferenceSweep(), updateCompassUi(), and Toast.
+     * Flow: begin the mandatory 360-degree horizon pass. The app captures small
+     * preview samples around the yaw circle and later draws them as a translucent
+     * reference belt over above/below horizon capture targets.
+     */
+    private void startHorizonReferenceSweep() {
+        if (!arCoreReady) {
+            Toast.makeText(this, "ARCore is required before capture can start", Toast.LENGTH_LONG).show();
+            verifyArCoreSupport();
+            return;
+        }
+        if (!compassCalibrationComplete) {
+            Toast.makeText(this, "Complete the compass calibration sweep first", Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        resetHorizonReferenceSweep();
+        horizonSweepStarted = true;
+        horizonSweepComplete = false;
+        horizonSweepAwaitingClose = false;
+        horizonStartHeadingDegrees = compassHeadingDegrees;
+        horizonStartPitchDegrees = pitchDegrees;
+        sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+        currentSweepLayerIndex = 0;
+        sweepLayerPaintingActive = false;
+        polarCaptureInfoShown = false;
+        resetSweepCaptureCoverage();
+        resetSweepMotionFeedback();
+        statusText.setText("Sweep horizon");
+        Toast.makeText(
+                this,
+                "Reference point set. Slowly sweep the phone around the horizon once.",
+                Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: endHorizonReferenceSweep
+     * Arguments: none.
+     * Calls: isAlignedWithHorizonStart(), updateCompassUi(), and Toast.
+     * Flow: close the 360-degree horizon reference only when the user has
+     * returned the crosshair to the fixed distant start landmark.
+     */
+    private void endHorizonReferenceSweep() {
+        if (!horizonSweepAwaitingClose) {
+            Toast.makeText(this, "Finish the 360-degree sweep first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!isAlignedWithHorizonStart()) {
+            Toast.makeText(this, "Line the crosshair up with the same start point", Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        horizonSweepComplete = true;
+        horizonSweepAwaitingClose = false;
+        currentSweepLayerIndex = 0;
+        sweepLayerStartHeadingDegrees = horizonStartHeadingDegrees;
+        sweepLayerPaintingActive = false;
+        resetSweepMotionFeedback();
+        statusText.setText("Horizon painted");
+        Toast.makeText(this, "Horizon layer painted. Tap Next for the upper layer.", Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: resetHorizonReferenceSweep
+     * Arguments: none.
+     * Calls: Bitmap.recycle().
+     * Flow: clear all captured horizon reference samples so a fresh 360-degree
+     * pass can replace the translucent overlay.
+     */
+    private void resetHorizonReferenceSweep() {
+        for (int i = 0; i < horizonReferenceBins.length; i++) {
+            horizonReferenceBins[i] = false;
+            if (horizonReferenceFrames[i] != null) {
+                horizonReferenceFrames[i].recycle();
+                horizonReferenceFrames[i] = null;
+            }
+        }
+        if (horizonReferencePanorama != null) {
+            horizonReferencePanorama.recycle();
+            horizonReferencePanorama = null;
+        }
+        horizonSweepAwaitingClose = false;
+        currentSweepLayerIndex = 0;
+        sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+        sweepLayerPaintingActive = false;
+        resetSweepCaptureCoverage();
+        resetSweepMotionFeedback();
+        if (guideView != null) {
+            guideView.setHorizonReference(null, false, false, 0f, false, false, "", 0f);
+            guideView.setSweepPaintState(
+                    false,
+                    "Horizon",
+                    "",
+                    0,
+                    0f,
+                    0f,
+                    false,
+                    false,
+                    false,
+                    false,
+                    null,
+                    0,
+                    false,
+                    false);
+        }
+    }
+
+    /*
+     * Function: resetSweepCaptureCoverage
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: clear the painted coverage map for the sweep-first capture mode so
+     * each new horizon reference pass starts a fresh photosphere draft.
+     */
+    private void resetSweepCaptureCoverage() {
+        for (int layer = 0; layer < sweepCaptureBins.length; layer++) {
+            for (int bin = 0; bin < sweepCaptureBins[layer].length; bin++) {
+                sweepCaptureBins[layer][bin] = false;
+                if (sweepCapturePreviewFrames[layer][bin] != null) {
+                    sweepCapturePreviewFrames[layer][bin].recycle();
+                    sweepCapturePreviewFrames[layer][bin] = null;
+                }
+            }
+        }
+        if (sweepLayerPreviewPanorama != null) {
+            sweepLayerPreviewPanorama.recycle();
+            sweepLayerPreviewPanorama = null;
+        }
+        if (paintedPhotospherePreview != null) {
+            paintedPhotospherePreview.recycle();
+            paintedPhotospherePreview = null;
+        }
+        lastCapturedSweepLayerIndex = -1;
+        lastCapturedSweepBin = -1;
+        lastCapturedTargetIndex = -1;
+        sweepLayerPaintingActive = false;
+    }
+
+    /*
+     * Function: clearSweepLayerPreviewPanorama
+     * Arguments: none.
+     * Calls: Bitmap.recycle().
+     * Flow: clear the displayed non-horizon preview when moving between paint
+     * bands so each layer starts visually empty.
+     */
+    private void clearSweepLayerPreviewPanorama() {
+        if (sweepLayerPreviewPanorama != null) {
+            sweepLayerPreviewPanorama.recycle();
+            sweepLayerPreviewPanorama = null;
+        }
+    }
+
+    /*
+     * Function: resetSweepLayer
+     * Arguments: layer is the sweep row to clear.
+     * Calls: Bitmap.recycle().
+     * Flow: remove captured/infilled preview data for one layer so it can be
+     * swept again from the normal Start/Stop flow.
+     */
+    private void resetSweepLayer(int layer) {
+        if (layer < 0 || layer >= sweepCaptureBins.length) {
+            return;
+        }
+        for (int bin = 0; bin < sweepCaptureBins[layer].length; bin++) {
+            sweepCaptureBins[layer][bin] = false;
+            if (sweepCapturePreviewFrames[layer][bin] != null) {
+                sweepCapturePreviewFrames[layer][bin].recycle();
+                sweepCapturePreviewFrames[layer][bin] = null;
+            }
+        }
+    }
+
+    /*
+     * Function: skipHighAndLowLayers
+     * Arguments: none.
+     * Calls: infillSweepLayerFromSource(), rebuildPaintedPhotospherePreview(),
+     * updateCompassUi(), and Toast.
+     * Flow: allow low-detail ceilings/skies/floors to be approximated from the
+     * nearest captured upper/lower layers rather than requiring two more sweeps.
+     */
+    private void skipHighAndLowLayers() {
+        if (!horizonSweepComplete) {
+            Toast.makeText(this, "Complete the horizon sweep first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (capturedSweepBinCount(1) == 0 || capturedSweepBinCount(2) == 0) {
+            Toast.makeText(this, "Paint upper and lower layers before skipping poles", Toast.LENGTH_LONG).show();
+            return;
+        }
+        infillSweepLayerFromSource(SWEEP_LAYER_HIGH_UPPER_INDEX, 1, true);
+        infillSweepLayerFromSource(SWEEP_LAYER_HIGH_LOWER_INDEX, 2, false);
+        if (currentSweepLayerIndex >= SWEEP_LAYER_HIGH_UPPER_INDEX) {
+            currentSweepLayerIndex = SWEEP_LAYER_PITCH_DEGREES.length - 1;
+            sweepLayerPaintingActive = false;
+        }
+        rebuildPaintedPhotospherePreview();
+        Toast.makeText(this, "Uppermost and lowermost layers filled from captured colour", Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: handleSweepLayerButton
+     * Arguments: none.
+     * Calls: startSweepLayerPainting(), stopSweepLayerPainting(), and
+     * advanceSweepLayer().
+     * Flow: after the horizon reference pass, use the overlay button as a
+     * deliberate Start/Stop control for each upper/lower paint layer.
+     */
+    private void handleSweepLayerButton() {
+        if (isCurrentPolarLayer()) {
+            handlePolarLayerButton();
+        } else if (sweepLayerPaintingActive) {
+            stopSweepLayerPainting();
+        } else if (currentSweepLayerComplete()) {
+            advanceSweepLayer();
+        } else {
+            startSweepLayerPainting();
+        }
+    }
+
+    /*
+     * Function: handlePolarLayerButton
+     * Arguments: none.
+     * Calls: captureFrame(), advanceSweepLayer(), and finishCaptureSession().
+     * Flow: polar layers are single-shot captures. The shared horizon button
+     * becomes Capture before the pole frame, Next after the upper pole, and
+     * Spherify! after the lower pole.
+     */
+    private void handlePolarLayerButton() {
+        if (currentSweepLayerComplete()) {
+            if (currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1) {
+                finishCaptureSession();
+            } else {
+                advanceSweepLayer();
+            }
+            return;
+        }
+        showPolarCaptureInfoIfNeeded();
+        if (!isSweepLayerPitchAligned()) {
+            Toast.makeText(this, "Align the pitch line before capturing", Toast.LENGTH_SHORT).show();
+            updateCompassUi();
+            return;
+        }
+        captureFrame("polar-manual");
+    }
+
+    /*
+     * Function: startSweepLayerPainting
+     * Arguments: none.
+     * Calls: isAlignedWithSweepLayerStart(), resetSweepMotionFeedback(), and
+     * updateCompassUi().
+     * Flow: begin painting the current layer after the user has lined up their
+     * chosen start view. Their Start tap defines the yaw origin for this layer.
+     */
+    private void startSweepLayerPainting() {
+        showPolarCaptureInfoIfNeeded();
+        if (!isSweepLayerPitchAligned()) {
+            Toast.makeText(this, "Tilt to the target line before starting", Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        sweepLayerPaintingActive = true;
+        sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+        lastAutoCaptureAt = 0L;
+        resetSweepMotionFeedback();
+        statusText.setText("Painting " + currentSweepLayerName());
+        Toast.makeText(
+                this,
+                isCurrentPolarLayer()
+                        ? "Polar capture started. Face the origin point and hold the pitch line."
+                        : "Start painting. Rotate slowly through 360 degrees.",
+                Toast.LENGTH_LONG).show();
+        updateCompassUi();
+    }
+
+    /*
+     * Function: stopSweepLayerPainting
+     * Arguments: none.
+     * Calls: currentSweepLayerComplete(), isAlignedWithSweepLayerStart(), and
+     * updateCompassUi().
+     * Flow: trust the user's Stop tap as the 360-degree closure for this layer
+     * and advance to the next paint band.
+     */
+    private void stopSweepLayerPainting() {
+        if (isCurrentPolarLayer() && !currentSweepLayerComplete()) {
+            Toast.makeText(this, polarRollInstruction(), Toast.LENGTH_SHORT).show();
+            updateCompassUi();
+            return;
+        }
+        markCurrentSweepLayerClosed();
+        sweepLayerPaintingActive = false;
+        if (currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1) {
+            Toast.makeText(this, "All sweep layers painted", Toast.LENGTH_SHORT).show();
+        } else {
+            currentSweepLayerIndex++;
+            sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+            clearSweepLayerPreviewPanorama();
+            resetSweepMotionFeedback();
+            showPolarCaptureInfoIfNeeded();
+            Toast.makeText(this, currentSweepLayerPrompt(), Toast.LENGTH_LONG).show();
+        }
+        updateCompassUi();
+    }
+
+    /*
+     * Function: advanceSweepLayer
+     * Arguments: none.
+     * Calls: currentSweepLayerComplete(), updateCompassUi(), and Toast.
+     * Flow: move the user through the photosphere paint bands after each layer
+     * has enough yaw coverage.
+     */
+    private void advanceSweepLayer() {
+        if (!horizonSweepComplete) {
+            return;
+        }
+        if (!currentSweepLayerComplete()) {
+            Toast.makeText(this, "Finish painting this layer before moving on", Toast.LENGTH_SHORT).show();
+            updateCompassUi();
+            return;
+        }
+        if (currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1) {
+            Toast.makeText(this, "All sweep layers painted", Toast.LENGTH_SHORT).show();
+            updateCompassUi();
+            return;
+        }
+        currentSweepLayerIndex++;
+        sweepLayerPaintingActive = false;
+        sweepLayerStartHeadingDegrees = compassHeadingDegrees;
+        clearSweepLayerPreviewPanorama();
+        lastAutoCaptureAt = 0L;
+        resetSweepMotionFeedback();
+        showPolarCaptureInfoIfNeeded();
+        Toast.makeText(this, currentSweepLayerPrompt(), Toast.LENGTH_LONG).show();
         updateCompassUi();
     }
 
@@ -663,6 +1337,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * magnetic north, store it as degrees, and rotate the always-visible pointer.
      */
     private void updateCompassHeading() {
+        if (arSessionRunning) {
+            return;
+        }
         if (!hasFilteredAccelerometerReading || !hasFilteredMagnetometerReading) {
             return;
         }
@@ -688,6 +1365,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * readings.
      */
     private void updateCompassHeadingFromRotationVector(float[] values) {
+        if (arSessionRunning) {
+            return;
+        }
         SensorManager.getRotationMatrixFromVector(rotationVectorMatrix, values);
         SensorManager.getOrientation(rotationVectorMatrix, orientationValues);
         acceptPitchRoll();
@@ -723,41 +1403,76 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         hasHeadingReading = true;
         updateHeadingStability();
         recordHeadingCoverage();
+        recordHorizonReferenceSample();
         if (compassNeedleView != null) {
-            compassNeedleView.setHeadingDegrees(compassHeadingDegrees);
+            compassNeedleView.setHeadingDegrees(compassHeadingDegrees, pitchDegrees);
         }
         updateGuideState();
     }
 
     /*
+     * Function: acceptArPose
+     * Arguments: pose is the latest ARCore camera pose in the session frame.
+     * Calls: Pose.toMatrix(), Math trig helpers, normalizeHeading(),
+     * updateHeadingStability(), recordHorizonReferenceSample(), and
+     * updateGuideState().
+     * Flow: convert ARCore's 6-DoF camera pose into yaw/pitch/roll guidance
+     * values, flipping ARCore's yaw handedness into the app's clockwise heading
+     * convention so overlay targets move with the user's rotation.
+     */
+    private void acceptArPose(Pose pose) {
+        pose.toMatrix(latestArPoseMatrix, 0);
+        float forwardX = -latestArPoseMatrix[8];
+        float forwardY = -latestArPoseMatrix[9];
+        float forwardZ = -latestArPoseMatrix[10];
+        rawCompassHeadingDegrees = normalizeHeading((float) -Math.toDegrees(Math.atan2(forwardX, forwardZ)));
+        compassHeadingDegrees = smoothHeading(rawCompassHeadingDegrees);
+        pitchDegrees = (float) Math.toDegrees(Math.asin(Math.max(-1f, Math.min(1f, forwardY))));
+        rollDegrees = (float) Math.toDegrees(Math.atan2(latestArPoseMatrix[1], latestArPoseMatrix[5]));
+        hasHeadingReading = true;
+        hasPitchRollReading = true;
+        updateHeadingStability();
+        recordHeadingCoverage();
+        updateSweepMotionFeedback();
+        recordHorizonReferenceSample();
+        runOnUiThread(() -> {
+            if (compassNeedleView != null) {
+                compassNeedleView.setHeadingDegrees(compassHeadingDegrees, pitchDegrees);
+            }
+            updateSensorOverlay();
+            updateCompassUi();
+            updateGuideState();
+        });
+    }
+
+    /*
      * Function: updateGuideState
      * Arguments: none.
-     * Calls: nearestOpenTargetIndex(), targetAligned(), coverageProgress(),
-     * TargetGuideView.setGuideState(), and maybeAutoCapture().
-     * Flow: select the next useful sphere target, measure yaw/pitch alignment
-     * and dwell stability, update the overlay, then optionally trigger capture
-     * when the user has enabled auto mode.
+     * Calls: sweep coverage helpers, TargetGuideView.setGuideState(), and
+     * maybeAutoCapture().
+     * Flow: update the sweep-first overlay around the current pitch band and
+     * optionally save frames as the user paints around the yaw circle.
      */
     private void updateGuideState() {
         if (!hasHeadingReading || !hasPitchRollReading) {
             return;
         }
         guideHeadingDegrees = smoothGuideHeading(compassHeadingDegrees);
-        guidePitchDegrees = smoothGuidePitch(pitchDegrees);
-        int nearest = nearestOpenTargetIndex();
-        boolean aligned = nearest >= 0 && targetAligned(captureTargets[nearest]);
-        long now = System.currentTimeMillis();
-        if (aligned) {
-            if (nearest != activeTargetIndex || targetAlignedStartedAt == 0L) {
-                targetAlignedStartedAt = now;
-            }
-        } else {
-            targetAlignedStartedAt = 0L;
-        }
-        activeTargetIndex = nearest;
-        boolean stable = isTargetStable();
-        float lockProgress = targetLockProgress();
+        guidePitchDegrees = smoothGuidePitch(effectiveGuidePitchDegrees());
+        activeTargetIndex = -1;
+        boolean aligned = horizonSweepComplete && isSweepLayerPitchAligned();
+        boolean stable = aligned && !"Move slower".equals(currentSweepSpeedMessage());
+        float lockProgress = sweepLayerProgress(currentSweepLayerIndex);
         if (guideView != null) {
+            guideView.setHorizonReference(
+                    paintedPhotospherePreview,
+                    horizonSweepStarted,
+                    horizonSweepComplete,
+                    horizonReferenceBinCount() / (float) REQUIRED_HORIZON_REFERENCE_BINS,
+                    horizonSweepAwaitingClose,
+                    isAlignedWithHorizonStart(),
+                    currentSweepSpeedMessage(),
+                    currentSweepTiltDeltaDegrees());
             guideView.setGuideState(
                     captureTargets,
                     activeTargetIndex,
@@ -766,8 +1481,23 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     aligned,
                     stable,
                     lockProgress,
-                    coverageProgress(),
+                    totalSweepCoverageProgress(),
                     capturePaused);
+            guideView.setSweepPaintState(
+                    horizonSweepComplete,
+                    currentSweepLayerName(),
+                    currentSweepLayerPrompt(),
+                    currentSweepLayerPitch(),
+                    sweepLayerProgress(currentSweepLayerIndex),
+                    totalSweepCoverageProgress(),
+                    isSweepLayerPitchAligned(),
+                    currentSweepLayerComplete(),
+                    sweepLayerPaintingActive,
+                    isAlignedWithSweepLayerStart(),
+                    currentSweepLayerBins(),
+                    currentOverlayBin(),
+                    previewDragActive,
+                    isCurrentPolarLayer());
             if (aligned && !stable && !guideRefreshPosted) {
                 guideRefreshPosted = true;
                 guideView.postDelayed(() -> {
@@ -906,96 +1636,304 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Function: updateCompassUi
      * Arguments: none.
-     * Calls: compassCalibrationProgress(), isCompassCalibrationReady(), and view
+     * Calls: horizonReferenceProgressText(), isCaptureSetupReady(), and view
      * setters.
-     * Flow: keep the north pointer label, calibration button, capture enabled
-     * state, and status text synchronized with the calibration gate.
+     * Flow: keep the AR/horizon label, sweep button, capture enabled state, and
+     * status text synchronized with the capture setup gate.
      */
     private void updateCompassUi() {
-        boolean ready = isCompassCalibrationReady();
+        boolean ready = isCaptureSetupReady();
         if (compassStatusText != null) {
             compassStatusText.setText(String.format(
                     Locale.US,
-                    "N %.0f deg\n%s",
+                    "AR %.0f deg\n%s",
                     compassHeadingDegrees,
-                    ready ? "ready" : "calibrate"));
+                    ready ? "ready" : horizonReferenceProgressText()));
         }
         if (captureButton != null) {
-            captureButton.setEnabled(ready && !capturePaused && imageCapture != null);
+            captureButton.setEnabled(ready && !capturePaused && !captureInProgress && latestArJpeg != null);
+            captureButton.setText("Capture Block");
         }
         if (calibrationButton != null) {
-            calibrationButton.setText(ready ? "Recalibrate" : "Calibrate");
+            calibrationButton.setText(!compassCalibrationComplete
+                    ? !calibrationStarted
+                    ? "Start"
+                    : isCompassCalibrationReady()
+                    ? "Complete"
+                    : "Calibrating"
+                    : ready
+                    ? currentSweepButtonText()
+                    : horizonSweepAwaitingClose
+                    ? "End"
+                    : horizonSweepStarted
+                    ? "Restart"
+                    : "Start");
         }
         if (calibrationProgressView != null) {
             calibrationProgressView.setCalibrationState(
-                    calibrationStarted,
+                    calibrationStarted || horizonSweepStarted,
                     ready,
                     timeProgress(),
-                    accuracyProgress(),
+                    arCoreReady ? 1f : 0f,
                     stabilityProgress(),
                     headingProgress(),
-                    tiltProgress());
+                    horizonPitchProgress());
         }
         if (statusText != null) {
-            if (!ready) {
-                statusText.setText("Calibration needed");
+            if (!arCoreReady) {
+                statusText.setText("ARCore required");
+            } else if (!compassCalibrationComplete) {
+                statusText.setText(calibrationStarted
+                        ? "Calibrate compass"
+                        : "Compass calibration");
+            } else if (!ready) {
+                statusText.setText(horizonSweepStarted
+                        ? horizonSweepAwaitingClose ? "Return to start point" : currentSweepStatusText()
+                        : "Align start point");
             } else if (!"Image captured".contentEquals(statusText.getText())) {
-                statusText.setText(capturePaused ? "Capture paused" : "Capture ready");
+                statusText.setText(capturePaused ? "Capture paused" : currentSweepCaptureStatusText());
             }
         }
         updateGuideState();
     }
 
     /*
-     * Function: isCompassCalibrationReady
+     * Function: currentSweepButtonText
      * Arguments: none.
-     * Calls: headingBinCount(), tiltCoverageCount(), and System.currentTimeMillis().
-     * Flow: enforce the capture gate by requiring a deliberate calibration
-     * session with sensor availability, heading readings, high accuracy,
-     * minimum duration, broad yaw coverage, and meaningful tilt coverage.
+     * Calls: currentSweepLayerComplete().
+     * Flow: label the shared capture-progress button for sweep layers and the
+     * one-shot polar layers.
      */
-    private boolean isCompassCalibrationReady() {
-        if (!calibrationStarted || magnetometer == null || accelerometer == null || !hasHeadingReading) {
-            return false;
+    private String currentSweepButtonText() {
+        if (isCurrentPolarLayer()) {
+            if (currentSweepLayerComplete()) {
+                return currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1
+                        ? "Spherify!"
+                        : "Next";
+            }
+            return "Capture";
         }
-        long now = System.currentTimeMillis();
-        boolean highAccuracyHeld = highAccuracyStartedAt > 0L
-                && now - highAccuracyStartedAt >= REQUIRED_COMPASS_HIGH_ACCURACY_MS;
-        boolean headingStable = stableHeadingStartedAt > 0L
-                && now - stableHeadingStartedAt >= REQUIRED_HEADING_STABILITY_MS;
-        boolean longEnough = now - calibrationStartedAt >= REQUIRED_CALIBRATION_DURATION_MS;
-        return highAccuracyHeld
-                && headingStable
-                && longEnough
-                && headingBinCount() >= REQUIRED_HEADING_BINS
-                && tiltCoverageCount() >= 2;
+        if (sweepLayerPaintingActive) {
+            return "Stop";
+        }
+        if (currentSweepLayerComplete()) {
+            return currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1
+                    ? "Spherify!"
+                    : "Next";
+        }
+        return "Start";
     }
 
     /*
-     * Function: compassCalibrationProgress
+     * Function: isCaptureSetupReady
      * Arguments: none.
-     * Calls: headingBinCount(), tiltCoverageCount(), and System.currentTimeMillis().
-     * Flow: produce concise progress text explaining which parts of the mandatory
-     * calibration gate are complete or still needed.
+     * Calls: horizonReferenceBinCount() and System.currentTimeMillis().
+     * Flow: enforce the capture gate by requiring ARCore support, a completed
+     * compass calibration sweep, orientation readings, and a 360-degree horizon
+     * reference sweep before photo capture.
      */
-    private String compassCalibrationProgress() {
-        if (magnetometer == null || accelerometer == null) {
-            return "Compass sensors missing.";
+    private boolean isCaptureSetupReady() {
+        if (!arCoreReady || !compassCalibrationComplete || !horizonSweepStarted
+                || !hasHeadingReading || !hasPitchRollReading) {
+            return false;
         }
-        if (!calibrationStarted) {
-            return "Tap Calibrate, then rotate and tilt the phone.";
+        if (horizonSweepComplete) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        boolean headingStable = stableHeadingStartedAt > 0L
+                && now - stableHeadingStartedAt >= REQUIRED_HEADING_STABILITY_MS;
+        boolean longEnough = now - calibrationStartedAt >= REQUIRED_CALIBRATION_DURATION_MS;
+        boolean sweepCovered = headingStable
+                && longEnough
+                && horizonReferenceBinCount() >= REQUIRED_HORIZON_REFERENCE_BINS
+                && Math.abs(pitchDegrees) <= MAX_HORIZON_SWEEP_PITCH_DEGREES;
+        if (sweepCovered) {
+            horizonSweepAwaitingClose = true;
+        }
+        return false;
+    }
+
+    /*
+     * Function: isAlignedWithHorizonStart
+     * Arguments: none.
+     * Calls: headingDeltaDegrees() and Math.abs().
+     * Flow: after the 360-degree sweep has enough coverage, require the user to
+     * point the reticle back at the original distant landmark before unlocking.
+     */
+    private boolean isAlignedWithHorizonStart() {
+        if (!horizonSweepStarted || !hasHeadingReading || !hasPitchRollReading) {
+            return false;
+        }
+        return headingDeltaDegrees(compassHeadingDegrees, horizonStartHeadingDegrees)
+                <= MAX_SWEEP_CLOSE_YAW_DELTA_DEGREES
+                && Math.abs(pitchDegrees - horizonStartPitchDegrees)
+                <= MAX_SWEEP_CLOSE_PITCH_DELTA_DEGREES;
+    }
+
+    /*
+     * Function: horizonReferenceProgressText
+     * Arguments: none.
+     * Calls: horizonReferenceBinCount() and System.currentTimeMillis().
+     * Flow: produce concise progress text explaining how much of the 360-degree
+     * reference sweep has been sampled.
+     */
+    private String horizonReferenceProgressText() {
+        if (!arCoreReady) {
+            return "ARCore required";
+        }
+        if (!compassCalibrationComplete) {
+            return compassCalibrationProgressText();
+        }
+        if (!horizonSweepStarted) {
+            return "align start point";
+        }
+        if (horizonSweepAwaitingClose && !horizonSweepComplete) {
+            return String.format(
+                    Locale.US,
+                    "return %.0f deg / %.0f deg",
+                    headingDeltaDegrees(compassHeadingDegrees, horizonStartHeadingDegrees),
+                    Math.abs(pitchDegrees - horizonStartPitchDegrees));
         }
         long elapsed = Math.max(0L, System.currentTimeMillis() - calibrationStartedAt);
         return String.format(
                 Locale.US,
-                "%ds/%ds, accuracy %s, stable %s, yaw %d/%d, tilt %d/2",
+                "%ds/%ds, yaw %d/%d, pitch %s, %s",
                 elapsed / 1000L,
                 REQUIRED_CALIBRATION_DURATION_MS / 1000L,
-                compassCalibrationStatus(),
-                stableHeadingStartedAt > 0L ? "yes" : "no",
+                horizonReferenceBinCount(),
+                REQUIRED_HORIZON_REFERENCE_BINS,
+                Math.abs(pitchDegrees) <= MAX_HORIZON_SWEEP_PITCH_DEGREES ? "level" : "too high/low",
+                currentSweepSpeedMessage());
+    }
+
+    /*
+     * Function: isCompassCalibrationReady
+     * Arguments: none.
+     * Calls: System.currentTimeMillis(), headingBinCount(), and Math.abs().
+     * Flow: require a short, stable, broad 360-degree horizon sweep before the
+     * capture-reference sweep can record any imagery.
+     */
+    private boolean isCompassCalibrationReady() {
+        if (!calibrationStarted || !hasHeadingReading || !hasPitchRollReading) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        boolean headingStable = stableHeadingStartedAt > 0L
+                && now - stableHeadingStartedAt >= REQUIRED_HEADING_STABILITY_MS;
+        boolean longEnough = now - calibrationStartedAt >= REQUIRED_CALIBRATION_DURATION_MS;
+        return headingStable
+                && longEnough
+                && headingBinCount() >= REQUIRED_HEADING_BINS
+                && Math.abs(pitchDegrees) <= MAX_HORIZON_SWEEP_PITCH_DEGREES;
+    }
+
+    /*
+     * Function: compassCalibrationProgressText
+     * Arguments: none.
+     * Calls: headingBinCount() and System.currentTimeMillis().
+     * Flow: summarize calibration progress without mixing it with the later
+     * horizon reference image sweep.
+     */
+    private String compassCalibrationProgressText() {
+        if (!calibrationStarted) {
+            return "tap Start for compass sweep";
+        }
+        long elapsed = Math.max(0L, System.currentTimeMillis() - calibrationStartedAt);
+        return String.format(
+                Locale.US,
+                "calibrate %ds/%ds, yaw %d/%d, pitch %s",
+                elapsed / 1000L,
+                REQUIRED_CALIBRATION_DURATION_MS / 1000L,
                 headingBinCount(),
                 REQUIRED_HEADING_BINS,
-                tiltCoverageCount());
+                Math.abs(pitchDegrees) <= MAX_HORIZON_SWEEP_PITCH_DEGREES ? "level" : "too high/low");
+    }
+
+    /*
+     * Function: updateSweepMotionFeedback
+     * Arguments: none.
+     * Calls: headingDeltaDegrees() and System.currentTimeMillis().
+     * Flow: estimate how quickly the user is turning during the horizon strip
+     * pass so the overlay can warn when the sweep pace is hard to stitch.
+     */
+    private void updateSweepMotionFeedback() {
+        if (!horizonSweepStarted || horizonSweepAwaitingClose || !hasHeadingReading) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (lastSweepSpeedAt == 0L) {
+            lastSweepSpeedAt = now;
+            lastSweepSpeedHeadingDegrees = compassHeadingDegrees;
+            sweepSpeedMessage = "Begin sweep";
+            return;
+        }
+        long elapsedMs = now - lastSweepSpeedAt;
+        if (elapsedMs < SWEEP_SPEED_SAMPLE_MIN_MS) {
+            return;
+        }
+        float yawDelta = headingDeltaDegrees(compassHeadingDegrees, lastSweepSpeedHeadingDegrees);
+        sweepYawRateDegreesPerSecond = yawDelta * 1000f / Math.max(1L, elapsedMs);
+        if (sweepYawRateDegreesPerSecond < MIN_SWEEP_YAW_RATE_DEGREES_PER_SECOND) {
+            sweepSpeedMessage = "Move faster";
+        } else if (sweepYawRateDegreesPerSecond > MAX_SWEEP_YAW_RATE_DEGREES_PER_SECOND) {
+            sweepSpeedMessage = "Move slower";
+        } else {
+            sweepSpeedMessage = "Good pace";
+        }
+        lastSweepSpeedAt = now;
+        lastSweepSpeedHeadingDegrees = compassHeadingDegrees;
+    }
+
+    /*
+     * Function: resetSweepMotionFeedback
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: clear transient sweep pace estimates before starting a fresh strip.
+     */
+    private void resetSweepMotionFeedback() {
+        lastSweepSpeedAt = 0L;
+        lastSweepSpeedHeadingDegrees = compassHeadingDegrees;
+        sweepYawRateDegreesPerSecond = 0f;
+        sweepSpeedMessage = "Begin sweep";
+    }
+
+    /*
+     * Function: currentSweepStatusText
+     * Arguments: none.
+     * Calls: currentSweepSpeedMessage().
+     * Flow: produce the large status text shown above the AR preview while the
+     * user is building the horizon strip.
+     */
+    private String currentSweepStatusText() {
+        String message = currentSweepSpeedMessage();
+        return "Good pace".equals(message) ? "Sweep horizon" : message;
+    }
+
+    /*
+     * Function: currentSweepSpeedMessage
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return a stable, user-facing pace hint for both text and overlay UI.
+     */
+    private String currentSweepSpeedMessage() {
+        return sweepSpeedMessage == null || sweepSpeedMessage.isEmpty()
+                ? "Begin sweep"
+                : sweepSpeedMessage;
+    }
+
+    /*
+     * Function: currentSweepTiltDeltaDegrees
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: compare the live pitch against the start landmark pitch so the guide
+     * can show an immediate tilt-drift warning.
+     */
+    private float currentSweepTiltDeltaDegrees() {
+        if (!horizonSweepStarted || horizonSweepComplete || horizonSweepAwaitingClose) {
+            return 0f;
+        }
+        return pitchDegrees - horizonStartPitchDegrees;
     }
 
     /*
@@ -1052,7 +1990,479 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Flow: convert observed yaw sector coverage into visual progress.
      */
     private float headingProgress() {
-        return clamp01(headingBinCount() / (float) REQUIRED_HEADING_BINS);
+        if (!compassCalibrationComplete) {
+            return clamp01(headingBinCount() / (float) REQUIRED_HEADING_BINS);
+        }
+        return clamp01(horizonReferenceBinCount() / (float) REQUIRED_HORIZON_REFERENCE_BINS);
+    }
+
+    /*
+     * Function: horizonPitchProgress
+     * Arguments: none.
+     * Calls: Math.abs() and clamp01().
+     * Flow: show whether the user is keeping the initial reference pass near the
+     * horizon plane while collecting 360-degree samples.
+     */
+    private float horizonPitchProgress() {
+        if ((!calibrationStarted && !horizonSweepStarted) || !hasPitchRollReading) {
+            return 0f;
+        }
+        return clamp01(1f - Math.abs(pitchDegrees) / MAX_HORIZON_SWEEP_PITCH_DEGREES);
+    }
+
+    /*
+     * Function: recordHorizonReferenceSample
+     * Arguments: none.
+     * Calls: createHorizonReferenceStrip(), updateHorizonReferencePanorama(),
+     * TargetGuideView.setHorizonReference().
+     * Flow: during the initial sweep, sample a central vertical slice for each
+     * yaw sector while the phone is close to the horizon plane.
+     */
+    private void recordHorizonReferenceSample() {
+        if (!compassCalibrationComplete
+                || !horizonSweepStarted
+                || horizonSweepComplete
+                || previewView == null
+                || !hasHeadingReading
+                || !hasPitchRollReading
+                || Math.abs(pitchDegrees) > MAX_HORIZON_SWEEP_PITCH_DEGREES) {
+            return;
+        }
+        int bin = horizonReferenceBinForHeading(compassHeadingDegrees);
+        if (horizonReferenceBins[bin]) {
+            return;
+        }
+        Bitmap source;
+        synchronized (arFrameLock) {
+            source = latestArPreviewBitmap == null ? null : latestArPreviewBitmap.copy(Bitmap.Config.ARGB_8888, false);
+        }
+        if (source == null) {
+            return;
+        }
+        Bitmap portraitSource = orientReferenceSampleToPortrait(source);
+        Bitmap reference = createHorizonReferenceStrip(portraitSource);
+        if (portraitSource != source) {
+            portraitSource.recycle();
+        }
+        source.recycle();
+        horizonReferenceBins[bin] = true;
+        sweepCaptureBins[0][sweepCaptureBinForHeading(compassHeadingDegrees)] = true;
+        if (horizonReferenceFrames[bin] != null) {
+            horizonReferenceFrames[bin].recycle();
+        }
+        horizonReferenceFrames[bin] = reference;
+        updateHorizonReferencePanorama(bin, reference);
+        if (guideView != null) {
+            guideView.setHorizonReference(
+                    paintedPhotospherePreview,
+                    horizonSweepStarted,
+                    isCaptureSetupReady(),
+                    horizonReferenceBinCount() / (float) REQUIRED_HORIZON_REFERENCE_BINS,
+                    horizonSweepAwaitingClose,
+                    isAlignedWithHorizonStart(),
+                    currentSweepSpeedMessage(),
+                    currentSweepTiltDeltaDegrees());
+        }
+    }
+
+    /*
+     * Function: updateHorizonReferencePanorama
+     * Arguments: bin is the yaw sector index; reference is the portrait thumbnail
+     * for that sector.
+     * Calls: Bitmap.createBitmap(), Canvas.drawColor(), Canvas.drawBitmap(), and
+     * featherHorizonReferenceSeams().
+     * Flow: maintain a single live 360-degree horizon strip by placing each
+     * center-sampled strip next to its neighbors and softening visible seams.
+     */
+    private void updateHorizonReferencePanorama(int bin, Bitmap reference) {
+        if (horizonReferencePanorama == null) {
+            horizonReferencePanorama = Bitmap.createBitmap(
+                    HORIZON_REFERENCE_SAMPLE_WIDTH * HORIZON_REFERENCE_BIN_COUNT,
+                    HORIZON_REFERENCE_SAMPLE_HEIGHT,
+                    Bitmap.Config.ARGB_8888);
+        }
+        Canvas panoramaCanvas = new Canvas(horizonReferencePanorama);
+        panoramaCanvas.drawColor(0x00000000, PorterDuff.Mode.CLEAR);
+        Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
+        Rect destinationRect = new Rect();
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        for (int i = 0; i < horizonReferenceFrames.length; i++) {
+            Bitmap frame = horizonReferenceFrames[i];
+            if (frame == null || frame.isRecycled()) {
+                continue;
+            }
+            destinationRect.set(
+                    i * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    0,
+                    (i + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    HORIZON_REFERENCE_SAMPLE_HEIGHT);
+            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+        }
+        featherHorizonReferenceSeams();
+        rebuildPaintedPhotospherePreview();
+    }
+
+    /*
+     * Function: updateSweepLayerPreviewPanorama
+     * Arguments: none.
+     * Calls: Bitmap.createBitmap(), Canvas.drawBitmap(), and
+     * featherBitmapSeams().
+     * Flow: rebuild the active non-horizon layer's preview strip from captured
+     * slices so the overlay shows live painting beyond the horizon reference.
+     */
+    private void updateSweepLayerPreviewPanorama() {
+        if (currentSweepLayerIndex <= 0 || currentSweepLayerIndex >= sweepCapturePreviewFrames.length) {
+            return;
+        }
+        if (sweepLayerPreviewPanorama == null) {
+            sweepLayerPreviewPanorama = Bitmap.createBitmap(
+                    HORIZON_REFERENCE_SAMPLE_WIDTH * SWEEP_CAPTURE_BIN_COUNT,
+                    HORIZON_REFERENCE_SAMPLE_HEIGHT,
+                    Bitmap.Config.ARGB_8888);
+        }
+        Canvas panoramaCanvas = new Canvas(sweepLayerPreviewPanorama);
+        panoramaCanvas.drawColor(0x00000000, PorterDuff.Mode.CLEAR);
+        Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
+        Rect destinationRect = new Rect();
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        for (int i = 0; i < sweepCapturePreviewFrames[currentSweepLayerIndex].length; i++) {
+            Bitmap frame = sweepCapturePreviewFrames[currentSweepLayerIndex][i];
+            if (frame == null || frame.isRecycled()) {
+                continue;
+            }
+            destinationRect.set(
+                    i * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    0,
+                    (i + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    HORIZON_REFERENCE_SAMPLE_HEIGHT);
+            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+        }
+        featherBitmapSeams(sweepLayerPreviewPanorama, sweepCaptureBins[currentSweepLayerIndex]);
+        rebuildPaintedPhotospherePreview();
+    }
+
+    /*
+     * Function: rebuildPaintedPhotospherePreview
+     * Arguments: none.
+     * Calls: drawLayerPreviewRow(), Canvas.drawColor(), and Bitmap APIs.
+     * Flow: build one compact equirectangular-style preview of every painted
+     * layer so the overlay reflects the current state of the photosphere.
+     */
+    private void rebuildPaintedPhotospherePreview() {
+        int width = HORIZON_REFERENCE_SAMPLE_WIDTH * SWEEP_CAPTURE_BIN_COUNT;
+        int height = HORIZON_REFERENCE_SAMPLE_HEIGHT * SWEEP_LAYER_PITCH_DEGREES.length;
+        if (paintedPhotospherePreview == null) {
+            paintedPhotospherePreview = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        }
+        Canvas canvas = new Canvas(paintedPhotospherePreview);
+        canvas.drawColor(0x00000000, PorterDuff.Mode.CLEAR);
+        for (int layer = 0; layer < SWEEP_LAYER_PITCH_DEGREES.length; layer++) {
+            drawLayerPreviewRow(canvas, layer, layer * HORIZON_REFERENCE_SAMPLE_HEIGHT);
+        }
+    }
+
+    /*
+     * Function: drawLayerPreviewRow
+     * Arguments: canvas is the composite target; layer is the paint layer index;
+     * top is the y position of that row.
+     * Calls: Canvas.drawBitmap().
+     * Flow: draw either horizon samples or layer capture samples into a stable
+     * row within the overall painted photosphere preview.
+     */
+    private void drawLayerPreviewRow(Canvas canvas, int layer, int top) {
+        Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
+        Rect destinationRect = new Rect();
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        for (int bin = 0; bin < SWEEP_CAPTURE_BIN_COUNT; bin++) {
+            int destinationBin = bin;
+            Bitmap frame;
+            if (layer == 0) {
+                frame = horizonReferenceFrames[bin];
+                destinationBin = relativeBinForRawHorizonBin(bin);
+            } else {
+                frame = sweepCapturePreviewFrames[layer][bin];
+            }
+            if (frame == null || frame.isRecycled()) {
+                continue;
+            }
+            destinationRect.set(
+                    destinationBin * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    top,
+                    (destinationBin + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    top + HORIZON_REFERENCE_SAMPLE_HEIGHT);
+            canvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+        }
+    }
+
+    /*
+     * Function: createHorizonReferenceStrip
+     * Arguments: portraitSource is the normalized AR camera frame.
+     * Calls: Bitmap.createBitmap() and Bitmap.createScaledBitmap().
+     * Flow: take the central vertical slice of the camera image instead of
+     * squashing the whole portrait frame into a narrow yaw bin.
+     */
+    private Bitmap createHorizonReferenceStrip(Bitmap portraitSource) {
+        int cropWidth = Math.max(1, Math.round(portraitSource.getWidth() * 0.28f));
+        int cropX = Math.max(0, (portraitSource.getWidth() - cropWidth) / 2);
+        Bitmap cropped = Bitmap.createBitmap(
+                portraitSource,
+                cropX,
+                0,
+                cropWidth,
+                portraitSource.getHeight());
+        Bitmap strip = Bitmap.createScaledBitmap(
+                cropped,
+                HORIZON_REFERENCE_SAMPLE_WIDTH,
+                HORIZON_REFERENCE_SAMPLE_HEIGHT,
+                true);
+        cropped.recycle();
+        return strip;
+    }
+
+    /*
+     * Function: createCurrentSweepPreviewStrip
+     * Arguments: none.
+     * Calls: orientReferenceSampleToPortrait() and createHorizonReferenceStrip().
+     * Flow: copy the latest AR preview frame and turn it into the same kind of
+     * small central strip used by the horizon reference overlay.
+     */
+    private Bitmap createCurrentSweepPreviewStrip() {
+        Bitmap source;
+        synchronized (arFrameLock) {
+            source = latestArPreviewBitmap == null ? null : latestArPreviewBitmap.copy(Bitmap.Config.ARGB_8888, false);
+        }
+        if (source == null) {
+            return null;
+        }
+        Bitmap portraitSource = orientReferenceSampleToPortrait(source);
+        Bitmap strip = createHorizonReferenceStrip(portraitSource);
+        if (portraitSource != source) {
+            portraitSource.recycle();
+        }
+        source.recycle();
+        return strip;
+    }
+
+    /*
+     * Function: infillSweepLayerFromSource
+     * Arguments: targetLayer is the high/low layer to fill; sourceLayer is the
+     * nearest painted layer; sampleTopThird chooses top or bottom sample colour.
+     * Calls: averageLayerEdgeColor() and Bitmap.createBitmap().
+     * Flow: create simple colour infill strips for low-detail pole regions.
+     */
+    private void infillSweepLayerFromSource(int targetLayer, int sourceLayer, boolean sampleTopThird) {
+        if (targetLayer < 0 || targetLayer >= sweepCapturePreviewFrames.length) {
+            return;
+        }
+        int color = averageLayerEdgeColor(sourceLayer, sampleTopThird);
+        for (int bin = 0; bin < SWEEP_CAPTURE_BIN_COUNT; bin++) {
+            if (sweepCapturePreviewFrames[targetLayer][bin] != null) {
+                sweepCapturePreviewFrames[targetLayer][bin].recycle();
+            }
+            Bitmap infill = Bitmap.createBitmap(
+                    HORIZON_REFERENCE_SAMPLE_WIDTH,
+                    HORIZON_REFERENCE_SAMPLE_HEIGHT,
+                    Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(infill);
+            canvas.drawColor(color);
+            sweepCapturePreviewFrames[targetLayer][bin] = infill;
+            sweepCaptureBins[targetLayer][bin] = true;
+        }
+    }
+
+    /*
+     * Function: averageLayerEdgeColor
+     * Arguments: layer is the captured source layer; sampleTopThird chooses the
+     * sampled vertical third.
+     * Calls: averageBitmapThirdColor().
+     * Flow: combine captured edge colours into one representative infill colour.
+     */
+    private int averageLayerEdgeColor(int layer, boolean sampleTopThird) {
+        long a = 0L;
+        long r = 0L;
+        long g = 0L;
+        long b = 0L;
+        long count = 0L;
+        if (layer >= 0 && layer < sweepCapturePreviewFrames.length) {
+            for (Bitmap frame : sweepCapturePreviewFrames[layer]) {
+                if (frame == null || frame.isRecycled()) {
+                    continue;
+                }
+                int color = averageBitmapThirdColor(frame, sampleTopThird);
+                a += (color >>> 24) & 0xFF;
+                r += (color >>> 16) & 0xFF;
+                g += (color >>> 8) & 0xFF;
+                b += color & 0xFF;
+                count++;
+            }
+        }
+        if (count == 0L) {
+            return 0xAA0F172A;
+        }
+        return ((int) (a / count) << 24)
+                | ((int) (r / count) << 16)
+                | ((int) (g / count) << 8)
+                | (int) (b / count);
+    }
+
+    /*
+     * Function: averageBitmapThirdColor
+     * Arguments: bitmap is a captured strip; sampleTopThird selects top or
+     * bottom third.
+     * Calls: Bitmap.getPixel().
+     * Flow: estimate a simple representative colour for pole infill.
+     */
+    private int averageBitmapThirdColor(Bitmap bitmap, boolean sampleTopThird) {
+        int yStart = sampleTopThird ? 0 : bitmap.getHeight() * 2 / 3;
+        int yEnd = sampleTopThird ? bitmap.getHeight() / 3 : bitmap.getHeight();
+        long a = 0L;
+        long r = 0L;
+        long g = 0L;
+        long b = 0L;
+        long count = 0L;
+        for (int y = yStart; y < yEnd; y += 3) {
+            for (int x = 0; x < bitmap.getWidth(); x += 3) {
+                int color = bitmap.getPixel(x, y);
+                a += (color >>> 24) & 0xFF;
+                r += (color >>> 16) & 0xFF;
+                g += (color >>> 8) & 0xFF;
+                b += color & 0xFF;
+                count++;
+            }
+        }
+        if (count == 0L) {
+            return 0xAA0F172A;
+        }
+        return ((int) (a / count) << 24)
+                | ((int) (r / count) << 16)
+                | ((int) (g / count) << 8)
+                | (int) (b / count);
+    }
+
+    /*
+     * Function: featherHorizonReferenceSeams
+     * Arguments: none.
+     * Calls: Bitmap.getPixels(), blendColors(), and Bitmap.setPixels().
+     * Flow: replace hard joins between adjacent yaw strips with a short blended
+     * transition so the live reference overlay reads as one panorama.
+     */
+    private void featherHorizonReferenceSeams() {
+        if (horizonReferencePanorama == null) {
+            return;
+        }
+        featherBitmapSeams(horizonReferencePanorama, horizonReferenceBins);
+    }
+
+    /*
+     * Function: featherBitmapSeams
+     * Arguments: bitmap is the strip to soften; bins says which sections exist.
+     * Calls: Bitmap.getPixels(), blendColors(), and Bitmap.setPixels().
+     * Flow: replace hard joins between adjacent yaw strips with a short blended
+     * transition so preview overlays read as one panorama.
+     */
+    private void featherBitmapSeams(Bitmap bitmap, boolean[] bins) {
+        if (bitmap == null || bins == null) {
+            return;
+        }
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int overlap = Math.max(4, HORIZON_REFERENCE_SAMPLE_WIDTH / 6);
+        int[] pixels = new int[width * height];
+        int[] original = new int[width * height];
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
+        System.arraycopy(pixels, 0, original, 0, pixels.length);
+        for (int boundaryBin = 1; boundaryBin < bins.length; boundaryBin++) {
+            if (!bins[boundaryBin - 1] || !bins[boundaryBin]) {
+                continue;
+            }
+            int boundaryX = boundaryBin * HORIZON_REFERENCE_SAMPLE_WIDTH;
+            int leftSampleX = Math.max(0, boundaryX - overlap - 1);
+            int rightSampleX = Math.min(width - 1, boundaryX + overlap);
+            for (int dx = -overlap; dx < overlap; dx++) {
+                int x = boundaryX + dx;
+                if (x < 0 || x >= width) {
+                    continue;
+                }
+                float amount = (dx + overlap) / (float) (overlap * 2 - 1);
+                for (int y = 0; y < height; y++) {
+                    int row = y * width;
+                    pixels[row + x] = blendColors(original[row + leftSampleX], original[row + rightSampleX], amount);
+                }
+            }
+        }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+    }
+
+    /*
+     * Function: blendColors
+     * Arguments: first/second are ARGB colors and amount is the 0..1 mix.
+     * Calls: clamp01().
+     * Flow: linearly blend two bitmap pixels while preserving alpha.
+     */
+    private static int blendColors(int first, int second, float amount) {
+        float t = clamp01(amount);
+        int a = Math.round(((first >>> 24) & 0xFF) * (1f - t) + ((second >>> 24) & 0xFF) * t);
+        int r = Math.round(((first >>> 16) & 0xFF) * (1f - t) + ((second >>> 16) & 0xFF) * t);
+        int g = Math.round(((first >>> 8) & 0xFF) * (1f - t) + ((second >>> 8) & 0xFF) * t);
+        int b = Math.round((first & 0xFF) * (1f - t) + (second & 0xFF) * t);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    /*
+     * Function: orientReferenceSampleToPortrait
+     * Arguments: source is a latest ARCore CPU frame snapshot.
+     * Calls: Matrix.postRotate() and Bitmap.createBitmap().
+     * Flow: ARCore CPU images often arrive in camera sensor orientation; normalize
+     * horizon reference thumbnails to portrait before drawing them side-by-side.
+     */
+    private Bitmap orientReferenceSampleToPortrait(Bitmap source) {
+        if (source.getHeight() >= source.getWidth()) {
+            return source;
+        }
+        Matrix matrix = new Matrix();
+        matrix.postRotate(90f);
+        return Bitmap.createBitmap(source, 0, 0, source.getWidth(), source.getHeight(), matrix, true);
+    }
+
+    /*
+     * Function: horizonReferenceBinForHeading
+     * Arguments: headingDegrees is the current yaw around the capture session.
+     * Calls: normalizeHeading().
+     * Flow: convert heading into one of the fixed horizon-reference sectors.
+     */
+    private int horizonReferenceBinForHeading(float headingDegrees) {
+        int bin = (int) (normalizeHeading(headingDegrees) / (360f / HORIZON_REFERENCE_BIN_COUNT));
+        return Math.max(0, Math.min(HORIZON_REFERENCE_BIN_COUNT - 1, bin));
+    }
+
+    /*
+     * Function: relativeBinForRawHorizonBin
+     * Arguments: rawBin is a horizon-reference bin in absolute AR yaw order.
+     * Calls: normalizeHeading().
+     * Flow: remap the initial horizon row into the same user Start-origin yaw
+     * coordinates used by subsequent painted layers.
+     */
+    private int relativeBinForRawHorizonBin(int rawBin) {
+        float rawCenterDegrees = (rawBin + 0.5f) * 360f / HORIZON_REFERENCE_BIN_COUNT;
+        float relativeDegrees = normalizeHeading(rawCenterDegrees - horizonStartHeadingDegrees);
+        int bin = (int) (relativeDegrees / (360f / SWEEP_CAPTURE_BIN_COUNT));
+        return Math.max(0, Math.min(SWEEP_CAPTURE_BIN_COUNT - 1, bin));
+    }
+
+    /*
+     * Function: horizonReferenceBinCount
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: count how many yaw sectors now have translucent reference imagery.
+     */
+    private int horizonReferenceBinCount() {
+        int count = 0;
+        for (boolean seen : horizonReferenceBins) {
+            if (seen) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /*
@@ -1215,6 +2625,466 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
+     * Function: currentSweepLayerPitch
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return the target pitch for the layer the user is currently painting.
+     */
+    private int currentSweepLayerPitch() {
+        return SWEEP_LAYER_PITCH_DEGREES[Math.max(
+                0,
+                Math.min(SWEEP_LAYER_PITCH_DEGREES.length - 1, currentSweepLayerIndex))];
+    }
+
+    /*
+     * Function: currentSweepLayerName
+     * Arguments: none.
+     * Calls: currentSweepLayerPitch().
+     * Flow: produce a compact label for the active photosphere paint band.
+     */
+    private String currentSweepLayerName() {
+        return layerName(currentSweepLayerIndex);
+    }
+
+    /*
+     * Function: layerName
+     * Arguments: layer is a sweep row index.
+     * Calls: no external functions.
+     * Flow: produce a compact label for any photosphere paint band.
+     */
+    private String layerName(int layer) {
+        if (layer < 0 || layer >= SWEEP_LAYER_PITCH_DEGREES.length) {
+            return "Layer";
+        }
+        int pitch = SWEEP_LAYER_PITCH_DEGREES[layer];
+        if (pitch == 0) {
+            return "Horizon";
+        }
+        return pitch > 0 ? "Upper " + pitch : "Lower " + Math.abs(pitch);
+    }
+
+    /*
+     * Function: currentSweepLayerPrompt
+     * Arguments: none.
+     * Calls: currentSweepLayerName() and currentSweepLayerPitch().
+     * Flow: tell the user how to align the phone for the active horizontal sweep.
+     */
+    private String currentSweepLayerPrompt() {
+        int pitch = currentSweepLayerPitch();
+        if (pitch == 0) {
+            return "Paint horizon: rotate slowly through 360 degrees";
+        }
+        if (isCurrentPolarLayer()) {
+            return String.format(
+                    Locale.US,
+                    "Polar %s: face the start point, point %+d deg, then hold steady",
+                    currentSweepLayerName(),
+                    pitch);
+        }
+        return String.format(
+                Locale.US,
+                "Paint %s: tilt to %+d deg, then rotate 360 degrees",
+                currentSweepLayerName(),
+                pitch);
+    }
+
+    /*
+     * Function: currentSweepCaptureStatusText
+     * Arguments: none.
+     * Calls: currentSweepLayerPrompt(), sweepLayerProgress(), and
+     * currentSweepSpeedMessage().
+     * Flow: keep the main Capture status focused on painting coverage rather
+     * than waiting at discrete target points.
+     */
+    private String currentSweepCaptureStatusText() {
+        if (!isSweepLayerPitchAligned()) {
+            return String.format(Locale.US, "Tilt to %+d deg", currentSweepLayerPitch());
+        }
+        if (isCurrentPolarLayer() && !currentSweepLayerComplete()) {
+            String rollText = polarRollInstruction();
+            if (!sweepLayerPaintingActive) {
+                return "Face start point - tap Capture";
+            }
+            return rollText;
+        }
+        if (!sweepLayerPaintingActive && !currentSweepLayerComplete()) {
+            return "Align view - tap Start";
+        }
+        if (currentSweepLayerComplete()) {
+            if (sweepLayerPaintingActive) {
+                return "Tap Stop to close 360";
+            }
+            return currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1
+                    ? "Photosphere painted"
+                    : "Layer complete - tap Next";
+        }
+        return String.format(
+                Locale.US,
+                "%s %.0f%% - %s",
+                currentSweepLayerName(),
+                sweepLayerProgress(currentSweepLayerIndex) * 100f,
+                currentSweepSpeedMessage());
+    }
+
+    /*
+     * Function: isSweepLayerPitchAligned
+     * Arguments: none.
+     * Calls: currentSweepLayerPitch() and Math.abs().
+     * Flow: allow sweep painting when the camera is close to the active pitch
+     * band instead of requiring a point target lock.
+     */
+    private boolean isSweepLayerPitchAligned() {
+        if (isCurrentPolarLayer() && sweepLayerPaintingActive) {
+            return true;
+        }
+        return Math.abs(pitchDegrees - currentSweepLayerPitch()) <= MAX_SWEEP_LAYER_PITCH_DELTA_DEGREES;
+    }
+
+    /*
+     * Function: effectiveGuidePitchDegrees
+     * Arguments: none.
+     * Calls: currentSweepLayerPitch().
+     * Flow: keep the polar overlay fixed on the intended vertical pitch once
+     * capture starts, because yaw/pitch labels become unstable near the pole.
+     */
+    private float effectiveGuidePitchDegrees() {
+        if (isCurrentPolarLayer() && sweepLayerPaintingActive) {
+            return currentSweepLayerPitch();
+        }
+        return pitchDegrees;
+    }
+
+    /*
+     * Function: isCurrentPolarLayer
+     * Arguments: none.
+     * Calls: isPolarLayer().
+     * Flow: identify the high upper/lower layers where yaw is unreliable and
+     * capture should be driven by phone roll instead.
+     */
+    private boolean isCurrentPolarLayer() {
+        return isPolarLayer(currentSweepLayerIndex);
+    }
+
+    /*
+     * Function: isPolarLayer
+     * Arguments: layer is a sweep row index.
+     * Calls: no external functions.
+     * Flow: treat the uppermost and lowermost rows as polar capture special
+     * cases because yaw breaks down when the phone points vertically.
+     */
+    private boolean isPolarLayer(int layer) {
+        return layer == SWEEP_LAYER_HIGH_UPPER_INDEX || layer == SWEEP_LAYER_HIGH_LOWER_INDEX;
+    }
+
+    /*
+     * Function: showPolarCaptureInfoIfNeeded
+     * Arguments: none.
+     * Calls: AlertDialog.Builder.
+     * Flow: explain the polar exception once, just before the first polar layer
+     * asks the user to stop relying on yaw and roll the phone instead.
+     */
+    private void showPolarCaptureInfoIfNeeded() {
+        if (polarCaptureInfoShown || !isCurrentPolarLayer()) {
+            return;
+        }
+        polarCaptureInfoShown = true;
+        new AlertDialog.Builder(this)
+                .setTitle("Polar capture")
+                .setMessage("At the top and bottom of a photosphere, yaw and roll become unreliable.\n\nThe nearby +30/-30 degree sweeps already provide overlap, so each pole captures one vertical frame.\n\nFace your original start point, point the device vertically up or down to the target pitch line, and hold steady while Spherify captures from pitch alignment.")
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    /*
+     * Function: currentCaptureBin
+     * Arguments: none.
+     * Calls: polarSweepBinForRoll() or sweepCaptureBinForHeading().
+     * Flow: use yaw bins for normal sweeps, but use one fixed center bin for
+     * polar cap layers.
+     */
+    private int currentCaptureBin() {
+        if (isCurrentPolarLayer()) {
+            return POLAR_ROLL_SLOT_SWEEP_BINS[0];
+        }
+        return sweepCaptureBinForHeading(compassHeadingDegrees);
+    }
+
+    /*
+     * Function: currentOverlayBin
+     * Arguments: none.
+     * Calls: polarRollSlotForRoll() or sweepCaptureBinForHeading().
+     * Flow: report a compact three-position progress index for polar overlays.
+     */
+    private int currentOverlayBin() {
+        if (isCurrentPolarLayer()) {
+            return 0;
+        }
+        return sweepCaptureBinForHeading(compassHeadingDegrees);
+    }
+
+    /*
+     * Function: polarSweepBinForRoll
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return the fixed center bin for one-shot polar cap capture.
+     */
+    private int polarSweepBinForRoll() {
+        return POLAR_ROLL_SLOT_SWEEP_BINS[0];
+    }
+
+    /*
+     * Function: polarRollInstruction
+     * Arguments: none.
+     * Calls: polarSlotCaptured().
+     * Flow: tell the user whether the one-shot polar cap still needs capture.
+     */
+    private String polarRollInstruction() {
+        return polarSlotCaptured(currentSweepLayerIndex, 0)
+                ? "Polar layer complete"
+                : "Align pitch line";
+    }
+
+    /*
+     * Function: polarSlotName
+     * Arguments: slot is 0, 1, or 2.
+     * Calls: no external functions.
+     * Flow: provide concise user-facing roll labels.
+     */
+    private String polarSlotName(int slot) {
+        return "center";
+    }
+
+    /*
+     * Function: polarSlotCaptured
+     * Arguments: layer is a polar layer; slot is the roll slot.
+     * Calls: no external functions.
+     * Flow: read coverage from the synthetic preview bins used for polar frames.
+     */
+    private boolean polarSlotCaptured(int layer, int slot) {
+        if (layer < 0 || layer >= sweepCaptureBins.length
+                || slot < 0 || slot >= POLAR_ROLL_SLOT_SWEEP_BINS.length) {
+            return false;
+        }
+        return sweepCaptureBins[layer][POLAR_ROLL_SLOT_SWEEP_BINS[slot]];
+    }
+
+    /*
+     * Function: polarSlotIndexForSweepBin
+     * Arguments: sweepBin is the synthetic row bin used for a polar frame.
+     * Calls: no external functions.
+     * Flow: map a stored polar preview bin back to its left/middle/right slot.
+     */
+    private int polarSlotIndexForSweepBin(int sweepBin) {
+        for (int i = 0; i < POLAR_ROLL_SLOT_SWEEP_BINS.length; i++) {
+            if (POLAR_ROLL_SLOT_SWEEP_BINS[i] == sweepBin) {
+                return i;
+            }
+        }
+        return 1;
+    }
+
+    /*
+     * Function: signedAngleDeltaDegrees
+     * Arguments: fromDegrees and toDegrees are angular values.
+     * Calls: no external functions.
+     * Flow: return the shortest signed angular delta in degrees.
+     */
+    private float signedAngleDeltaDegrees(float fromDegrees, float toDegrees) {
+        float delta = (fromDegrees - toDegrees) % 360f;
+        if (delta > 180f) {
+            delta -= 360f;
+        } else if (delta < -180f) {
+            delta += 360f;
+        }
+        return delta;
+    }
+
+    /*
+     * Function: isAlignedWithSweepLayerStart
+     * Arguments: none.
+     * Calls: headingDeltaDegrees() and isSweepLayerPitchAligned().
+     * Flow: require layer sweeps to start and stop at the original real-world
+     * horizon landmark while allowing the target pitch to be above or below it.
+     */
+    private boolean isAlignedWithSweepLayerStart() {
+        return horizonSweepComplete && isSweepLayerPitchAligned();
+    }
+
+    /*
+     * Function: sweepCaptureBinForHeading
+     * Arguments: headingDegrees is the current ARCore yaw.
+     * Calls: normalizeHeading().
+     * Flow: map yaw to the sweep coverage bin used for automatic frame saves.
+     */
+    private int sweepCaptureBinForHeading(float headingDegrees) {
+        int bin = (int) (relativeSweepYawDegrees(headingDegrees) / (360f / SWEEP_CAPTURE_BIN_COUNT));
+        return Math.max(0, Math.min(SWEEP_CAPTURE_BIN_COUNT - 1, bin));
+    }
+
+    /*
+     * Function: relativeSweepYawDegrees
+     * Arguments: headingDegrees is the current ARCore yaw.
+     * Calls: normalizeHeading().
+     * Flow: convert AR yaw into the user-defined layer coordinate system where
+     * the Start button is always yaw zero.
+     */
+    private float relativeSweepYawDegrees(float headingDegrees) {
+        return normalizeHeading(headingDegrees - sweepLayerStartHeadingDegrees);
+    }
+
+    /*
+     * Function: markCurrentSweepLayerClosed
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: trust the user's Stop press as completing one full turn, even if AR
+     * yaw drift prevented every intermediate bin from filling.
+     */
+    private void markCurrentSweepLayerClosed() {
+        if (currentSweepLayerIndex < 0 || currentSweepLayerIndex >= sweepCaptureBins.length) {
+            return;
+        }
+        for (int i = 0; i < sweepCaptureBins[currentSweepLayerIndex].length; i++) {
+            sweepCaptureBins[currentSweepLayerIndex][i] = true;
+        }
+    }
+
+    /*
+     * Function: sweepCaptureBinCenterDegrees
+     * Arguments: bin is a sweep coverage bin index.
+     * Calls: normalizeHeading().
+     * Flow: return the yaw represented by a captured sweep bin for metadata.
+     */
+    private int sweepCaptureBinCenterDegrees(int bin) {
+        return Math.round(normalizeHeading((bin + 0.5f) * 360f / SWEEP_CAPTURE_BIN_COUNT));
+    }
+
+    /*
+     * Function: sweepLayerProgress
+     * Arguments: layerIndex is the sweep layer to summarize.
+     * Calls: capturedSweepBinCount() and clamp01().
+     * Flow: convert one layer's painted yaw bins into a completion fraction.
+     */
+    private float sweepLayerProgress(int layerIndex) {
+        if (layerIndex < 0 || layerIndex >= sweepCaptureBins.length) {
+            return 0f;
+        }
+        if (isPolarLayer(layerIndex)) {
+            return clamp01(capturedSweepBinCount(layerIndex) / (float) POLAR_ROLL_SLOT_TARGETS.length);
+        }
+        return clamp01(capturedSweepBinCount(layerIndex) / (float) REQUIRED_SWEEP_CAPTURE_BINS);
+    }
+
+    /*
+     * Function: currentSweepLayerComplete
+     * Arguments: none.
+     * Calls: capturedSweepBinCount().
+     * Flow: determine when enough of the current horizontal band has been painted.
+     */
+    private boolean currentSweepLayerComplete() {
+        return capturedSweepBinCount(currentSweepLayerIndex) >= (isCurrentPolarLayer()
+                ? POLAR_ROLL_SLOT_TARGETS.length
+                : REQUIRED_SWEEP_CAPTURE_BINS);
+    }
+
+    /*
+     * Function: capturedSweepBinCount
+     * Arguments: layerIndex is the sweep layer to count.
+     * Calls: no external functions.
+     * Flow: count painted yaw bins within a layer.
+     */
+    private int capturedSweepBinCount(int layerIndex) {
+        if (layerIndex < 0 || layerIndex >= sweepCaptureBins.length) {
+            return 0;
+        }
+        if (isPolarLayer(layerIndex)) {
+            int captured = 0;
+            for (int slot = 0; slot < POLAR_ROLL_SLOT_SWEEP_BINS.length; slot++) {
+                if (polarSlotCaptured(layerIndex, slot)) {
+                    captured++;
+                }
+            }
+            return captured;
+        }
+        int captured = 0;
+        for (boolean seen : sweepCaptureBins[layerIndex]) {
+            if (seen) {
+                captured++;
+            }
+        }
+        return captured;
+    }
+
+    /*
+     * Function: totalSweepCoverageProgress
+     * Arguments: none.
+     * Calls: capturedSweepBinCount() and clamp01().
+     * Flow: summarize all paint bands as one overall coverage fraction.
+     */
+    private float totalSweepCoverageProgress() {
+        int captured = 0;
+        int required = 0;
+        for (int layer = 0; layer < sweepCaptureBins.length; layer++) {
+            int layerRequired = isPolarLayer(layer) ? POLAR_ROLL_SLOT_TARGETS.length : REQUIRED_SWEEP_CAPTURE_BINS;
+            captured += Math.min(layerRequired, capturedSweepBinCount(layer));
+            required += layerRequired;
+        }
+        return required == 0 ? 0f : clamp01(captured / (float) required);
+    }
+
+    /*
+     * Function: capturedSweepFrameCount
+     * Arguments: none.
+     * Calls: capturedSweepBinCount().
+     * Flow: count painted bins across every layer for session summaries.
+     */
+    private int capturedSweepFrameCount() {
+        int captured = 0;
+        for (int layer = 0; layer < sweepCaptureBins.length; layer++) {
+            captured += capturedSweepBinCount(layer);
+        }
+        return captured;
+    }
+
+    /*
+     * Function: currentSweepLayerBins
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: return a defensive copy of the active layer's yaw coverage for the
+     * overlay paint strip.
+     */
+    private boolean[] currentSweepLayerBins() {
+        boolean[] bins = new boolean[SWEEP_CAPTURE_BIN_COUNT];
+        if (currentSweepLayerIndex < 0 || currentSweepLayerIndex >= sweepCaptureBins.length) {
+            return bins;
+        }
+        if (isCurrentPolarLayer()) {
+            bins = new boolean[POLAR_ROLL_SLOT_SWEEP_BINS.length];
+            for (int slot = 0; slot < bins.length; slot++) {
+                bins[slot] = polarSlotCaptured(currentSweepLayerIndex, slot);
+            }
+            return bins;
+        }
+        for (int i = 0; i < bins.length; i++) {
+            bins[i] = sweepCaptureBins[currentSweepLayerIndex][i];
+        }
+        return bins;
+    }
+
+    /*
+     * Function: currentOverlayPanorama
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: use the active layer preview outside the horizon layer so the user
+     * can see non-horizon images being painted in the overlay.
+     */
+    private Bitmap currentOverlayPanorama() {
+        if (currentSweepLayerIndex > 0 && sweepLayerPreviewPanorama != null) {
+            return sweepLayerPreviewPanorama;
+        }
+        return horizonReferencePanorama;
+    }
+
+    /*
      * Function: capturedTargetCount
      * Arguments: none.
      * Calls: no helpers.
@@ -1234,33 +3104,41 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Function: maybeAutoCapture
      * Arguments: none.
      * Calls: captureFrame() and System.currentTimeMillis().
-     * Flow: auto-capture once calibration, reticle alignment, and the one-second
-     * lock countdown are all satisfied.
+     * Flow: auto-capture a new frame whenever the active sweep layer reaches an
+     * unpainted yaw bin at acceptable motion speed.
      */
     private void maybeAutoCapture() {
         long now = System.currentTimeMillis();
+        int bin = currentCaptureBin();
+        if (bin < 0) {
+            return;
+        }
         if (autoCaptureEnabled
                 && isCaptureAllowed()
-                && isTargetStable()
-                && now - lastAutoCaptureAt > 1300L) {
+                && sweepLayerPaintingActive
+                && isSweepLayerPitchAligned()
+                && (isCurrentPolarLayer() || !"Move slower".equals(currentSweepSpeedMessage()))
+                && !sweepCaptureBins[currentSweepLayerIndex][bin]
+                && now - lastAutoCaptureAt > MIN_SWEEP_CAPTURE_INTERVAL_MS) {
             lastAutoCaptureAt = now;
-            captureFrame("auto");
+            captureFrame(isCurrentPolarLayer() ? "polar-auto" : "sweep-auto");
         }
     }
 
     /*
      * Function: isCaptureAllowed
      * Arguments: none.
-     * Calls: isCompassCalibrationReady().
+     * Calls: isCaptureSetupReady().
      * Flow: centralize all capture gates so manual and auto-capture follow the
      * same paused/calibrated/camera-ready/in-progress rules.
      */
     private boolean isCaptureAllowed() {
         return !capturePaused
                 && !captureInProgress
-                && imageCapture != null
-                && isCompassCalibrationReady()
-                && activeTargetIndex >= 0;
+                && latestArJpeg != null
+                && isCaptureSetupReady()
+                && currentSweepLayerIndex >= 0
+                && currentSweepLayerIndex < sweepCaptureBins.length;
     }
 
     /*
@@ -1286,10 +3164,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      */
     private void toggleAutoCapture() {
         autoCaptureEnabled = !autoCaptureEnabled;
-        autoCaptureButton.setText(autoCaptureEnabled ? "Auto On" : "Auto Off");
+        autoCaptureButton.setText(autoCaptureEnabled ? "Auto Paint" : "Manual Paint");
         Toast.makeText(
                 this,
-                autoCaptureEnabled ? "Auto capture waits for stable alignment" : "Manual capture only",
+                autoCaptureEnabled ? "Auto paint saves each new sweep slice" : "Manual paint only",
                 Toast.LENGTH_SHORT).show();
         maybeAutoCapture();
     }
@@ -1298,18 +3176,19 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Function: undoLastTarget
      * Arguments: none.
      * Calls: Toast and updateGuideState().
-     * Flow: remove the latest target coverage mark. The already-written JPEG
+     * Flow: remove the latest sweep coverage mark. The already-written JPEG
      * remains in the draft folder for recovery, but the guide lets the user
      * recapture that direction.
      */
     private void undoLastTarget() {
-        if (lastCapturedTargetIndex < 0) {
-            Toast.makeText(this, "No target to undo", Toast.LENGTH_SHORT).show();
+        if (lastCapturedSweepLayerIndex < 0 || lastCapturedSweepBin < 0) {
+            Toast.makeText(this, "No sweep slice to undo", Toast.LENGTH_SHORT).show();
             return;
         }
-        captureTargets[lastCapturedTargetIndex].captured = false;
-        lastCapturedTargetIndex = -1;
-        Toast.makeText(this, "Last target reopened", Toast.LENGTH_SHORT).show();
+        sweepCaptureBins[lastCapturedSweepLayerIndex][lastCapturedSweepBin] = false;
+        lastCapturedSweepLayerIndex = -1;
+        lastCapturedSweepBin = -1;
+        Toast.makeText(this, "Last sweep slice reopened", Toast.LENGTH_SHORT).show();
         updateGuideState();
     }
 
@@ -1321,11 +3200,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * whether enough frames exist for later stitching experiments.
      */
     private void finishCaptureSession() {
-        int captured = capturedTargetCount();
+        int captured = capturedSweepFrameCount();
         new AlertDialog.Builder(this)
                 .setTitle("Finish draft capture?")
-                .setMessage("Captured " + captured + " of " + captureTargets.length
-                        + " guide targets.\n\nDraft frames remain saved for Phase 5 stitching experiments.")
+                .setMessage("Painted " + captured + " of "
+                        + (SWEEP_LAYER_PITCH_DEGREES.length * SWEEP_CAPTURE_BIN_COUNT)
+                        + " sweep slices.\n\nDraft frames remain saved for Phase 5 stitching experiments.")
                 .setNegativeButton("Keep capturing", null)
                 .setPositiveButton("Finish", (dialog, which) -> {
                     clearActiveSession();
@@ -1398,60 +3278,378 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
-     * Function: showCompassCalibrationInstructions
+     * Function: showHorizonSweepInstructions
      * Arguments: none.
      * Calls: AlertDialog.Builder.
-     * Flow: explain the stronger-than-panorama calibration requirement as soon as
-     * capture opens, before the user tries to save a frame.
+     * Flow: explain the separate compass calibration and horizon-reference
+     * passes as soon as capture opens.
      */
-    private void showCompassCalibrationInstructions() {
+    private void showHorizonSweepInstructions() {
         new AlertDialog.Builder(this)
-                .setTitle("Why calibrate the compass?")
-                .setMessage("Spherify needs to know which way your phone is pointing.\n\n"
-                        + "If the compass is wrong, photos may line up badly later and north may be in the wrong place.\n\n"
-                        + "Calibration helps the phone find a steady, trustworthy north before you capture.")
-                .setPositiveButton("Start calibration", (dialog, which) -> startCompassCalibration())
-                .setNegativeButton("Close", null)
+                .setTitle("Start with compass calibration")
+                .setMessage("First, tap Start and slowly turn once around the horizon to let the compass settle.\n\n"
+                        + "After calibration, point the crosshair at a fixed distant landmark, tap Start again, sweep once around the horizon, return to the same landmark, then tap End.")
+                .setPositiveButton("OK", null)
                 .show();
     }
 
     /*
-     * Function: startCamera
+     * Function: startArCoreCapture
      * Arguments: none.
-     * Calls: ContextCompat.checkSelfPermission(), ProcessCameraProvider.getInstance(),
-     * Preview/ImageCapture builders, bindToLifecycle(), and statusText.setText().
-     * Flow: verify camera permission, asynchronously acquire CameraX provider,
-     * bind preview plus still capture to the back camera, and update status.
+     * Calls: ContextCompat.checkSelfPermission(), verifyArCoreSupport(),
+     * initializeArSession(), resumeArSession(), and updateCompassUi().
+     * Flow: verify camera permission and hand camera ownership to an ARCore
+     * shared-camera session, which supplies both pose and CPU camera frames.
      */
-    private void startCamera() {
+    private void startArCoreCapture() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
-            statusText.setText("Calibration needed");
+            statusText.setText("ARCore required");
             return;
         }
+        verifyArCoreSupport();
+        initializeArSession();
+        resumeArSession();
+        updateCompassUi();
+    }
 
-        ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
-        cameraProviderFuture.addListener(() -> {
-            try {
-                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
-                Preview preview = new Preview.Builder().build();
-                imageCapture = new ImageCapture.Builder()
-                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                        .build();
-                preview.setSurfaceProvider(previewView.getSurfaceProvider());
+    /*
+     * Function: initializeArSession
+     * Arguments: none.
+     * Calls: Session constructor, Session.configure(), and getSharedCamera().
+     * Flow: create one ARCore session with the shared-camera feature and configure
+     * autofocus so every preview/capture frame has an ARCore pose source.
+     */
+    private void initializeArSession() {
+        if (!arCoreReady || arSession != null) {
+            return;
+        }
+        try {
+            arSession = new Session(this, EnumSet.of(Session.Feature.SHARED_CAMERA));
+            Config config = arSession.getConfig();
+            config.setFocusMode(Config.FocusMode.AUTO);
+            arSession.configure(config);
+            sharedCamera = arSession.getSharedCamera();
+            attachArCameraTexture();
+        } catch (UnavailableException e) {
+            arCoreReady = false;
+            showArCoreUnsupportedMessage();
+        } catch (RuntimeException e) {
+            arCoreReady = false;
+            statusText.setText("ARCore unavailable");
+            Toast.makeText(this, "ARCore session failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
 
-                cameraProvider.unbindAll();
-                cameraProvider.bindToLifecycle(
-                        this,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        imageCapture);
-                updateCompassUi();
-            } catch (Exception e) {
-                statusText.setText("Calibration needed");
-                Toast.makeText(this, "Camera failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+    /*
+     * Function: resumeArSession
+     * Arguments: none.
+     * Calls: Session.resume() and attachArCameraTexture().
+     * Flow: start ARCore tracking; the GLSurfaceView render loop updates
+     * preview, horizon reference samples, guide pose, and capture JPEG data.
+     */
+    private void resumeArSession() {
+        if (!arCoreReady) {
+            return;
+        }
+        initializeArSession();
+        if (arSession == null || arSessionRunning) {
+            return;
+        }
+        try {
+            arSession.resume();
+            arSessionRunning = true;
+            attachArCameraTexture();
+        } catch (CameraNotAvailableException e) {
+            arSessionRunning = false;
+            statusText.setText("ARCore camera unavailable");
+            Toast.makeText(this, "ARCore camera unavailable", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /*
+     * Function: pauseArSession
+     * Arguments: none.
+     * Calls: Session.pause().
+     * Flow: stop ARCore camera/tracking while paused.
+     */
+    private void pauseArSession() {
+        if (arSession != null && arSessionRunning) {
+            arSession.pause();
+        }
+        arSessionRunning = false;
+    }
+
+    /*
+     * Function: onArCameraTextureCreated
+     * Arguments: textureId is the external OES texture created by the GL renderer.
+     * Calls: attachArCameraTexture().
+     * Flow: remember the renderer texture and attach it to ARCore as soon as
+     * both the texture and session exist.
+     */
+    private void onArCameraTextureCreated(int textureId) {
+        arCameraTextureId = textureId;
+        attachArCameraTexture();
+    }
+
+    /*
+     * Function: attachArCameraTexture
+     * Arguments: none.
+     * Calls: Session.setCameraTextureNames().
+     * Flow: connect ARCore camera output to the renderer's external texture.
+     */
+    private void attachArCameraTexture() {
+        if (arSession == null || arCameraTextureId == 0) {
+            return;
+        }
+        arSession.setCameraTextureNames(new int[]{arCameraTextureId});
+    }
+
+    /*
+     * Function: drawArFrame
+     * Arguments: renderer draws the external camera texture after update.
+     * Calls: Session.update(), Frame.getImageMetadata(),
+     * Frame.acquireCameraImage(), acceptArPose(), and updatePreviewFromArImage().
+     * Flow: pull the latest ARCore frame from the GL render loop, update pose
+     * guidance, cache exposure metadata and a CPU JPEG when available, and draw
+     * the camera texture.
+     */
+    private void drawArFrame(ArCameraRenderer renderer) {
+        if (!arSessionRunning || arSession == null || arCameraTextureId == 0) {
+            renderer.drawEmpty();
+            return;
+        }
+        try {
+            Frame frame = arSession.update();
+            if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
+                acceptArPose(frame.getCamera().getPose());
             }
-        }, ContextCompat.getMainExecutor(this));
+            updateExposureMetadataFromArFrame(frame);
+            try (Image image = frame.acquireCameraImage()) {
+                updatePreviewFromArImage(image);
+            } catch (NotYetAvailableException ignored) {
+                // ARCore may not have a CPU image for every pose frame.
+            }
+            renderer.drawCamera();
+        } catch (Throwable ignored) {
+            renderer.drawEmpty();
+        }
+    }
+
+    /*
+     * Function: updateExposureMetadataFromArFrame
+     * Arguments: frame is the latest ARCore frame.
+     * Calls: Frame.getImageMetadata() and captureExposureMetadataJson().
+     * Flow: cache the camera exposure references from ARCore so the next draft
+     * frame records the sensor values Phase 5 needs for exposure balancing.
+     * Metadata availability varies by device/frame, so every failure is kept
+     * local to this helper and must never interrupt camera rendering.
+     */
+    private void updateExposureMetadataFromArFrame(Frame frame) {
+        try {
+            ImageMetadata metadata = frame.getImageMetadata();
+            String exposureJson = captureExposureMetadataJson(metadata);
+            synchronized (arFrameLock) {
+                latestExposureMetadataJson = exposureJson;
+            }
+        } catch (NotYetAvailableException ignored) {
+            synchronized (arFrameLock) {
+                if (latestExposureMetadataJson == null) {
+                    latestExposureMetadataJson = unavailableExposureJson("metadata not ready");
+                }
+            }
+        } catch (Throwable ignored) {
+            synchronized (arFrameLock) {
+                if (latestExposureMetadataJson == null) {
+                    latestExposureMetadataJson = unavailableExposureJson("metadata unavailable");
+                }
+            }
+        }
+    }
+
+    /*
+     * Function: captureExposureMetadataJson
+     * Arguments: metadata is ARCore's camera metadata snapshot.
+     * Calls: ImageMetadata getters and JSONObject.put().
+     * Flow: convert the exposure-relevant camera fields into a small structured
+     * JSON object that is written beside each draft frame for Phase 5 stitching.
+     */
+    private String captureExposureMetadataJson(ImageMetadata metadata) {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("available", true);
+            json.put("source", "arcore-image-metadata");
+            putLongMetadata(json, "sensorExposureTimeNs", metadata, ImageMetadata.SENSOR_EXPOSURE_TIME);
+            putIntMetadata(json, "sensorSensitivityIso", metadata, ImageMetadata.SENSOR_SENSITIVITY);
+            putLongMetadata(json, "sensorFrameDurationNs", metadata, ImageMetadata.SENSOR_FRAME_DURATION);
+            putLongMetadata(json, "sensorTimestampNs", metadata, ImageMetadata.SENSOR_TIMESTAMP);
+            putFloatMetadata(json, "lensAperture", metadata, ImageMetadata.LENS_APERTURE);
+            putFloatMetadata(json, "lensFocalLengthMm", metadata, ImageMetadata.LENS_FOCAL_LENGTH);
+            putIntMetadata(json, "aeState", metadata, ImageMetadata.CONTROL_AE_STATE);
+            putIntMetadata(json, "awbState", metadata, ImageMetadata.CONTROL_AWB_STATE);
+            putIntMetadata(json, "aeExposureCompensation", metadata, ImageMetadata.CONTROL_AE_EXPOSURE_COMPENSATION);
+            putIntMetadata(json, "aeMode", metadata, ImageMetadata.CONTROL_AE_MODE);
+            putIntMetadata(json, "awbMode", metadata, ImageMetadata.CONTROL_AWB_MODE);
+            return json.toString();
+        } catch (JSONException e) {
+            return unavailableExposureJson("metadata encode failed");
+        }
+    }
+
+    private static void putLongMetadata(JSONObject json, String name, ImageMetadata metadata, int key)
+            throws JSONException {
+        try {
+            json.put(name, metadata.getLong(key));
+        } catch (MetadataNotFoundException ignored) {
+            json.put(name, JSONObject.NULL);
+        }
+    }
+
+    private static void putIntMetadata(JSONObject json, String name, ImageMetadata metadata, int key)
+            throws JSONException {
+        try {
+            json.put(name, metadata.getInt(key));
+        } catch (MetadataNotFoundException ignored) {
+            json.put(name, JSONObject.NULL);
+        }
+    }
+
+    private static void putFloatMetadata(JSONObject json, String name, ImageMetadata metadata, int key)
+            throws JSONException {
+        try {
+            json.put(name, metadata.getFloat(key));
+        } catch (MetadataNotFoundException ignored) {
+            json.put(name, JSONObject.NULL);
+        }
+    }
+
+    private static String unavailableExposureJson(String reason) {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("available", false);
+            json.put("reason", reason);
+            return json.toString();
+        } catch (JSONException ignored) {
+            return "{\"available\":false,\"reason\":\"metadata unavailable\"}";
+        }
+    }
+
+    /*
+     * Function: updatePreviewFromArImage
+     * Arguments: image is the latest ARCore CPU camera image.
+     * Calls: yuv420ToJpeg() and BitmapFactory.decodeByteArray().
+     * Flow: convert ARCore's YUV frame once, keep the JPEG for draft capture,
+     * keep a downsampled bitmap for horizon sampling.
+     */
+    private void updatePreviewFromArImage(Image image) {
+        byte[] jpeg = yuv420ToJpeg(image, 88);
+        Bitmap bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+        if (bitmap == null) {
+            return;
+        }
+        synchronized (arFrameLock) {
+            latestArJpeg = jpeg;
+            if (latestArPreviewBitmap != null && latestArPreviewBitmap != bitmap) {
+                latestArPreviewBitmap.recycle();
+            }
+            latestArPreviewBitmap = bitmap;
+        }
+    }
+
+    /*
+     * Function: yuv420ToJpeg
+     * Arguments: image is an ARCore YUV_420_888 frame; quality is JPEG quality.
+     * Calls: yuv420ToNv21(), YuvImage.compressToJpeg(), and ByteArrayOutputStream.
+     * Flow: adapt Android's multi-plane YUV camera image into a compact JPEG
+     * used for both live preview and draft frame capture.
+     */
+    private byte[] yuv420ToJpeg(Image image, int quality) {
+        byte[] nv21 = yuv420ToNv21(image);
+        YuvImage yuvImage = new YuvImage(
+                nv21,
+                ImageFormat.NV21,
+                image.getWidth(),
+                image.getHeight(),
+                null);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), quality, output);
+        return output.toByteArray();
+    }
+
+    /*
+     * Function: orientCapturedJpegUpright
+     * Arguments: jpeg is the raw ARCore camera frame encoded from YUV.
+     * Calls: BitmapFactory.decodeByteArray(), Matrix.postRotate(), and
+     * Bitmap.compress().
+     * Flow: ARCore CPU camera frames arrive in the sensor's landscape buffer
+     * orientation, which displays as 90 degrees left in the draft browser. Rotate
+     * landscape captures clockwise into upright portrait pixels before saving.
+     */
+    private byte[] orientCapturedJpegUpright(byte[] jpeg) {
+        Bitmap source = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+        if (source == null) {
+            return jpeg;
+        }
+        if (source.getWidth() <= source.getHeight()) {
+            source.recycle();
+            return jpeg;
+        }
+        Matrix matrix = new Matrix();
+        matrix.postRotate(90f);
+        Bitmap rotated = Bitmap.createBitmap(source, 0, 0, source.getWidth(), source.getHeight(), matrix, true);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        rotated.compress(Bitmap.CompressFormat.JPEG, 92, output);
+        source.recycle();
+        if (rotated != source) {
+            rotated.recycle();
+        }
+        return output.toByteArray();
+    }
+
+    /*
+     * Function: yuv420ToNv21
+     * Arguments: image is an Android YUV_420_888 image.
+     * Calls: copyPlane().
+     * Flow: copy Y, V, and U plane data into the NV21 byte order expected by
+     * YuvImage while respecting row and pixel strides.
+     */
+    private byte[] yuv420ToNv21(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        byte[] output = new byte[width * height * 3 / 2];
+        Image.Plane[] planes = image.getPlanes();
+        copyPlane(planes[0].getBuffer(), output, 0, width, height, planes[0].getRowStride(), planes[0].getPixelStride(), false);
+        int chromaOffset = width * height;
+        copyPlane(planes[2].getBuffer(), output, chromaOffset, width / 2, height / 2, planes[2].getRowStride(), planes[2].getPixelStride(), true);
+        copyPlane(planes[1].getBuffer(), output, chromaOffset + 1, width / 2, height / 2, planes[1].getRowStride(), planes[1].getPixelStride(), true);
+        return output;
+    }
+
+    /*
+     * Function: copyPlane
+     * Arguments: buffer is one image plane; output receives bytes; outputOffset
+     * starts the plane; width/height are plane dimensions; rowStride/pixelStride
+     * describe the source layout; interleaved writes chroma bytes every other slot.
+     * Calls: ByteBuffer.position() and ByteBuffer.get().
+     * Flow: copy a possibly-strided camera plane into tightly packed output.
+     */
+    private void copyPlane(
+            ByteBuffer buffer,
+            byte[] output,
+            int outputOffset,
+            int width,
+            int height,
+            int rowStride,
+            int pixelStride,
+            boolean interleaved) {
+        int outputIndex = outputOffset;
+        for (int row = 0; row < height; row++) {
+            int rowStart = row * rowStride;
+            for (int column = 0; column < width; column++) {
+                output[outputIndex] = buffer.get(rowStart + column * pixelStride);
+                outputIndex += interleaved ? 2 : 1;
+            }
+        }
     }
 
     /*
@@ -1468,37 +3666,64 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Function: captureFrame
      * Arguments: captureMode is "manual" or "auto" for draft metadata.
-     * Calls: SpherifyLibrary.createDraftFrameFile(), ImageCapture.takePicture(),
+     * Calls: SpherifyLibrary.createDraftFrameFile(), FileOutputStream,
      * readLocationSummary(), SpherifyLibrary.recordDraftFrame(), Toast, and
      * runOnUiThread().
-     * Flow: ensure CameraX/calibration/guidance are ready, allocate an output
-     * JPEG, capture into it on the background executor, then record metadata,
-     * mark target coverage, and notify the UI.
+     * Flow: ensure ARCore/horizon/sweep layer are ready, allocate an output
+     * JPEG, write the latest ARCore camera frame, then record metadata and mark
+     * the current sweep slice as painted.
      */
     private void captureFrame(String captureMode) {
         if (capturePaused) {
             Toast.makeText(this, "Capture is paused", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (!isCompassCalibrationReady()) {
-            String message = "Capture locked until compass calibration completes. "
-                    + compassCalibrationProgress();
-            statusText.setText("Calibration needed");
+        if (!isCaptureSetupReady()) {
+            String message = "Capture locked until the ARCore horizon sweep completes. "
+                    + horizonReferenceProgressText();
+            statusText.setText(arCoreReady ? "Horizon sweep needed" : "ARCore required");
             Toast.makeText(this, message, Toast.LENGTH_LONG).show();
             return;
         }
-        if (imageCapture == null) {
-            Toast.makeText(this, "Camera is not ready yet", Toast.LENGTH_SHORT).show();
+        byte[] jpeg;
+        String exposureJson;
+        synchronized (arFrameLock) {
+            jpeg = latestArJpeg == null ? null : latestArJpeg.clone();
+            exposureJson = latestExposureMetadataJson;
+        }
+        if (jpeg == null) {
+            Toast.makeText(this, "ARCore camera frame is not ready yet", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (activeTargetIndex < 0 || !targetAligned(captureTargets[activeTargetIndex])) {
-            Toast.makeText(this, "Line up the reticle with an open target first", Toast.LENGTH_SHORT).show();
+        if (!isSweepLayerPitchAligned()) {
+            Toast.makeText(
+                    this,
+                    String.format(Locale.US, "Tilt to %+d deg for this layer", currentSweepLayerPitch()),
+                    Toast.LENGTH_SHORT).show();
             return;
         }
-        if (!isTargetStable()) {
-            Toast.makeText(this, "Hold steady on the target", Toast.LENGTH_SHORT).show();
+        if (!sweepLayerPaintingActive && ("sweep-auto".equals(captureMode) || "polar-auto".equals(captureMode))) {
             return;
         }
+        if (!sweepLayerPaintingActive && currentSweepLayerIndex == 0) {
+            Toast.makeText(this, "Use Start/End for the horizon sweep", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!isCurrentPolarLayer() && "Move slower".equals(currentSweepSpeedMessage())) {
+            Toast.makeText(this, "Move slower before painting this slice", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int sweepLayerIndex = currentSweepLayerIndex;
+        int sweepBin = currentCaptureBin();
+        if (sweepBin < 0) {
+            return;
+        }
+        boolean manualBlockCapture = "manual".equals(captureMode);
+        if (sweepCaptureBins[sweepLayerIndex][sweepBin]
+                && ("sweep-auto".equals(captureMode) || "polar-auto".equals(captureMode))) {
+            return;
+        }
+        Bitmap previewStrip = createCurrentSweepPreviewStrip();
 
         File outputFile;
         try {
@@ -1509,71 +3734,75 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         }
 
         captureInProgress = true;
-        int targetIndex = activeTargetIndex;
-        CaptureTarget target = captureTargets[targetIndex];
-        ImageCapture.OutputFileOptions outputOptions =
-                new ImageCapture.OutputFileOptions.Builder(outputFile).build();
-        imageCapture.takePicture(outputOptions, cameraExecutor, new ImageCapture.OnImageSavedCallback() {
-            /*
-             * Function: onImageSaved
-             * Arguments: outputFileResults is CameraX's completion object; this
-             * implementation uses the already-known outputFile path instead.
-             * Calls: readLocationSummary(), library.recordDraftFrame(), runOnUiThread(),
-             * statusText.setText(), and Toast.
-             * Flow: after CameraX writes the JPEG, append draft metadata and
-             * report success on the UI thread.
-             */
-            @Override
-            public void onImageSaved(ImageCapture.OutputFileResults outputFileResults) {
-                String location = readLocationSummary();
-                try {
-                    library.recordDraftFrame(
-                            outputFile,
-                            sessionId,
-                            location,
-                            compassHeadingDegrees,
-                            pitchDegrees,
-                            rollDegrees,
-                            target.yawDegrees,
-                            target.pitchDegrees,
-                            captureMode);
-                    runOnUiThread(() -> {
-                        captureInProgress = false;
-                        target.captured = true;
-                        lastCapturedTargetIndex = targetIndex;
-                        statusText.setText("Image captured");
-                        updateGuideState();
-                        Toast.makeText(CaptureActivity.this, "Draft frame saved", Toast.LENGTH_SHORT).show();
-                    });
-                } catch (IOException e) {
-                    runOnUiThread(() -> {
-                        captureInProgress = false;
-                        Toast.makeText(
-                                CaptureActivity.this,
-                                "Metadata failed: " + e.getMessage(),
-                                Toast.LENGTH_LONG).show();
-                    });
-                }
-            }
-
-            /*
-             * Function: onError
-             * Arguments: exception describes the CameraX capture failure.
-             * Calls: runOnUiThread() and Toast.makeText().
-             * Flow: marshal the error back to the UI thread and show a readable
-             * failure message.
-             */
-            @Override
-            public void onError(ImageCaptureException exception) {
+        int targetYawDegrees = isPolarLayer(sweepLayerIndex)
+                ? POLAR_ROLL_SLOT_TARGETS[Math.max(0, polarSlotIndexForSweepBin(sweepBin))]
+                : sweepCaptureBinCenterDegrees(sweepBin);
+        int targetPitchDegrees = SWEEP_LAYER_PITCH_DEGREES[sweepLayerIndex];
+        float relativeHeadingDegrees = isPolarLayer(sweepLayerIndex)
+                ? 0f
+                : relativeSweepYawDegrees(compassHeadingDegrees);
+        float recordedPitchDegrees = isPolarLayer(sweepLayerIndex) ? targetPitchDegrees : pitchDegrees;
+        float recordedRollDegrees = isPolarLayer(sweepLayerIndex) ? targetYawDegrees : rollDegrees;
+        new Thread(() -> {
+            byte[] uprightJpeg = orientCapturedJpegUpright(jpeg);
+            try (FileOutputStream output = new FileOutputStream(outputFile)) {
+                output.write(uprightJpeg);
+            } catch (IOException e) {
                 runOnUiThread(() -> {
                     captureInProgress = false;
                     Toast.makeText(
                             CaptureActivity.this,
-                            "Capture failed: " + exception.getMessage(),
+                            "Capture failed: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+                return;
+            }
+            try {
+                String location = readLocationSummary();
+                library.recordDraftFrame(
+                        outputFile,
+                        sessionId,
+                        location,
+                        relativeHeadingDegrees,
+                        recordedPitchDegrees,
+                        recordedRollDegrees,
+                        targetYawDegrees,
+                        targetPitchDegrees,
+                        manualBlockCapture ? "manual-block" : captureMode,
+                        exposureJson);
+                runOnUiThread(() -> {
+                    captureInProgress = false;
+                    sweepCaptureBins[sweepLayerIndex][sweepBin] = true;
+                    if (previewStrip != null
+                            && sweepLayerIndex > 0
+                            && sweepLayerIndex < sweepCapturePreviewFrames.length) {
+                        if (sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] != null) {
+                            sweepCapturePreviewFrames[sweepLayerIndex][sweepBin].recycle();
+                        }
+                        sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] = previewStrip;
+                        updateSweepLayerPreviewPanorama();
+                    } else if (previewStrip != null) {
+                        previewStrip.recycle();
+                    }
+                    lastCapturedSweepLayerIndex = sweepLayerIndex;
+                    lastCapturedSweepBin = sweepBin;
+                    statusText.setText("Slice painted");
+                    updateCompassUi();
+                    updateGuideState();
+                    if (!"sweep-auto".equals(captureMode) && !"polar-auto".equals(captureMode)) {
+                        Toast.makeText(CaptureActivity.this, "Sweep slice saved", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    captureInProgress = false;
+                    Toast.makeText(
+                            CaptureActivity.this,
+                            "Metadata failed: " + e.getMessage(),
                             Toast.LENGTH_LONG).show();
                 });
             }
-        });
+        }).start();
     }
 
     /*
@@ -1667,9 +3896,149 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
+     * Class: ArCameraRenderer
+     * Educational overview:
+     * Renders ARCore's camera background texture into the capture preview. ARCore
+     * only starts producing a visible camera background after the app provides an
+     * external OES texture through Session.setCameraTextureNames().
+     */
+    private final class ArCameraRenderer implements GLSurfaceView.Renderer {
+        private static final String VERTEX_SHADER =
+                "attribute vec2 aPosition;\n" +
+                "attribute vec2 aTexCoord;\n" +
+                "varying vec2 vTexCoord;\n" +
+                "void main() {\n" +
+                "  gl_Position = vec4(aPosition, 0.0, 1.0);\n" +
+                "  vTexCoord = aTexCoord;\n" +
+                "}\n";
+
+        private static final String FRAGMENT_SHADER =
+                "#extension GL_OES_EGL_image_external : require\n" +
+                "precision mediump float;\n" +
+                "varying vec2 vTexCoord;\n" +
+                "uniform samplerExternalOES uTexture;\n" +
+                "void main() {\n" +
+                "  gl_FragColor = texture2D(uTexture, vTexCoord);\n" +
+                "}\n";
+
+        private final FloatBuffer vertices = ByteBuffer
+                .allocateDirect(8 * 4)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+                .put(new float[]{-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f});
+
+        private final FloatBuffer texCoords = ByteBuffer
+                .allocateDirect(8 * 4)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+                .put(new float[]{1f, 1f, 1f, 0f, 0f, 1f, 0f, 0f});
+
+        private int textureId;
+        private int program;
+        private int positionHandle;
+        private int texCoordHandle;
+        private int textureHandle;
+
+        ArCameraRenderer() {
+            vertices.position(0);
+            texCoords.position(0);
+        }
+
+        @Override
+        public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+            GLES20.glClearColor(0.02f, 0.04f, 0.06f, 1f);
+            textureId = createExternalTexture();
+            program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER);
+            positionHandle = GLES20.glGetAttribLocation(program, "aPosition");
+            texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord");
+            textureHandle = GLES20.glGetUniformLocation(program, "uTexture");
+            onArCameraTextureCreated(textureId);
+        }
+
+        @Override
+        public void onSurfaceChanged(GL10 gl, int width, int height) {
+            GLES20.glViewport(0, 0, Math.max(1, width), Math.max(1, height));
+            if (arSession != null) {
+                arSession.setDisplayGeometry(
+                        getWindowManager().getDefaultDisplay().getRotation(),
+                        Math.max(1, width),
+                        Math.max(1, height));
+            }
+        }
+
+        @Override
+        public void onDrawFrame(GL10 gl) {
+            drawArFrame(this);
+        }
+
+        void drawCamera() {
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+            GLES20.glUseProgram(program);
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
+            GLES20.glUniform1i(textureHandle, 0);
+            GLES20.glEnableVertexAttribArray(positionHandle);
+            GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertices);
+            GLES20.glEnableVertexAttribArray(texCoordHandle);
+            GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, texCoords);
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            GLES20.glDisableVertexAttribArray(positionHandle);
+            GLES20.glDisableVertexAttribArray(texCoordHandle);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);
+        }
+
+        void drawEmpty() {
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+        }
+
+        private int createExternalTexture() {
+            int[] textures = new int[1];
+            GLES20.glGenTextures(1, textures, 0);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textures[0]);
+            GLES20.glTexParameteri(
+                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MIN_FILTER,
+                    GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(
+                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MAG_FILTER,
+                    GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(
+                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_S,
+                    GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameteri(
+                    GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_T,
+                    GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);
+            return textures[0];
+        }
+
+        private int buildProgram(String vertexShaderSource, String fragmentShaderSource) {
+            int vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexShaderSource);
+            int fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderSource);
+            int program = GLES20.glCreateProgram();
+            GLES20.glAttachShader(program, vertexShader);
+            GLES20.glAttachShader(program, fragmentShader);
+            GLES20.glLinkProgram(program);
+            GLES20.glDeleteShader(vertexShader);
+            GLES20.glDeleteShader(fragmentShader);
+            return program;
+        }
+
+        private int compileShader(int type, String source) {
+            int shader = GLES20.glCreateShader(type);
+            GLES20.glShaderSource(shader, source);
+            GLES20.glCompileShader(shader);
+            return shader;
+        }
+    }
+
+    /*
      * Class: TargetGuideView
      * Educational overview:
-     * Draws the Phase 4 capture guide over the live CameraX preview. It shows a
+     * Draws the Phase 4 capture guide over the live ARCore preview. It shows a
      * fixed reticle in the middle, nearby yaw/pitch targets around it, captured
      * targets as green dots, the active target as a larger ring with a one-
      * second countdown pie, and a coverage bar so missing areas are obvious
@@ -1689,16 +4058,45 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint progressTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint progressFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint horizonReferencePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint horizonLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint tiltWarningPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint tiltWarningTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint sweepPitchLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint sweepBinPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF rect = new RectF();
+        private final Rect panoramaSourceRect = new Rect();
         private CaptureTarget[] targets = new CaptureTarget[0];
+        private Bitmap horizonReferencePanorama;
         private int activeTargetIndex;
         private float headingDegrees;
         private float pitchDegrees;
         private float coverageProgress;
+        private float horizonReferenceProgress;
         private float lockProgress;
         private boolean aligned;
         private boolean stable;
         private boolean paused;
+        private boolean horizonSweepStarted;
+        private boolean horizonSweepComplete;
+        private boolean horizonSweepAwaitingClose;
+        private boolean horizonStartAligned;
+        private String sweepSpeedMessage = "";
+        private float sweepTiltDeltaDegrees;
+        private boolean sweepPaintActive;
+        private boolean sweepLayerPitchAligned;
+        private boolean sweepLayerComplete;
+        private boolean sweepLayerPaintingActive;
+        private boolean sweepLayerStartAligned;
+        private boolean polarLayerActive;
+        private boolean previewDragActive;
+        private String sweepLayerName = "Horizon";
+        private String sweepLayerPrompt = "";
+        private int sweepLayerPitchDegrees;
+        private int currentSweepBin;
+        private float sweepLayerProgress;
+        private boolean[] sweepLayerBins = new boolean[0];
+        private final int[] sweepLayerPitchRows = SWEEP_LAYER_PITCH_DEGREES.clone();
 
         /*
          * Function: TargetGuideView constructor
@@ -1728,6 +4126,48 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             progressTrackPaint.setStyle(Paint.Style.FILL);
             progressFillPaint.setColor(0xFF38BDF8);
             progressFillPaint.setStyle(Paint.Style.FILL);
+            horizonReferencePaint.setAlpha(128);
+            horizonReferencePaint.setFilterBitmap(true);
+            horizonLinePaint.setColor(0x99F8FAFC);
+            horizonLinePaint.setStyle(Paint.Style.STROKE);
+            horizonLinePaint.setStrokeWidth(2f);
+            tiltWarningPaint.setStyle(Paint.Style.FILL);
+            tiltWarningTextPaint.setColor(0xFFFFFFFF);
+            tiltWarningTextPaint.setTextAlign(Paint.Align.CENTER);
+            tiltWarningTextPaint.setTextSize(26f);
+            tiltWarningTextPaint.setFakeBoldText(true);
+            sweepPitchLinePaint.setColor(0xDDFACC15);
+            sweepPitchLinePaint.setStyle(Paint.Style.STROKE);
+            sweepPitchLinePaint.setStrokeWidth(4f);
+            sweepBinPaint.setStyle(Paint.Style.FILL);
+        }
+
+        /*
+         * Function: setHorizonReference
+         * Arguments: panorama is the assembled low-resolution 360-degree strip;
+         * started/completed describe the sweep state; progress is 0..1.
+         * Calls: invalidate().
+         * Flow: keep a reference to the latest horizon belt samples for
+         * translucent overlay drawing above the live camera preview.
+         */
+        void setHorizonReference(
+                Bitmap panorama,
+                boolean started,
+                boolean completed,
+                float progress,
+                boolean awaitingClose,
+                boolean startAligned,
+                String speedMessage,
+                float tiltDeltaDegrees) {
+            horizonReferencePanorama = panorama;
+            horizonSweepStarted = started;
+            horizonSweepComplete = completed;
+            horizonReferenceProgress = clamp01(progress);
+            horizonSweepAwaitingClose = awaitingClose;
+            horizonStartAligned = startAligned;
+            sweepSpeedMessage = speedMessage == null ? "" : speedMessage;
+            sweepTiltDeltaDegrees = tiltDeltaDegrees;
+            invalidate();
         }
 
         /*
@@ -1763,6 +4203,46 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         }
 
         /*
+         * Function: setSweepPaintState
+         * Arguments: active enables sweep-first painting display; layer values
+         * describe the current photosphere band and progress.
+         * Calls: invalidate().
+         * Flow: keep the overlay focused on painted band coverage instead of
+         * discrete target points.
+         */
+        void setSweepPaintState(
+                boolean active,
+                String layerName,
+                String layerPrompt,
+                int layerPitchDegrees,
+                float layerProgress,
+                float totalProgress,
+                boolean pitchAligned,
+                boolean layerComplete,
+                boolean paintingActive,
+                boolean startAligned,
+                boolean[] layerBins,
+                int currentBin,
+                boolean draggingPreview,
+                boolean polarActive) {
+            sweepPaintActive = active;
+            sweepLayerName = layerName == null ? "" : layerName;
+            sweepLayerPrompt = layerPrompt == null ? "" : layerPrompt;
+            sweepLayerPitchDegrees = layerPitchDegrees;
+            sweepLayerProgress = clamp01(layerProgress);
+            coverageProgress = clamp01(totalProgress);
+            sweepLayerPitchAligned = pitchAligned;
+            sweepLayerComplete = layerComplete;
+            sweepLayerPaintingActive = paintingActive;
+            sweepLayerStartAligned = startAligned;
+            currentSweepBin = currentBin;
+            previewDragActive = draggingPreview;
+            polarLayerActive = polarActive;
+            sweepLayerBins = layerBins == null ? new boolean[0] : layerBins.clone();
+            invalidate();
+        }
+
+        /*
          * Function: onDraw
          * Arguments: canvas is Android's drawing target.
          * Calls: drawTargets(), drawReticle(), drawProgress(), and Canvas APIs.
@@ -1772,9 +4252,262 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            drawTargets(canvas);
+            drawTiltWarning(canvas);
+            drawHorizonReference(canvas);
+            if (polarLayerActive && sweepPaintActive && horizonSweepComplete) {
+                drawPolarGuide(canvas);
+            } else {
+                drawSweepPitchLine(canvas);
+            }
+            drawAlignmentLine(canvas);
             drawReticle(canvas);
             drawProgress(canvas);
+        }
+
+        /*
+         * Function: drawAlignmentLine
+         * Arguments: canvas is Android's drawing target.
+         * Calls: Canvas line APIs.
+         * Flow: draw a fixed vertical line to compare the real-world center with
+         * the draggable painted preview while recovering alignment.
+         */
+        private void drawAlignmentLine(Canvas canvas) {
+            reticlePaint.setColor(0xEE38BDF8);
+            reticlePaint.setStrokeWidth(4f);
+            float centerX = getWidth() * 0.5f;
+            canvas.drawLine(centerX, 0f, centerX, getHeight(), reticlePaint);
+            reticlePaint.setStrokeWidth(3f);
+        }
+
+        /*
+         * Function: drawSweepPitchLine
+         * Arguments: canvas is Android's drawing target.
+         * Calls: angularToY() and Canvas line/text APIs.
+         * Flow: show the exact horizontal pitch band the user should hold while
+         * painting upper and lower layers.
+         */
+        private void drawSweepPitchLine(Canvas canvas) {
+            if (!sweepPaintActive || !horizonSweepComplete) {
+                return;
+            }
+            float y = angularToY(sweepLayerPitchDegrees - pitchDegrees);
+            if (y < 0f || y > getHeight()) {
+                return;
+            }
+            sweepPitchLinePaint.setColor(sweepLayerPitchAligned ? 0xDD22C55E : 0xDDFACC15);
+            canvas.drawLine(20f, y, getWidth() - 20f, y, sweepPitchLinePaint);
+            textPaint.setTextSize(20f);
+            textPaint.setTextAlign(Paint.Align.LEFT);
+            canvas.drawText(sweepLayerName, 28f, Math.max(28f, y - 10f), textPaint);
+        }
+
+        /*
+         * Function: drawPolarGuide
+         * Arguments: canvas is Android's drawing target.
+         * Calls: angularToY() and Canvas line/text APIs.
+         * Flow: avoid the misleading cylindrical preview at the pole. Show only
+         * the vertical pitch target because yaw/roll cues are unreliable when the
+         * device points near straight up or down.
+         */
+        private void drawPolarGuide(Canvas canvas) {
+            float y = angularToY(sweepLayerPitchDegrees - pitchDegrees);
+            y = Math.max(42f, Math.min(getHeight() - 42f, y));
+            sweepPitchLinePaint.setColor(sweepLayerPitchAligned ? 0xDD22C55E : 0xDDFACC15);
+            canvas.drawLine(26f, y, getWidth() - 26f, y, sweepPitchLinePaint);
+
+            float centerX = getWidth() * 0.5f;
+            float centerY = getHeight() * 0.5f;
+            textPaint.setTextSize(20f);
+            textPaint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText(sweepLayerName + " 80 deg", centerX, Math.max(28f, y - 12f), textPaint);
+            canvas.drawText(
+                    sweepLayerPitchAligned
+                            ? sweepLayerPaintingActive ? "Capturing pole" : "Tap Start"
+                            : "Align pitch line",
+                    centerX,
+                    centerY + 54f,
+                    textPaint);
+        }
+
+        /*
+         * Function: drawTiltWarning
+         * Arguments: canvas is Android's drawing target.
+         * Calls: LinearGradient constructor and Canvas rectangle/text APIs.
+         * Flow: warn immediately when the user pitches away from the reference
+         * plane during the strip sweep, fading stronger as the drift increases.
+         */
+        private void drawTiltWarning(Canvas canvas) {
+            if (!horizonSweepStarted || horizonSweepComplete || horizonSweepAwaitingClose) {
+                return;
+            }
+            float drift = Math.abs(sweepTiltDeltaDegrees);
+            if (drift <= TILT_WARNING_START_DEGREES) {
+                return;
+            }
+            float amount = clamp01((drift - TILT_WARNING_START_DEGREES)
+                    / (TILT_WARNING_FULL_DEGREES - TILT_WARNING_START_DEGREES));
+            int alpha = Math.round(210f * amount);
+            int opaqueRed = (alpha << 24) | 0x00DC2626;
+            int transparentRed = 0x00DC2626;
+            float barHeight = Math.max(86f, getHeight() * 0.13f);
+            boolean tiltUp = sweepTiltDeltaDegrees > 0f;
+            if (tiltUp) {
+                tiltWarningPaint.setShader(new LinearGradient(
+                        0f,
+                        getHeight() - barHeight,
+                        0f,
+                        getHeight(),
+                        transparentRed,
+                        opaqueRed,
+                        Shader.TileMode.CLAMP));
+                rect.set(0f, getHeight() - barHeight, getWidth(), getHeight());
+                canvas.drawRect(rect, tiltWarningPaint);
+                tiltWarningPaint.setShader(null);
+                canvas.drawText("Tilt UP", getWidth() * 0.5f, getHeight() - barHeight * 0.34f, tiltWarningTextPaint);
+            } else {
+                tiltWarningPaint.setShader(new LinearGradient(
+                        0f,
+                        barHeight,
+                        0f,
+                        0f,
+                        transparentRed,
+                        opaqueRed,
+                        Shader.TileMode.CLAMP));
+                rect.set(0f, 0f, getWidth(), barHeight);
+                canvas.drawRect(rect, tiltWarningPaint);
+                tiltWarningPaint.setShader(null);
+                canvas.drawText("Tilt DOWN", getWidth() * 0.5f, barHeight * 0.62f, tiltWarningTextPaint);
+            }
+        }
+
+        /*
+         * Function: drawHorizonReference
+         * Arguments: canvas is Android's drawing target.
+         * Calls: drawHorizonReferenceSegment(), angularToY(), and Canvas bitmap/line
+         * APIs.
+         * Flow: project the current yaw window of every painted preview row at
+         * its captured pitch so the overlay reflects the photosphere state.
+         */
+        private void drawHorizonReference(Canvas canvas) {
+            if (!horizonSweepStarted || horizonReferencePanorama == null) {
+                return;
+            }
+            if (polarLayerActive && sweepPaintActive && horizonSweepComplete) {
+                return;
+            }
+            int rowHeight = Math.max(1, horizonReferencePanorama.getHeight() / Math.max(1, sweepLayerPitchRows.length));
+            float bandHeight = getHeight() * (previewDragActive ? 0.34f : 0.26f);
+            float drawWidth = getWidth() - 36f;
+            horizonReferencePaint.setAlpha(previewDragActive ? 215 : 128);
+            for (int row = 0; row < sweepLayerPitchRows.length; row++) {
+                int rowPitch = sweepLayerPitchRows[row];
+                float layerY = angularToY(rowPitch - pitchDegrees);
+                if (layerY < -bandHeight || layerY > getHeight() + bandHeight) {
+                    continue;
+                }
+                float sphericalWidth = drawWidth * sphericalLatitudeScale(rowPitch);
+                float left = (getWidth() - sphericalWidth) * 0.5f;
+                rect.set(
+                        left,
+                        layerY - bandHeight * 0.5f,
+                        left + sphericalWidth,
+                        layerY + bandHeight * 0.5f);
+                drawHorizonReferenceWindow(canvas, rect, row * rowHeight, rowHeight);
+                canvas.drawLine(0f, layerY, getWidth(), layerY, horizonLinePaint);
+            }
+            horizonReferencePaint.setAlpha(128);
+        }
+
+        /*
+         * Function: sphericalLatitudeScale
+         * Arguments: pitchDegrees is the latitude-like capture row angle.
+         * Calls: Math.cos(), Math.toRadians(), Math.abs(), and Math.max().
+         * Flow: narrow high-latitude preview rows so the guide reads more like a
+         * sphere than a cylinder, especially around the polar capture rows.
+         */
+        private float sphericalLatitudeScale(float pitchDegrees) {
+            return Math.max(0.22f, (float) Math.cos(Math.toRadians(Math.abs(pitchDegrees))));
+        }
+
+        /*
+         * Function: drawHorizonReferenceWindow
+         * Arguments: canvas is Android's drawing target; destination is the
+         * screen band that should receive the heading-centered strip.
+         * Calls: drawHorizonReferenceSegment() and normalizeHeading().
+         * Flow: select a limited yaw window from the 360-degree reference strip,
+         * splitting the draw when the current view crosses the 0/360 seam.
+         */
+        private void drawHorizonReferenceWindow(Canvas canvas, RectF destination, int sourceTop, int sourceHeight) {
+            int panoramaWidth = horizonReferencePanorama.getWidth();
+            float viewDegrees = previewDragActive
+                    ? HORIZON_REFERENCE_VIEW_DEGREES * 0.55f
+                    : HORIZON_REFERENCE_VIEW_DEGREES;
+            float sourceWindowWidth = panoramaWidth * viewDegrees / 360f;
+            float centerX = sweepLayerBins.length > 0
+                    ? (currentSweepBin + 0.5f) / sweepLayerBins.length * panoramaWidth
+                    : normalizeHeading(headingDegrees) / 360f * panoramaWidth;
+            float sourceLeft = centerX - sourceWindowWidth * 0.5f;
+            float sourceRight = centerX + sourceWindowWidth * 0.5f;
+            if (sourceLeft < 0f) {
+                float leftWidth = -sourceLeft;
+                float rightWidth = sourceRight;
+                float split = leftWidth / sourceWindowWidth;
+                RectF leftDestination = new RectF(
+                        destination.left,
+                        destination.top,
+                        destination.left + destination.width() * split,
+                        destination.bottom);
+                RectF rightDestination = new RectF(
+                        leftDestination.right,
+                        destination.top,
+                        destination.right,
+                        destination.bottom);
+                drawHorizonReferenceSegment(canvas, panoramaWidth + sourceLeft, panoramaWidth, sourceTop, sourceHeight, leftDestination);
+                drawHorizonReferenceSegment(canvas, 0f, rightWidth, sourceTop, sourceHeight, rightDestination);
+            } else if (sourceRight > panoramaWidth) {
+                float leftWidth = panoramaWidth - sourceLeft;
+                float rightWidth = sourceRight - panoramaWidth;
+                float split = leftWidth / sourceWindowWidth;
+                RectF leftDestination = new RectF(
+                        destination.left,
+                        destination.top,
+                        destination.left + destination.width() * split,
+                        destination.bottom);
+                RectF rightDestination = new RectF(
+                        leftDestination.right,
+                        destination.top,
+                        destination.right,
+                        destination.bottom);
+                drawHorizonReferenceSegment(canvas, sourceLeft, panoramaWidth, sourceTop, sourceHeight, leftDestination);
+                drawHorizonReferenceSegment(canvas, 0f, rightWidth, sourceTop, sourceHeight, rightDestination);
+            } else {
+                drawHorizonReferenceSegment(canvas, sourceLeft, sourceRight, sourceTop, sourceHeight, destination);
+            }
+        }
+
+        /*
+         * Function: drawHorizonReferenceSegment
+         * Arguments: sourceLeft/sourceRight define a panorama slice; destination
+         * defines where that slice is projected on screen.
+         * Calls: Canvas.drawBitmap().
+         * Flow: draw a single non-wrapping slice of the reference panorama.
+         */
+        private void drawHorizonReferenceSegment(
+                Canvas canvas,
+                float sourceLeft,
+                float sourceRight,
+                int sourceTop,
+                int sourceHeight,
+                RectF destination) {
+            if (destination.width() <= 0f || sourceRight <= sourceLeft) {
+                return;
+            }
+            panoramaSourceRect.set(
+                    Math.max(0, Math.round(sourceLeft)),
+                    Math.max(0, sourceTop),
+                    Math.max(1, Math.round(sourceRight)),
+                    Math.max(sourceTop + 1, sourceTop + sourceHeight));
+            canvas.drawBitmap(horizonReferencePanorama, panoramaSourceRect, destination, horizonReferencePaint);
         }
 
         /*
@@ -1837,7 +4570,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private void drawReticle(Canvas canvas) {
             float centerX = getWidth() * 0.5f;
             float centerY = getHeight() * 0.5f;
-            reticlePaint.setColor(stable ? 0xFF22C55E : aligned ? 0xFFFACC15 : 0xFFFFFFFF);
+            reticlePaint.setColor(sweepPaintActive
+                    ? sweepLayerPitchAligned ? 0xFF22C55E : 0xFFFACC15
+                    : stable ? 0xFF22C55E : aligned ? 0xFFFACC15 : 0xFFFFFFFF);
             canvas.drawCircle(centerX, centerY, 34f, reticlePaint);
             canvas.drawLine(centerX - 48f, centerY, centerX - 18f, centerY, reticlePaint);
             canvas.drawLine(centerX + 18f, centerY, centerX + 48f, centerY, reticlePaint);
@@ -1846,6 +4581,22 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
 
             String text = paused
                     ? "Paused"
+                    : !horizonSweepStarted
+                    ? "Aim at distant start point"
+                    : horizonSweepAwaitingClose && !horizonSweepComplete
+                    ? horizonStartAligned ? "Aligned - hold steady" : "Return to start point"
+                    : !horizonSweepComplete
+                    ? sweepSpeedMessage == null || sweepSpeedMessage.isEmpty() ? "Sweep horizon" : sweepSpeedMessage
+                    : sweepPaintActive && sweepLayerComplete
+                    ? sweepLayerPaintingActive ? "Return to start - tap Stop" : "Layer painted"
+                    : sweepPaintActive && !sweepLayerPitchAligned
+                    ? "Tilt to " + sweepLayerName
+                    : sweepPaintActive && !sweepLayerPaintingActive
+                    ? sweepLayerStartAligned ? "Tap Start" : "Align start point"
+                    : sweepPaintActive && sweepLayerPrompt.startsWith("Polar")
+                    ? "Roll left / middle / right"
+                    : sweepPaintActive
+                    ? sweepSpeedMessage == null || sweepSpeedMessage.isEmpty() ? "Paint this layer" : sweepSpeedMessage
                     : stable
                     ? "Hold steady - capture ready"
                     : aligned
@@ -1866,19 +4617,56 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             float left = 18f;
             float right = getWidth() - 18f;
             float bottom = getHeight() - 184f;
-            rect.set(left, bottom, right, bottom + 54f);
+            rect.set(left, bottom, right, bottom + 86f);
             canvas.drawRoundRect(rect, 10f, 10f, panelPaint);
             textPaint.setTextAlign(Paint.Align.LEFT);
             textPaint.setTextSize(20f);
             canvas.drawText(
-                    String.format(Locale.US, "Coverage %.0f%%", coverageProgress * 100f),
+                    String.format(Locale.US, "Painted %.0f%%", coverageProgress * 100f),
                     left + 14f,
+                    bottom + 24f,
+                    textPaint);
+            textPaint.setTextAlign(Paint.Align.RIGHT);
+            canvas.drawText(
+                    horizonSweepComplete
+                            ? String.format(Locale.US, "%s %.0f%%", sweepLayerName, sweepLayerProgress * 100f)
+                            : horizonSweepAwaitingClose
+                            ? "Return to start"
+                            : String.format(Locale.US, "Reference %.0f%% - %s", horizonReferenceProgress * 100f, sweepSpeedMessage),
+                    right - 14f,
                     bottom + 24f,
                     textPaint);
             rect.set(left + 14f, bottom + 34f, right - 14f, bottom + 44f);
             canvas.drawRoundRect(rect, 5f, 5f, progressTrackPaint);
             rect.set(left + 14f, bottom + 34f, left + 14f + (right - left - 28f) * coverageProgress, bottom + 44f);
             canvas.drawRoundRect(rect, 5f, 5f, progressFillPaint);
+            drawSweepBins(canvas, left + 14f, bottom + 58f, right - 14f, bottom + 74f);
+        }
+
+        /*
+         * Function: drawSweepBins
+         * Arguments: canvas is Android's drawing target; bounds define the
+         * current layer's live yaw coverage strip.
+         * Calls: Canvas.drawRoundRect().
+         * Flow: show painted/unpainted yaw slices while the user pans around the
+         * active layer.
+         */
+        private void drawSweepBins(Canvas canvas, float left, float top, float right, float bottom) {
+            if (!sweepPaintActive || sweepLayerBins.length == 0) {
+                return;
+            }
+            float gap = 2f;
+            float binWidth = (right - left - gap * (sweepLayerBins.length - 1)) / sweepLayerBins.length;
+            for (int i = 0; i < sweepLayerBins.length; i++) {
+                if (i == currentSweepBin) {
+                    sweepBinPaint.setColor(0xFFFACC15);
+                } else {
+                    sweepBinPaint.setColor(sweepLayerBins[i] ? 0xFF22C55E : 0x77334155);
+                }
+                float x = left + i * (binWidth + gap);
+                rect.set(x, top, x + binWidth, bottom);
+                canvas.drawRoundRect(rect, 3f, 3f, sweepBinPaint);
+            }
         }
 
         /*
@@ -1917,9 +4705,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Class: CalibrationProgressView
      * Educational overview:
-     * Draws a simple graphical checklist for the mandatory compass calibration.
+     * Draws a simple graphical checklist for the mandatory ARCore horizon sweep.
      * Rather than showing only noisy headings and sensor numbers, it presents the
-     * work as visible progress bars: time, accuracy, steadiness, rotate, and tilt.
+     * work as visible progress bars: time, ARCore, steadiness, yaw, and level.
      *
      * Data flow:
      * updateCompassUi() computes progress from filtered sensor data -> 
@@ -1927,7 +4715,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * onDraw() -> onDraw() paints the current checklist on top of the preview.
      */
     private static final class CalibrationProgressView extends View {
-        private static final String[] LABELS = {"Time", "Accuracy", "Steady", "Rotate", "Tilt"};
+        private static final String[] LABELS = {"Time", "ARCore", "Steady", "Yaw", "Level"};
         private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -2002,10 +4790,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             textPaint.setTextSize(20f);
             textPaint.setColor(0xFFFFFFFF);
             String title = ready
-                    ? "Compass ready - capture unlocked"
+                    ? "Reference ready - capture unlocked"
                     : calibrationStarted
-                    ? "Move in figure-eights, rotate, then tilt"
-                    : "Tap Calibrate to begin";
+                    ? "Sweep the horizon"
+                    : "Tap Start sweep";
             canvas.drawText(title, 16f, 28f, textPaint);
 
             float top = 44f;
@@ -2021,7 +4809,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
          * position the row; width/height size the progress bar.
          * Calls: Canvas.drawText(), Canvas.drawRoundRect(), and Math.min().
          * Flow: draw one label, then a track and filled portion for that
-         * calibration requirement.
+         * horizon-sweep requirement.
          */
         private void drawStep(Canvas canvas, int index, float x, float y, float width, float height) {
             float labelWidth = 82f;
@@ -2047,10 +4835,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Class: CompassNeedleView
      * Educational overview:
-     * Draws the always-visible north pointer above the CameraX preview. The view
-     * receives the device's current compass heading and rotates a simple needle
-     * so the tip points toward magnetic north relative to the phone's portrait
-     * screen orientation.
+     * Draws the always-visible north pointer above the ARCore preview. The view
+     * receives the device's current compass heading and pitch, then rotates a
+     * simple needle so the tip points toward magnetic north in the user's current
+     * screen-facing frame.
      *
      * Data flow:
      * SensorManager readings -> updateCompassHeading() -> setHeadingDegrees() ->
@@ -2062,6 +4850,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path needlePath = new Path();
         private float headingDegrees;
+        private boolean screenFlippedTowardUser;
 
         /*
          * Function: CompassNeedleView constructor
@@ -2084,13 +4873,15 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         /*
          * Function: setHeadingDegrees
          * Arguments: headingDegrees is the phone-top bearing relative to magnetic
-         * north in degrees.
+         * north; pitchDegrees decides whether the user is looking up at the
+         * screen enough to invert screen interpretation.
          * Calls: invalidate().
-         * Flow: store the heading and schedule a redraw so the needle remains
-         * live while the user moves.
+         * Flow: store the heading, flip only for the upward-looking screen frame,
+         * and schedule a redraw so the needle remains live while the user moves.
          */
-        void setHeadingDegrees(float headingDegrees) {
+        void setHeadingDegrees(float headingDegrees, float pitchDegrees) {
             this.headingDegrees = headingDegrees;
+            this.screenFlippedTowardUser = pitchDegrees > COMPASS_SCREEN_FLIP_PITCH_DEGREES;
             invalidate();
         }
 
@@ -2098,8 +4889,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
          * Function: onDraw
          * Arguments: canvas is Android's drawing target.
          * Calls: Canvas/Paint/Path drawing APIs.
-         * Flow: draw a dark circular backing, rotate the canvas opposite the
-         * heading, draw a red north needle, restore orientation, then label it N.
+         * Flow: draw a dark circular backing, optionally mirror the upward-looking
+         * screen frame, rotate opposite heading, draw the red north needle, then
+         * restore orientation and label it N.
          */
         @Override
         protected void onDraw(Canvas canvas) {
@@ -2109,6 +4901,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             float radius = Math.min(getWidth(), getHeight()) * 0.45f;
             canvas.drawCircle(centerX, centerY, radius, ringPaint);
             canvas.save();
+            if (screenFlippedTowardUser) {
+                canvas.scale(1f, -1f, centerX, centerY);
+            }
             canvas.rotate(-headingDegrees, centerX, centerY);
             needlePath.reset();
             needlePath.moveTo(centerX, centerY - radius + 10f);

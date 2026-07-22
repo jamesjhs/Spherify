@@ -40,10 +40,12 @@ import java.io.File;
 final class LibraryItem {
     static final String TYPE_MASTER = "master";
     static final String TYPE_VARIANT = "variant";
+    static final String TYPE_DRAFT_SESSION = "draft_session";
     static final String FILTER_ALL = "all";
     static final String FILTER_MASTERS = "masters";
     static final String FILTER_TINY_PLANETS = "tiny_planets";
     static final String FILTER_IMPORTS = "imports";
+    static final String FILTER_DRAFTS = "drafts";
     static final String FILTER_SAVED = "saved";
 
     final String id;
@@ -52,8 +54,8 @@ final class LibraryItem {
     final String source;
     final String projection;
     final String parentId;
-    final String imagePath;
-    final String thumbnailPath;
+    String imagePath;
+    String thumbnailPath;
     final long createdAt;
     long updatedAt;
 
@@ -130,6 +132,9 @@ final class LibraryItem {
         }
         if (FILTER_IMPORTS.equals(filter)) {
             return "import".equals(source);
+        }
+        if (FILTER_DRAFTS.equals(filter)) {
+            return TYPE_DRAFT_SESSION.equals(type);
         }
         if (FILTER_SAVED.equals(filter)) {
             return TYPE_VARIANT.equals(type);

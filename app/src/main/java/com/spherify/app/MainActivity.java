@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.4.5");
+        version.setText("0.4.33");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -938,19 +938,20 @@ public class MainActivity extends Activity {
      * draft frame browsing or LibraryItem browsing.
      */
     private void showBrowseFilters() {
-        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Saved", "Draft Frames"};
+        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Drafts", "Saved", "Draft Frames"};
         String[] filters = {
                 LibraryItem.FILTER_ALL,
                 LibraryItem.FILTER_MASTERS,
                 LibraryItem.FILTER_TINY_PLANETS,
                 LibraryItem.FILTER_IMPORTS,
+                LibraryItem.FILTER_DRAFTS,
                 LibraryItem.FILTER_SAVED
         };
 
         new AlertDialog.Builder(this)
                 .setTitle("Browse")
                 .setItems(labels, (dialog, which) -> {
-                    if (which == 5) {
+                    if (which == 6) {
                         showDraftFrames();
                     } else {
                         showLibrary(filters[which], labels[which]);
@@ -1076,7 +1077,9 @@ public class MainActivity extends Activity {
             activeLibraryDialog.dismiss();
             activeLibraryDialog = null;
         }
-        if (LibraryItem.TYPE_VARIANT.equals(item.type)) {
+        if (LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)) {
+            showDraftSession(item);
+        } else if (LibraryItem.TYPE_VARIANT.equals(item.type)) {
             showSavedOpenChoices(item);
         } else {
             currentItem = item;
@@ -1115,6 +1118,46 @@ public class MainActivity extends Activity {
         Intent intent = new Intent(this, FlatImageActivity.class);
         intent.putExtra(FlatImageActivity.EXTRA_IMAGE_PATH, item.imagePath);
         startActivity(intent);
+    }
+
+    /*
+     * Function: openFlatViewer
+     * Arguments: file is a local image file, such as a draft frame.
+     * Calls: Intent constructor, Intent.putExtra(), and startActivity().
+     * Flow: launch FlatImageActivity directly so draft frames always open inside
+     * Spherify instead of being handed to an external Android image app.
+     */
+    private void openFlatViewer(File file) {
+        Intent intent = new Intent(this, FlatImageActivity.class);
+        intent.putExtra(FlatImageActivity.EXTRA_IMAGE_PATH, file.getAbsolutePath());
+        startActivity(intent);
+    }
+
+    /*
+     * Function: showDraftSession
+     * Arguments: item is a first-class draft capture LibraryItem.
+     * Calls: library.listDraftFrames(), DraftFrameAdapter, and AlertDialog.
+     * Flow: open only the frames that belong to the selected draft session, so
+     * draft captures behave like browseable library records instead of loose
+     * files.
+     */
+    private void showDraftSession(LibraryItem item) {
+        List<File> drafts = library.listDraftFrames(item.id);
+        if (drafts.isEmpty()) {
+            Toast.makeText(this, "This draft has no remaining frames", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        ListView listView = new ListView(this);
+        DraftFrameAdapter adapter = new DraftFrameAdapter(drafts);
+        listView.setAdapter(adapter);
+        listView.setDividerHeight(1);
+
+        activeLibraryDialog = new AlertDialog.Builder(this)
+                .setTitle(item.title + " - swipe left to delete")
+                .setView(listView)
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     /*
@@ -1550,7 +1593,7 @@ public class MainActivity extends Activity {
      *
      * Data flow:
      * showDraftFrames() provides a mutable file list -> getView() renders each
-     * row -> tap opens the JPEG externally -> left swipe calls deleteDraftFrame()
+     * row -> tap opens the JPEG in FlatImageActivity -> left swipe calls deleteDraftFrame()
      * -> performDraftDelete() mutates the same list and notifies this adapter.
      *
      * Key variables:
@@ -1608,7 +1651,7 @@ public class MainActivity extends Activity {
          * Function: getView
          * Arguments: position identifies the row; convertView is unused because
          * this custom row is rebuilt; parent is the ListView container.
-         * Calls: getItem(), BitmapFactory.decodeFile(), openExternalApp(),
+         * Calls: getItem(), BitmapFactory.decodeFile(), openFlatViewer(),
          * deleteDraftFrame(), and animation APIs.
          * Flow: build a thumbnail/name/detail row layered over a red delete
          * background, open on tap, reveal delete on left swipe, and confirm once
@@ -1708,7 +1751,7 @@ public class MainActivity extends Activity {
                         if (!swiping[0] && !deleted[0]
                                 && Math.abs(totalDx) < 24f
                                 && Math.abs(totalDy) < 24f) {
-                            openExternalApp(draft);
+                            openFlatViewer(draft);
                         } else if (!deleted[0]) {
                             row.animate().translationX(0f).alpha(1f).setDuration(120).start();
                             deleteLabel.animate().alpha(0f).setDuration(120).start();

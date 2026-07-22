@@ -15,8 +15,10 @@
  * files and MainActivity passes a ProjectionExport here; this class copies the
  * files into the library and optionally publishes the image to Android
  * MediaStore. For capture drafts, CaptureActivity asks for a destination JPEG
- * File, CameraX writes it, and recordDraftFrame() appends path/location/
- * orientation/session data to drafts.json.
+ * File, writes the latest ARCore CPU camera frame, and recordDraftFrame()
+ * appends path/location/
+ * orientation/exposure/session data to drafts.json while upserting a
+ * first-class draft-session library item.
  *
  * External files/functions:
  * Reads the bundled asset stream supplied by MainActivity.
@@ -38,7 +40,7 @@
  * root: app-private library root directory.
  * mastersDir/variantsDir/draftsDir/thumbnailsDir: content subfolders.
  * metadataFile: JSON index of LibraryItem records.
- * draftMetadataFile: JSON index of CameraX draft frames.
+ * draftMetadataFile: JSON index of ARCore draft frames.
  * items: in-memory LibraryItem list loaded from metadataFile.
  */
 package com.spherify.app;
@@ -254,9 +256,46 @@ final class SpherifyLibrary {
      */
     List<File> listDraftFrames() {
         ArrayList<File> result = new ArrayList<>();
-        File[] files = draftsDir.listFiles((dir, name) -> name.endsWith(".jpg"));
-        if (files != null) {
-            Collections.addAll(result, files);
+        JSONArray metadata = readDraftMetadata();
+        for (int i = 0; i < metadata.length(); i++) {
+            JSONObject json = metadata.optJSONObject(i);
+            if (json == null) {
+                continue;
+            }
+            File file = new File(json.optString("path", ""));
+            if (file.exists()) {
+                result.add(file);
+            }
+        }
+        if (result.isEmpty()) {
+            File[] files = draftsDir.listFiles((dir, name) -> name.endsWith(".jpg"));
+            if (files != null) {
+                Collections.addAll(result, files);
+            }
+        }
+        Collections.sort(result, Comparator.comparingLong(File::lastModified).reversed());
+        return result;
+    }
+
+    /*
+     * Function: listDraftFrames
+     * Arguments: sessionId identifies one draft capture LibraryItem.
+     * Calls: readDraftMetadata(), File.exists(), and Collections.sort().
+     * Flow: return only JPEG frames recorded for the selected draft session so
+     * users and Phase 5 jobs can work with a coherent capture set.
+     */
+    List<File> listDraftFrames(String sessionId) {
+        ArrayList<File> result = new ArrayList<>();
+        JSONArray metadata = readDraftMetadata();
+        for (int i = 0; i < metadata.length(); i++) {
+            JSONObject json = metadata.optJSONObject(i);
+            if (json == null || !sessionId.equals(json.optString("sessionId", ""))) {
+                continue;
+            }
+            File file = new File(json.optString("path", ""));
+            if (file.exists()) {
+                result.add(file);
+            }
         }
         Collections.sort(result, Comparator.comparingLong(File::lastModified).reversed());
         return result;
@@ -273,33 +312,22 @@ final class SpherifyLibrary {
      */
     void deleteDraftFrame(File imageFile) throws IOException {
         String deletedPath = imageFile.getAbsolutePath();
+        String deletedSessionId = "";
         deleteFile(imageFile);
-        if (!draftMetadataFile.exists()) {
-            return;
-        }
-
-        JSONArray source;
-        try (FileInputStream input = new FileInputStream(draftMetadataFile)) {
-            byte[] data = new byte[(int) draftMetadataFile.length()];
-            int read = input.read(data);
-            source = read > 0
-                    ? new JSONArray(new String(data, 0, read, StandardCharsets.UTF_8))
-                    : new JSONArray();
-        } catch (JSONException e) {
-            throw new IOException("draft metadata is corrupt", e);
-        }
+        JSONArray source = readDraftMetadataOrThrow();
 
         JSONArray kept = new JSONArray();
         try {
             for (int i = 0; i < source.length(); i++) {
                 JSONObject json = source.getJSONObject(i);
-                if (!deletedPath.equals(json.optString("path", ""))) {
+                if (deletedPath.equals(json.optString("path", ""))) {
+                    deletedSessionId = json.optString("sessionId", "");
+                } else {
                     kept.put(json);
                 }
             }
-            try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
-                output.write(kept.toString(2).getBytes(StandardCharsets.UTF_8));
-            }
+            writeDraftMetadata(kept);
+            refreshDraftSessionItem(deletedSessionId, kept);
         } catch (JSONException e) {
             throw new IOException("could not update draft metadata", e);
         }
@@ -326,6 +354,8 @@ final class SpherifyLibrary {
         } catch (JSONException e) {
             throw new IOException("could not reset draft metadata", e);
         }
+        items.removeIf(item -> LibraryItem.TYPE_DRAFT_SESSION.equals(item.type));
+        save();
     }
 
     /*
@@ -350,6 +380,10 @@ final class SpherifyLibrary {
      * persist the changed item list.
      */
     void delete(LibraryItem item) throws IOException {
+        if (LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)) {
+            deleteDraftSession(item.id);
+            return;
+        }
         items.remove(item);
         deleteFile(item.imageFile());
         deleteFile(item.thumbnailFile());
@@ -368,6 +402,9 @@ final class SpherifyLibrary {
                 + "\nType: " + item.type
                 + "\nSource: " + item.source
                 + "\nProjection: " + item.projection
+                + (LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)
+                ? "\nDraft frames: " + listDraftFrames(item.id).size()
+                : "")
                 + "\nImage: " + item.imagePath
                 + "\nThumbnail: " + item.thumbnailPath
                 + "\nCreated: " + item.createdAt;
@@ -405,24 +442,15 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
-            String captureMode) throws IOException {
-        JSONArray array = new JSONArray();
-        if (draftMetadataFile.exists()) {
-            try (FileInputStream input = new FileInputStream(draftMetadataFile)) {
-                byte[] data = new byte[(int) draftMetadataFile.length()];
-                int read = input.read(data);
-                if (read > 0) {
-                    array = new JSONArray(new String(data, 0, read, StandardCharsets.UTF_8));
-                }
-            } catch (JSONException e) {
-                throw new IOException("draft metadata is corrupt", e);
-            }
-        }
+            String captureMode,
+            String exposureJson) throws IOException {
+        JSONArray array = readDraftMetadataOrThrow();
+        long now = System.currentTimeMillis();
         try {
             JSONObject json = new JSONObject();
             json.put("path", imageFile.getAbsolutePath());
             json.put("sessionId", sessionId == null ? "" : sessionId);
-            json.put("createdAt", System.currentTimeMillis());
+            json.put("createdAt", now);
             json.put("location", locationSummary == null ? "" : locationSummary);
             json.put("headingDegrees", headingDegrees);
             json.put("pitchDegrees", pitchDegrees);
@@ -430,13 +458,181 @@ final class SpherifyLibrary {
             json.put("targetYawDegrees", targetYawDegrees);
             json.put("targetPitchDegrees", targetPitchDegrees);
             json.put("captureMode", captureMode == null ? "manual" : captureMode);
-            json.put("exposure", "not recorded yet");
+            json.put("exposure", parseExposureJson(exposureJson));
             array.put(json);
-            try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
-                output.write(array.toString(2).getBytes(StandardCharsets.UTF_8));
-            }
+            writeDraftMetadata(array);
+            upsertDraftSessionItem(imageFile, sessionId, now);
         } catch (JSONException e) {
             throw new IOException("could not write draft metadata", e);
+        }
+    }
+
+    /*
+     * Function: deleteDraftSession
+     * Arguments: sessionId identifies the draft capture LibraryItem to remove.
+     * Calls: readDraftMetadataOrThrow(), deleteFile(), writeDraftMetadata(), and
+     * save().
+     * Flow: delete all JPEGs and metadata rows for one draft session, then remove
+     * its first-class library record.
+     */
+    private void deleteDraftSession(String sessionId) throws IOException {
+        JSONArray source = readDraftMetadataOrThrow();
+        JSONArray kept = new JSONArray();
+        try {
+            for (int i = 0; i < source.length(); i++) {
+                JSONObject json = source.getJSONObject(i);
+                if (sessionId.equals(json.optString("sessionId", ""))) {
+                    deleteFile(new File(json.optString("path", "")));
+                } else {
+                    kept.put(json);
+                }
+            }
+            writeDraftMetadata(kept);
+            items.removeIf(item -> sessionId.equals(item.id)
+                    && LibraryItem.TYPE_DRAFT_SESSION.equals(item.type));
+            save();
+        } catch (JSONException e) {
+            throw new IOException("could not delete draft session", e);
+        }
+    }
+
+    /*
+     * Function: upsertDraftSessionItem
+     * Arguments: imageFile is the newest/representative draft frame, sessionId
+     * groups frames, and now is the record timestamp.
+     * Calls: LibraryItem constructor and save().
+     * Flow: create a first-class draft-session gallery item when a session first
+     * records a frame, or update the existing item timestamp and representative
+     * frame path as new frames arrive.
+     */
+    private void upsertDraftSessionItem(File imageFile, String sessionId, long now) throws IOException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        for (LibraryItem item : items) {
+            if (sessionId.equals(item.id) && LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)) {
+                if (!item.imageFile().exists()) {
+                    item.imagePath = imageFile.getAbsolutePath();
+                    item.thumbnailPath = imageFile.getAbsolutePath();
+                }
+                item.updatedAt = now;
+                save();
+                return;
+            }
+        }
+        items.add(new LibraryItem(
+                sessionId,
+                "Draft Capture " + compactSessionLabel(sessionId),
+                LibraryItem.TYPE_DRAFT_SESSION,
+                "capture",
+                "draft_session",
+                "",
+                imageFile.getAbsolutePath(),
+                imageFile.getAbsolutePath(),
+                now,
+                now));
+        save();
+    }
+
+    /*
+     * Function: refreshDraftSessionItem
+     * Arguments: sessionId is the affected session; metadata is the retained
+     * draft-frame index after a deletion.
+     * Calls: save().
+     * Flow: keep a draft-session LibraryItem pointed at an existing frame, or
+     * remove it when the session no longer has any frames.
+     */
+    private void refreshDraftSessionItem(String sessionId, JSONArray metadata) throws IOException, JSONException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        File replacement = null;
+        for (int i = 0; i < metadata.length(); i++) {
+            JSONObject json = metadata.getJSONObject(i);
+            if (sessionId.equals(json.optString("sessionId", ""))) {
+                File file = new File(json.optString("path", ""));
+                if (file.exists()) {
+                    replacement = file;
+                    break;
+                }
+            }
+        }
+        for (int i = items.size() - 1; i >= 0; i--) {
+            LibraryItem item = items.get(i);
+            if (sessionId.equals(item.id) && LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)) {
+                if (replacement == null) {
+                    items.remove(i);
+                } else {
+                    item.imagePath = replacement.getAbsolutePath();
+                    item.thumbnailPath = replacement.getAbsolutePath();
+                    item.updatedAt = System.currentTimeMillis();
+                }
+            }
+        }
+        save();
+    }
+
+    private static String compactSessionLabel(String sessionId) {
+        return sessionId.length() <= 12 ? sessionId : sessionId.substring(sessionId.length() - 12);
+    }
+
+    private static JSONObject parseExposureJson(String exposureJson) throws JSONException {
+        if (exposureJson == null || exposureJson.trim().isEmpty()) {
+            JSONObject json = new JSONObject();
+            json.put("available", false);
+            json.put("reason", "metadata unavailable");
+            return json;
+        }
+        return new JSONObject(exposureJson);
+    }
+
+    /*
+     * Function: readDraftMetadata
+     * Arguments: none.
+     * Calls: readDraftMetadataOrThrow().
+     * Flow: best-effort draft metadata read for non-mutating UI lists; corrupt
+     * metadata behaves like an empty set so the app can still show filesystem
+     * fallback frames.
+     */
+    private JSONArray readDraftMetadata() {
+        try {
+            return readDraftMetadataOrThrow();
+        } catch (IOException ignored) {
+            return new JSONArray();
+        }
+    }
+
+    /*
+     * Function: readDraftMetadataOrThrow
+     * Arguments: none.
+     * Calls: FileInputStream and JSONArray parser.
+     * Flow: read the draft-frame index or return an empty array when it has not
+     * been created yet.
+     */
+    private JSONArray readDraftMetadataOrThrow() throws IOException {
+        if (!draftMetadataFile.exists()) {
+            return new JSONArray();
+        }
+        try (FileInputStream input = new FileInputStream(draftMetadataFile)) {
+            byte[] data = new byte[(int) draftMetadataFile.length()];
+            int read = input.read(data);
+            return read > 0
+                    ? new JSONArray(new String(data, 0, read, StandardCharsets.UTF_8))
+                    : new JSONArray();
+        } catch (JSONException e) {
+            throw new IOException("draft metadata is corrupt", e);
+        }
+    }
+
+    /*
+     * Function: writeDraftMetadata
+     * Arguments: metadata is the full draft-frame index to persist.
+     * Calls: FileOutputStream and JSONArray.toString().
+     * Flow: rewrite drafts.json in one pass after an append or deletion.
+     */
+    private void writeDraftMetadata(JSONArray metadata) throws IOException, JSONException {
+        try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
+            output.write(metadata.toString(2).getBytes(StandardCharsets.UTF_8));
         }
     }
 
