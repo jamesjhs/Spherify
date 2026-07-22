@@ -36,7 +36,8 @@
  * sourceTinyPlanet: true when the input is already a tiny-planet-like square.
  * mode: current output projection, SPHERE or TINY_PLANET.
  * centerYaw/centerPitch/centerRoll: accumulated recentering offsets.
- * yaw/pitch/roll/horizonOffset/zoom: live interaction and adjustment state.
+ * yaw/pitch/roll/horizonOffset/cameraDistance/zoom: live interaction and
+ * adjustment state.
  * last* and rotatingGesture fields: gesture bookkeeping between touch events.
  */
 package com.spherify.app;
@@ -71,6 +72,9 @@ public class GLProjectionView extends GLSurfaceView {
     private static final int THUMBNAIL_SIZE = 320;
     private static final float PHOTOSPHERE_BASE_ROLL_DEGREES = 180f;
     private static final float BASE_FIELD_OF_VIEW_DEGREES = 92f;
+    private static final float MIN_CAMERA_DISTANCE = 0.35f;
+    private static final float MAX_CAMERA_DISTANCE = 2.5f;
+    private static final float MAX_VIEW_PITCH_DEGREES = 89f;
 
     private final ProjectionRenderer renderer;
     private final ScaleGestureDetector scaleDetector;
@@ -87,6 +91,7 @@ public class GLProjectionView extends GLSurfaceView {
     private float pitch;
     private float roll;
     private float horizonOffset;
+    private float cameraDistance = 1f;
     private float zoom = 1f;
     private float lastX;
     private float lastY;
@@ -163,6 +168,7 @@ public class GLProjectionView extends GLSurfaceView {
         pitch = 0f;
         roll = 0f;
         horizonOffset = 0f;
+        cameraDistance = 1f;
         boolean currentSourceTinyPlanet = sourceTinyPlanet;
         queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyPlanet));
         pushStateToRenderer();
@@ -195,6 +201,7 @@ public class GLProjectionView extends GLSurfaceView {
         outState.putFloat(prefix + "pitch", pitch);
         outState.putFloat(prefix + "roll", roll);
         outState.putFloat(prefix + "horizonOffset", horizonOffset);
+        outState.putFloat(prefix + "cameraDistance", cameraDistance);
         outState.putFloat(prefix + "zoom", zoom);
     }
 
@@ -216,12 +223,22 @@ public class GLProjectionView extends GLSurfaceView {
             }
         }
         centerYaw = savedState.getFloat(prefix + "centerYaw", 0f);
-        centerPitch = savedState.getFloat(prefix + "centerPitch", 0f);
+        centerPitch = clamp(
+                savedState.getFloat(prefix + "centerPitch", 0f),
+                -MAX_VIEW_PITCH_DEGREES,
+                MAX_VIEW_PITCH_DEGREES);
         centerRoll = savedState.getFloat(prefix + "centerRoll", 0f);
         yaw = savedState.getFloat(prefix + "yaw", 0f);
-        pitch = savedState.getFloat(prefix + "pitch", 0f);
+        pitch = clamp(
+                savedState.getFloat(prefix + "pitch", 0f),
+                -MAX_VIEW_PITCH_DEGREES,
+                MAX_VIEW_PITCH_DEGREES);
         roll = savedState.getFloat(prefix + "roll", 0f);
         horizonOffset = savedState.getFloat(prefix + "horizonOffset", 0f);
+        cameraDistance = clamp(
+                savedState.getFloat(prefix + "cameraDistance", 1f),
+                MIN_CAMERA_DISTANCE,
+                MAX_CAMERA_DISTANCE);
         zoom = Math.max(savedState.getFloat(prefix + "zoom", 1f), getMinimumZoom());
         pushStateToRenderer();
     }
@@ -273,9 +290,7 @@ public class GLProjectionView extends GLSurfaceView {
      */
     public void recentre() {
         centerYaw = normalizeDegrees(centerYaw + yaw);
-        centerPitch = mode == Mode.SPHERE
-                ? clamp(centerPitch + pitch, -89f, 89f)
-                : normalizeDegrees(centerPitch + pitch);
+        centerPitch = clamp(centerPitch + pitch, -MAX_VIEW_PITCH_DEGREES, MAX_VIEW_PITCH_DEGREES);
         centerRoll = normalizeDegrees(centerRoll + roll);
         yaw = 0f;
         pitch = 0f;
@@ -287,37 +302,40 @@ public class GLProjectionView extends GLSurfaceView {
      * Function: resetView
      * Arguments: none.
      * Calls: pushStateToRenderer().
-     * Flow: clear live orientation, horizon, and zoom adjustments without
-     * changing the currently loaded panorama or mode.
+     * Flow: clear live orientation, horizon, camera distance, and zoom
+     * adjustments without changing the currently loaded panorama or mode.
      */
     public void resetView() {
         yaw = 0f;
         pitch = 0f;
         roll = 0f;
         horizonOffset = 0f;
+        cameraDistance = 1f;
         zoom = 1f;
         pushStateToRenderer();
     }
 
     /*
-     * Function: getFieldOfViewDegrees
+     * Function: getCameraDistancePercent
      * Arguments: none.
      * Calls: no external functions.
-     * Flow: convert zoom back into an approximate field-of-view value for the
+     * Flow: expose the virtual camera distance as a percent value for the
      * Adjust dialog.
      */
-    public float getFieldOfViewDegrees() {
-        return BASE_FIELD_OF_VIEW_DEGREES / zoom;
+    public float getCameraDistancePercent() {
+        return cameraDistance * 100f;
     }
 
     /*
-     * Function: setFieldOfViewDegrees
-     * Arguments: degrees is the requested field of view from the Adjust dialog.
-     * Calls: clamp(), getMinimumZoom(), and pushStateToRenderer().
-     * Flow: convert FOV to zoom, bound it to valid limits, and redraw.
+     * Function: setCameraDistancePercent
+     * Arguments: percent is the requested virtual camera distance from the
+     * Adjust dialog.
+     * Calls: clamp() and pushStateToRenderer().
+     * Flow: convert the percent value to the internal distance multiplier, bound
+     * it to useful limits, and redraw.
      */
-    public void setFieldOfViewDegrees(float degrees) {
-        zoom = clamp(BASE_FIELD_OF_VIEW_DEGREES / clamp(degrees, 30f, 180f), getMinimumZoom(), 5f);
+    public void setCameraDistancePercent(float percent) {
+        cameraDistance = clamp(percent / 100f, MIN_CAMERA_DISTANCE, MAX_CAMERA_DISTANCE);
         pushStateToRenderer();
     }
 
@@ -402,7 +420,7 @@ public class GLProjectionView extends GLSurfaceView {
      * Calls: ScaleGestureDetector.onTouchEvent(), handleTwoFingerGesture(),
      * applyDragDelta(), and MotionEvent accessors.
      * Flow: let pinch zoom process first, handle pointer changes, route two-
-     * finger movement to rotation/drag logic, and route one-finger drag to pan or
+     * finger movement to adjustment logic, and route one-finger drag to pan or
      * tiny-planet spin depending on mode.
      */
     @Override
@@ -451,9 +469,10 @@ public class GLProjectionView extends GLSurfaceView {
     /*
      * Function: handleTwoFingerGesture
      * Arguments: event contains two active pointer positions.
-     * Calls: Math.atan2(), Math.toDegrees(), normalizeDegrees(), and applyDragDelta().
+     * Calls: Math.atan2(), Math.toDegrees(), normalizeDegrees(),
+     * applyTwoFingerFocusDelta(), and pushStateToRenderer().
      * Flow: track the angle and midpoint between two fingers so the user can
-     * rotate the projection while also dragging its focus.
+     * rotate the projection while also adjusting horizon and camera distance.
      */
     private void handleTwoFingerGesture(MotionEvent event) {
         float pointerDx = event.getX(1) - event.getX(0);
@@ -475,7 +494,29 @@ public class GLProjectionView extends GLSurfaceView {
         lastPointerAngle = angle;
         lastPointerFocusX = focusX;
         lastPointerFocusY = focusY;
-        applyDragDelta(focusDx, focusDy);
+        applyTwoFingerFocusDelta(focusDx, focusDy);
+    }
+
+    /*
+     * Function: applyTwoFingerFocusDelta
+     * Arguments: dx/dy are the screen-space movement deltas of the two-finger
+     * midpoint in pixels.
+     * Calls: getWidth(), getHeight(), clamp(), getMinimumZoom(), and
+     * pushStateToRenderer().
+     * Flow: translate two-finger midpoint movement into adjustment controls:
+     * horizontal movement changes camera distance, vertical movement changes the
+     * horizon reference. Pinch zoom and two-finger rotation are handled
+     * separately by the scale detector and angle tracking.
+     */
+    private void applyTwoFingerFocusDelta(float dx, float dy) {
+        float widthReference = Math.max(1f, getWidth());
+        float heightReference = Math.max(1f, Math.min(getWidth(), getHeight()));
+        cameraDistance = clamp(
+                cameraDistance + dx / widthReference * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE),
+                MIN_CAMERA_DISTANCE,
+                MAX_CAMERA_DISTANCE);
+        horizonOffset = clamp(horizonOffset - dy / heightReference * 120f, -75f, 75f);
+        pushStateToRenderer();
     }
 
     /*
@@ -483,18 +524,23 @@ public class GLProjectionView extends GLSurfaceView {
      * Arguments: dx/dy are screen-space movement deltas in pixels.
      * Calls: getWidth(), getHeight(), normalizeDegrees(), clamp(), and
      * pushStateToRenderer().
-     * Flow: translate touch movement into yaw/pitch/roll changes; sphere mode
-     * behaves like looking around, while tiny planet mode rotates/spins the map.
+     * Flow: translate touch movement into camera yaw/pitch changes; both
+     * projection modes clamp pitch to avoid flipping the viewport through a pole.
      */
     private void applyDragDelta(float dx, float dy) {
         float verticalDragReference = Math.max(1f, Math.min(getWidth(), getHeight()));
         if (mode == Mode.SPHERE) {
             yaw = normalizeDegrees(yaw + dx / Math.max(1f, getWidth()) * 180f / zoom);
-            pitch = clamp(pitch - dy / verticalDragReference * 120f / zoom, -89f, 89f);
+            pitch = clamp(
+                    pitch - dy / verticalDragReference * 120f / zoom,
+                    -MAX_VIEW_PITCH_DEGREES,
+                    MAX_VIEW_PITCH_DEGREES);
         } else {
-            yaw = normalizeDegrees(yaw - dx / Math.max(1f, getWidth()) * 180f / zoom);
-            roll = normalizeDegrees(roll + dx / Math.max(1f, getWidth()) * 240f);
-            pitch = normalizeDegrees(pitch + dy / verticalDragReference * 180f / zoom);
+            yaw = normalizeDegrees(yaw + dx / Math.max(1f, getWidth()) * 180f / zoom);
+            pitch = clamp(
+                    pitch - dy / verticalDragReference * 120f / zoom,
+                    -MAX_VIEW_PITCH_DEGREES,
+                    MAX_VIEW_PITCH_DEGREES);
         }
         pushStateToRenderer();
     }
@@ -513,6 +559,7 @@ public class GLProjectionView extends GLSurfaceView {
         float currentPitch = getEffectivePitch();
         float currentRoll = getEffectiveRoll();
         float currentHorizonOffset = horizonOffset;
+        float currentCameraDistance = cameraDistance;
         float currentZoom = zoom;
         queueEvent(() -> renderer.setState(
                 currentMode,
@@ -520,6 +567,7 @@ public class GLProjectionView extends GLSurfaceView {
                 currentPitch,
                 currentRoll,
                 currentHorizonOffset,
+                currentCameraDistance,
                 currentZoom));
         requestRender();
     }
@@ -540,6 +588,7 @@ public class GLProjectionView extends GLSurfaceView {
         double pitchRad = Math.toRadians(getEffectivePitch());
         double rollRad = Math.toRadians(getEffectiveRoll());
         double horizonOffsetRad = Math.toRadians(horizonOffset);
+        double currentCameraDistance = cameraDistance;
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
         double aspect = width / (double) height;
@@ -551,8 +600,8 @@ public class GLProjectionView extends GLSurfaceView {
             for (int x = 0; x < width; x++) {
                 double nx = ((2.0 * x / Math.max(1, width - 1)) - 1.0) * aspect;
                 Sample sample = mode == Mode.SPHERE
-                        ? sampleSphere(nx, ny, yawRad, pitchRad)
-                        : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll);
+                        ? sampleSphere(nx, ny, yawRad, pitchRad, currentCameraDistance)
+                        : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll, currentCameraDistance);
                 pixels[y * width + x] = sourceTinyPlanet
                         ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad, flipSourceVertically)
                         : samplePanorama(sample.u, sample.v, horizonOffsetRad, flipSourceVertically);
@@ -566,12 +615,12 @@ public class GLProjectionView extends GLSurfaceView {
     /*
      * Function: sampleSphere
      * Arguments: nx/ny are normalized screen coordinates; yawRad/pitchRad are
-     * camera angles in radians.
+     * camera angles in radians; cameraDistance controls virtual camera distance.
      * Calls: getEffectiveRoll(), Math trig helpers, and directionToSample().
      * Flow: construct a viewing ray through the virtual camera plane and convert
      * that ray into source texture coordinates.
      */
-    private Sample sampleSphere(double nx, double ny, double yawRad, double pitchRad) {
+    private Sample sampleSphere(double nx, double ny, double yawRad, double pitchRad, double cameraDistance) {
         double rollRad = Math.toRadians(getEffectiveRoll());
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
@@ -590,9 +639,10 @@ public class GLProjectionView extends GLSurfaceView {
         double upY = forwardZ * rightX - forwardX * rightZ;
         double upZ = forwardX * rightY - forwardY * rightX;
 
-        double x = forwardX + rightX * rx * spread + upX * ry * spread;
-        double y = forwardY + rightY * rx * spread + upY * ry * spread;
-        double z = forwardZ + rightZ * rx * spread + upZ * ry * spread;
+        double distanceSpread = spread * cameraDistance;
+        double x = forwardX + rightX * rx * distanceSpread + upX * ry * distanceSpread;
+        double y = forwardY + rightY * rx * distanceSpread + upY * ry * distanceSpread;
+        double z = forwardZ + rightZ * rx * distanceSpread + upZ * ry * distanceSpread;
         double length = Math.sqrt(x * x + y * y + z * z);
         return directionToSample(x / length, y / length, z / length);
     }
@@ -600,7 +650,8 @@ public class GLProjectionView extends GLSurfaceView {
     /*
      * Function: sampleTinyPlanet
      * Arguments: nx/ny are normalized screen coordinates; yawRad/pitchRad adjust
-     * orientation; cosRoll/sinRoll are precomputed roll values.
+     * orientation; cosRoll/sinRoll are precomputed roll values; cameraDistance
+     * controls how much of the projected scene is visible.
      * Calls: Math trig helpers and directionToSample().
      * Flow: map a 2D point through stereographic tiny-planet math into a 3D
      * direction, apply yaw/pitch, then convert to sampling coordinates.
@@ -611,9 +662,10 @@ public class GLProjectionView extends GLSurfaceView {
             double yawRad,
             double pitchRad,
             double cosRoll,
-            double sinRoll) {
-        double rx = (nx * cosRoll - ny * sinRoll) / zoom;
-        double ry = (nx * sinRoll + ny * cosRoll) / zoom;
+            double sinRoll,
+            double cameraDistance) {
+        double rx = (nx * cosRoll - ny * sinRoll) * cameraDistance / zoom;
+        double ry = (nx * sinRoll + ny * cosRoll) * cameraDistance / zoom;
         double radius = Math.sqrt(rx * rx + ry * ry);
         double angle = Math.atan2(ry, rx);
         double polar = 2.0 * Math.atan(radius);
@@ -707,15 +759,12 @@ public class GLProjectionView extends GLSurfaceView {
     /*
      * Function: getEffectivePitch
      * Arguments: none.
-     * Calls: clamp() or normalizeDegrees().
-     * Flow: combine recentered and live pitch; sphere pitch clamps near poles,
-     * while tiny planet pitch can wrap around.
+     * Calls: clamp().
+     * Flow: combine recentered and live pitch, clamping near the poles so
+     * viewport manipulation cannot invert the projected geometry.
      */
     private float getEffectivePitch() {
-        if (mode == Mode.SPHERE) {
-            return clamp(centerPitch + pitch, -89f, 89f);
-        }
-        return normalizeDegrees(centerPitch + pitch);
+        return clamp(centerPitch + pitch, -MAX_VIEW_PITCH_DEGREES, MAX_VIEW_PITCH_DEGREES);
     }
 
     /*
@@ -874,6 +923,7 @@ public class GLProjectionView extends GLSurfaceView {
                 "uniform float uPitch;\n" +
                 "uniform float uRoll;\n" +
                 "uniform float uZoom;\n" +
+                "uniform float uCameraDistance;\n" +
                 "uniform float uAspect;\n" +
                 "uniform float uHorizonOffset;\n" +
                 "uniform int uSourceProjection;\n" +
@@ -918,10 +968,11 @@ public class GLProjectionView extends GLSurfaceView {
                 "  vec3 forward = vec3(sin(uYaw) * cos(uPitch), sin(uPitch), cos(uYaw) * cos(uPitch));\n" +
                 "  vec3 right = vec3(cos(uYaw), 0.0, -sin(uYaw));\n" +
                 "  vec3 up = cross(forward, right);\n" +
-                "  return normalize(forward + right * r.x * spread + up * r.y * spread);\n" +
+                "  float distanceSpread = spread * uCameraDistance;\n" +
+                "  return normalize(forward + right * r.x * distanceSpread + up * r.y * distanceSpread);\n" +
                 "}\n" +
                 "vec3 tinyPlanetDirection(vec2 p) {\n" +
-                "  vec2 r = rollScreen(p) / uZoom;\n" +
+                "  vec2 r = rollScreen(p) * uCameraDistance / uZoom;\n" +
                 "  float radius = length(r);\n" +
                 "  float angle = atan(r.y, r.x);\n" +
                 "  float polar = 2.0 * atan(radius);\n" +
@@ -950,6 +1001,7 @@ public class GLProjectionView extends GLSurfaceView {
         private int pitchHandle;
         private int rollHandle;
         private int zoomHandle;
+        private int cameraDistanceHandle;
         private int aspectHandle;
         private int horizonOffsetHandle;
         private int sourceProjectionHandle;
@@ -961,6 +1013,7 @@ public class GLProjectionView extends GLSurfaceView {
         private float pitch;
         private float roll;
         private float horizonOffset;
+        private float cameraDistance = 1f;
         private float zoom = 1f;
 
         /*
@@ -992,18 +1045,26 @@ public class GLProjectionView extends GLSurfaceView {
 
         /*
          * Function: setState
-         * Arguments: mode, yaw, pitch, roll, horizonOffset, and zoom are the
-         * latest projection controls from GLProjectionView.
+         * Arguments: mode, yaw, pitch, roll, horizonOffset, cameraDistance, and
+         * zoom are the latest projection controls from GLProjectionView.
          * Calls: no external functions.
          * Flow: copy UI-thread state into renderer fields. pushStateToRenderer()
          * calls this on the GL thread through queueEvent().
          */
-        void setState(Mode mode, float yaw, float pitch, float roll, float horizonOffset, float zoom) {
+        void setState(
+                Mode mode,
+                float yaw,
+                float pitch,
+                float roll,
+                float horizonOffset,
+                float cameraDistance,
+                float zoom) {
             this.mode = mode;
             this.yaw = yaw;
             this.pitch = pitch;
             this.roll = roll;
             this.horizonOffset = horizonOffset;
+            this.cameraDistance = cameraDistance;
             this.zoom = zoom;
         }
 
@@ -1027,6 +1088,7 @@ public class GLProjectionView extends GLSurfaceView {
             pitchHandle = GLES20.glGetUniformLocation(program, "uPitch");
             rollHandle = GLES20.glGetUniformLocation(program, "uRoll");
             zoomHandle = GLES20.glGetUniformLocation(program, "uZoom");
+            cameraDistanceHandle = GLES20.glGetUniformLocation(program, "uCameraDistance");
             aspectHandle = GLES20.glGetUniformLocation(program, "uAspect");
             horizonOffsetHandle = GLES20.glGetUniformLocation(program, "uHorizonOffset");
             sourceProjectionHandle = GLES20.glGetUniformLocation(program, "uSourceProjection");
@@ -1070,6 +1132,7 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glUniform1f(pitchHandle, (float) Math.toRadians(pitch));
             GLES20.glUniform1f(rollHandle, (float) Math.toRadians(roll));
             GLES20.glUniform1f(zoomHandle, zoom);
+            GLES20.glUniform1f(cameraDistanceHandle, cameraDistance);
             GLES20.glUniform1f(aspectHandle, viewportWidth / (float) viewportHeight);
             GLES20.glUniform1f(horizonOffsetHandle, (float) Math.toRadians(horizonOffset));
             GLES20.glUniform1i(sourceProjectionHandle, sourceTinyPlanet ? 1 : 0);

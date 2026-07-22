@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.4.2
+Version: 0.4.5
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.4.2 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, simplified capture status messaging, smoother guided PhotoSphere target tracking, default auto-capture, draft-frame deletion, and confirmed bulk draft removal.
+This repository now contains the first Android proof-of-concept application code. The 0.4.5 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, simplified capture status messaging, smoother guided PhotoSphere target tracking, default auto-capture, draft-frame deletion, and confirmed bulk draft removal.
 
 ## Developer Build and Run Runbook
 
@@ -16,6 +16,30 @@ Current status:
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
 - The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, draft frame capture, an initial guided target grid for Phase 4 capture sessions, auto-capture on locked targets, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+
+### Version 0.4.5 Progress
+
+This build tightens viewport manipulation:
+
+- Makes Tiny Planet single-finger horizontal dragging adjust camera yaw instead of also spinning roll.
+- Clamps viewer pitch in both Photo Sphere and Tiny Planet modes so dragging cannot flip the projected geometry through a pole.
+- Clamps restored pitch state from older sessions before rendering.
+
+### Version 0.4.4 Progress
+
+This build separates viewer distance from zoom:
+
+- Changes the former Field of view adjustment into Camera distance.
+- Keeps pinch zoom as the focal-length-like magnification control.
+- Applies camera distance to both GPU preview and exported Photo Sphere/Tiny Planet variants.
+
+### Version 0.4.3 Progress
+
+This build improves Photo Sphere and Tiny Planet touch interaction:
+
+- Maps two-finger vertical dragging to Horizon reference adjustment.
+- Maps two-finger horizontal dragging to Field of view adjustment.
+- Keeps pinch zoom and two-finger rotation available alongside the new drag adjustments.
 
 ### Version 0.4.2 Progress
 
@@ -95,22 +119,22 @@ Windows PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force preview-apks
-Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.4.2-debug.apk
+Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.4.5-debug.apk
 ```
 
 macOS/Linux:
 
 ```bash
 mkdir -p preview-apks
-cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.4.2-debug.apk
+cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.4.5-debug.apk
 ```
 
 3. Commit the copied APK only when you intentionally want previewers to download that exact build from the repository.
 
-Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.4.2-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
+Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.4.5-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
 
 ```powershell
-adb install -r preview-apks\spherify-0.4.2-debug.apk
+adb install -r preview-apks\spherify-0.4.5-debug.apk
 ```
 
 The repository contains:
@@ -1088,7 +1112,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.4.2, license, acknowledgements.
+- About: version 0.4.5, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 

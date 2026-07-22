@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.4.2");
+        version.setText("0.4.5");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -664,7 +664,7 @@ public class MainActivity extends Activity {
      * Calls: openFlatViewer(), addAdjustmentControl(), projectionView getters and
      * setters, AlertDialog.Builder, resetView(), and updateLabels().
      * Flow: build a dialog of SeekBar controls that directly update projection
-     * field of view, image rotation, and horizon offset.
+     * camera distance, image rotation, and horizon offset.
      */
     private void showAdjustDialog() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
@@ -678,12 +678,12 @@ public class MainActivity extends Activity {
 
         addAdjustmentControl(
                 controls,
-                "Field of view",
-                30,
-                180,
-                Math.round(projectionView.getFieldOfViewDegrees()),
-                "deg",
-                value -> projectionView.setFieldOfViewDegrees(value));
+                "Camera distance",
+                35,
+                250,
+                Math.round(projectionView.getCameraDistancePercent()),
+                "%",
+                value -> projectionView.setCameraDistancePercent(value));
         addAdjustmentControl(
                 controls,
                 "Image rotation",
