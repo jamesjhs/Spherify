@@ -56,12 +56,18 @@ public class FlatImageActivity extends Activity {
         imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         imageView.setAdjustViewBounds(true);
         imageView.setForegroundGravity(Gravity.CENTER);
+        setContentView(imageView);
 
         String imagePath = getIntent().getStringExtra(EXTRA_IMAGE_PATH);
-        Bitmap bitmap = imagePath == null ? null : BitmapFactory.decodeFile(imagePath);
-        if (bitmap != null) {
-            imageView.setImageBitmap(bitmap);
+        if (imagePath != null) {
+            new Thread(() -> {
+                Bitmap bmp = BitmapFactory.decodeFile(imagePath);
+                runOnUiThread(() -> {
+                    if (!isFinishing() && bmp != null) {
+                        imageView.setImageBitmap(bmp);
+                    }
+                });
+            }).start();
         }
-        setContentView(imageView);
     }
 }

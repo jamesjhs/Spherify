@@ -262,6 +262,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private float maxAccelY = -Float.MAX_VALUE;
     private float minAccelZ = Float.MAX_VALUE;
     private float maxAccelZ = -Float.MAX_VALUE;
+    // Pre-allocated buffers to reduce per-frame allocation pressure
+    private byte[] yuvNv21Buffer;
+    private java.io.ByteArrayOutputStream yuvJpegStream;
+    private int[] featherPixelBuffer;
+    private int[] featherOriginalBuffer;
+    private final Paint bitmapDrawPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
 
     /*
      * Function: onCreate
@@ -461,6 +467,34 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 latestArPreviewBitmap.recycle();
                 latestArPreviewBitmap = null;
             }
+        }
+        // Recycle all horizon-reference and sweep-preview bitmaps to avoid
+        // retaining up to ~88 MB of bitmap memory after the Activity exits.
+        for (int i = 0; i < horizonReferenceFrames.length; i++) {
+            if (horizonReferenceFrames[i] != null) {
+                horizonReferenceFrames[i].recycle();
+                horizonReferenceFrames[i] = null;
+            }
+        }
+        for (int layer = 0; layer < sweepCapturePreviewFrames.length; layer++) {
+            for (int bin = 0; bin < sweepCapturePreviewFrames[layer].length; bin++) {
+                if (sweepCapturePreviewFrames[layer][bin] != null) {
+                    sweepCapturePreviewFrames[layer][bin].recycle();
+                    sweepCapturePreviewFrames[layer][bin] = null;
+                }
+            }
+        }
+        if (horizonReferencePanorama != null) {
+            horizonReferencePanorama.recycle();
+            horizonReferencePanorama = null;
+        }
+        if (sweepLayerPreviewPanorama != null) {
+            sweepLayerPreviewPanorama.recycle();
+            sweepLayerPreviewPanorama = null;
+        }
+        if (paintedPhotospherePreview != null) {
+            paintedPhotospherePreview.recycle();
+            paintedPhotospherePreview = null;
         }
         if (arSession != null) {
             arSession.close();
@@ -2085,7 +2119,6 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         panoramaCanvas.drawColor(0x00000000, PorterDuff.Mode.CLEAR);
         Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
         Rect destinationRect = new Rect();
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         for (int i = 0; i < horizonReferenceFrames.length; i++) {
             Bitmap frame = horizonReferenceFrames[i];
             if (frame == null || frame.isRecycled()) {
@@ -2096,7 +2129,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     0,
                     (i + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
                     HORIZON_REFERENCE_SAMPLE_HEIGHT);
-            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, bitmapDrawPaint);
         }
         featherHorizonReferenceSeams();
         rebuildPaintedPhotospherePreview();
@@ -2124,7 +2157,6 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         panoramaCanvas.drawColor(0x00000000, PorterDuff.Mode.CLEAR);
         Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
         Rect destinationRect = new Rect();
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         for (int i = 0; i < sweepCapturePreviewFrames[currentSweepLayerIndex].length; i++) {
             Bitmap frame = sweepCapturePreviewFrames[currentSweepLayerIndex][i];
             if (frame == null || frame.isRecycled()) {
@@ -2135,7 +2167,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     0,
                     (i + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
                     HORIZON_REFERENCE_SAMPLE_HEIGHT);
-            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+            panoramaCanvas.drawBitmap(frame, sourceRect, destinationRect, bitmapDrawPaint);
         }
         featherBitmapSeams(sweepLayerPreviewPanorama, sweepCaptureBins[currentSweepLayerIndex]);
         rebuildPaintedPhotospherePreview();
@@ -2172,7 +2204,6 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private void drawLayerPreviewRow(Canvas canvas, int layer, int top) {
         Rect sourceRect = new Rect(0, 0, HORIZON_REFERENCE_SAMPLE_WIDTH, HORIZON_REFERENCE_SAMPLE_HEIGHT);
         Rect destinationRect = new Rect();
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         for (int bin = 0; bin < SWEEP_CAPTURE_BIN_COUNT; bin++) {
             int destinationBin = bin;
             Bitmap frame;
@@ -2190,7 +2221,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     top,
                     (destinationBin + 1) * HORIZON_REFERENCE_SAMPLE_WIDTH,
                     top + HORIZON_REFERENCE_SAMPLE_HEIGHT);
-            canvas.drawBitmap(frame, sourceRect, destinationRect, paint);
+            canvas.drawBitmap(frame, sourceRect, destinationRect, bitmapDrawPaint);
         }
     }
 
@@ -2358,7 +2389,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Arguments: bitmap is the strip to soften; bins says which sections exist.
      * Calls: Bitmap.getPixels(), blendColors(), and Bitmap.setPixels().
      * Flow: replace hard joins between adjacent yaw strips with a short blended
-     * transition so preview overlays read as one panorama.
+     * transition so preview overlays read as one panorama. Pixel arrays are
+     * lazily allocated as fields and reused across calls to avoid repeated large
+     * allocations (~1.3 MB each) during the horizon sweep.
      */
     private void featherBitmapSeams(Bitmap bitmap, boolean[] bins) {
         if (bitmap == null || bins == null) {
@@ -2366,11 +2399,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         }
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
+        int size = width * height;
+        if (featherPixelBuffer == null || featherPixelBuffer.length < size) {
+            featherPixelBuffer = new int[size];
+            featherOriginalBuffer = new int[size];
+        }
         int overlap = Math.max(4, HORIZON_REFERENCE_SAMPLE_WIDTH / 6);
-        int[] pixels = new int[width * height];
-        int[] original = new int[width * height];
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
-        System.arraycopy(pixels, 0, original, 0, pixels.length);
+        bitmap.getPixels(featherPixelBuffer, 0, width, 0, 0, width, height);
+        System.arraycopy(featherPixelBuffer, 0, featherOriginalBuffer, 0, size);
         for (int boundaryBin = 1; boundaryBin < bins.length; boundaryBin++) {
             if (!bins[boundaryBin - 1] || !bins[boundaryBin]) {
                 continue;
@@ -2386,11 +2422,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 float amount = (dx + overlap) / (float) (overlap * 2 - 1);
                 for (int y = 0; y < height; y++) {
                     int row = y * width;
-                    pixels[row + x] = blendColors(original[row + leftSampleX], original[row + rightSampleX], amount);
+                    featherPixelBuffer[row + x] = blendColors(
+                            featherOriginalBuffer[row + leftSampleX],
+                            featherOriginalBuffer[row + rightSampleX],
+                            amount);
                 }
             }
         }
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+        bitmap.setPixels(featherPixelBuffer, 0, width, 0, 0, width, height);
     }
 
     /*
@@ -3559,9 +3598,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Function: yuv420ToJpeg
      * Arguments: image is an ARCore YUV_420_888 frame; quality is JPEG quality.
-     * Calls: yuv420ToNv21(), YuvImage.compressToJpeg(), and ByteArrayOutputStream.
-     * Flow: adapt Android's multi-plane YUV camera image into a compact JPEG
-     * used for both live preview and draft frame capture.
+     * Calls: yuv420ToNv21(), YuvImage.compressToJpeg(), and the reused yuvJpegStream.
+     * Flow: adapt Android's multi-plane YUV camera image into a compact JPEG used
+     * for both live preview and draft frame capture. The ByteArrayOutputStream is
+     * reused across frames to reduce per-frame allocation pressure.
      */
     private byte[] yuv420ToJpeg(Image image, int quality) {
         byte[] nv21 = yuv420ToNv21(image);
@@ -3571,9 +3611,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 image.getWidth(),
                 image.getHeight(),
                 null);
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), quality, output);
-        return output.toByteArray();
+        if (yuvJpegStream == null) {
+            yuvJpegStream = new java.io.ByteArrayOutputStream(nv21.length);
+        } else {
+            yuvJpegStream.reset();
+        }
+        yuvImage.compressToJpeg(
+                new Rect(0, 0, image.getWidth(), image.getHeight()), quality, yuvJpegStream);
+        return yuvJpegStream.toByteArray();
     }
 
     /*
@@ -3611,18 +3656,26 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Arguments: image is an Android YUV_420_888 image.
      * Calls: copyPlane().
      * Flow: copy Y, V, and U plane data into the NV21 byte order expected by
-     * YuvImage while respecting row and pixel strides.
+     * YuvImage while respecting row and pixel strides. The output buffer is
+     * reused across frames (reallocated only when frame dimensions change) to
+     * avoid per-frame allocation on the GL thread.
      */
     private byte[] yuv420ToNv21(Image image) {
         int width = image.getWidth();
         int height = image.getHeight();
-        byte[] output = new byte[width * height * 3 / 2];
+        int requiredSize = width * height * 3 / 2;
+        if (yuvNv21Buffer == null || yuvNv21Buffer.length < requiredSize) {
+            yuvNv21Buffer = new byte[requiredSize];
+        }
         Image.Plane[] planes = image.getPlanes();
-        copyPlane(planes[0].getBuffer(), output, 0, width, height, planes[0].getRowStride(), planes[0].getPixelStride(), false);
+        copyPlane(planes[0].getBuffer(), yuvNv21Buffer, 0, width, height,
+                planes[0].getRowStride(), planes[0].getPixelStride(), false);
         int chromaOffset = width * height;
-        copyPlane(planes[2].getBuffer(), output, chromaOffset, width / 2, height / 2, planes[2].getRowStride(), planes[2].getPixelStride(), true);
-        copyPlane(planes[1].getBuffer(), output, chromaOffset + 1, width / 2, height / 2, planes[1].getRowStride(), planes[1].getPixelStride(), true);
-        return output;
+        copyPlane(planes[2].getBuffer(), yuvNv21Buffer, chromaOffset, width / 2, height / 2,
+                planes[2].getRowStride(), planes[2].getPixelStride(), true);
+        copyPlane(planes[1].getBuffer(), yuvNv21Buffer, chromaOffset + 1, width / 2, height / 2,
+                planes[1].getRowStride(), planes[1].getPixelStride(), true);
+        return yuvNv21Buffer;
     }
 
     /*
@@ -3630,8 +3683,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Arguments: buffer is one image plane; output receives bytes; outputOffset
      * starts the plane; width/height are plane dimensions; rowStride/pixelStride
      * describe the source layout; interleaved writes chroma bytes every other slot.
-     * Calls: ByteBuffer.position() and ByteBuffer.get().
-     * Flow: copy a possibly-strided camera plane into tightly packed output.
+     * Calls: ByteBuffer.get(byte[], offset, length) for packed rows (fast path)
+     * or ByteBuffer.get(position) for strided/interleaved rows (slow path).
+     * Flow: for tightly-packed non-interleaved planes (the common Y-channel case),
+     * transfer a whole row with one bulk read per row instead of per-byte calls.
+     * For strided or interleaved chroma planes, fall back to the per-byte loop.
      */
     private void copyPlane(
             ByteBuffer buffer,
@@ -3642,12 +3698,23 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             int rowStride,
             int pixelStride,
             boolean interleaved) {
-        int outputIndex = outputOffset;
-        for (int row = 0; row < height; row++) {
-            int rowStart = row * rowStride;
-            for (int column = 0; column < width; column++) {
-                output[outputIndex] = buffer.get(rowStart + column * pixelStride);
-                outputIndex += interleaved ? 2 : 1;
+        if (!interleaved && pixelStride == 1) {
+            // Fast path: packed Y-plane or similarly packed plane — one bulk get() per row.
+            int outputIndex = outputOffset;
+            for (int row = 0; row < height; row++) {
+                buffer.position(row * rowStride);
+                buffer.get(output, outputIndex, width);
+                outputIndex += width;
+            }
+        } else {
+            // Slow path: strided or interleaved chroma plane.
+            int outputIndex = outputOffset;
+            for (int row = 0; row < height; row++) {
+                int rowStart = row * rowStride;
+                for (int column = 0; column < width; column++) {
+                    output[outputIndex] = buffer.get(rowStart + column * pixelStride);
+                    outputIndex += interleaved ? 2 : 1;
+                }
             }
         }
     }
@@ -4018,12 +4085,26 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private int buildProgram(String vertexShaderSource, String fragmentShaderSource) {
             int vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexShaderSource);
             int fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderSource);
+            if (vertexShader == 0 || fragmentShader == 0) {
+                if (vertexShader != 0) GLES20.glDeleteShader(vertexShader);
+                if (fragmentShader != 0) GLES20.glDeleteShader(fragmentShader);
+                return 0;
+            }
             int program = GLES20.glCreateProgram();
             GLES20.glAttachShader(program, vertexShader);
             GLES20.glAttachShader(program, fragmentShader);
             GLES20.glLinkProgram(program);
             GLES20.glDeleteShader(vertexShader);
             GLES20.glDeleteShader(fragmentShader);
+            int[] status = new int[1];
+            GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, status, 0);
+            if (status[0] == 0) {
+                String log = GLES20.glGetProgramInfoLog(program);
+                GLES20.glDeleteProgram(program);
+                android.util.Log.e("ArCameraRenderer", "GL program link failed: " + log);
+                runOnUiThread(() -> showArCoreUnsupportedMessage());
+                return 0;
+            }
             return program;
         }
 
@@ -4031,6 +4112,15 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             int shader = GLES20.glCreateShader(type);
             GLES20.glShaderSource(shader, source);
             GLES20.glCompileShader(shader);
+            int[] status = new int[1];
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0);
+            if (status[0] == 0) {
+                String log = GLES20.glGetShaderInfoLog(shader);
+                GLES20.glDeleteShader(shader);
+                android.util.Log.e("ArCameraRenderer", "GL shader compile failed: " + log);
+                runOnUiThread(() -> showArCoreUnsupportedMessage());
+                return 0;
+            }
             return shader;
         }
     }

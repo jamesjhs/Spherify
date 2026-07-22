@@ -103,6 +103,7 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private Button modeButton;
     private Button adjustButton;
+    private Button exportButton;
     private AlertDialog activeLibraryDialog;
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
@@ -212,7 +213,7 @@ public class MainActivity extends Activity {
             updateLabels();
         });
 
-        Button exportButton = makeButton("Export");
+        exportButton = makeButton("Export");
         exportButton.setOnClickListener(v -> exportCurrentView());
 
         controls.addView(modeButton);
@@ -797,50 +798,85 @@ public class MainActivity extends Activity {
     /*
      * Function: saveCurrentExport
      * Arguments: none.
-     * Calls: projectionView.exportProjection(), library.saveVariant(),
+     * Calls: projectionView.exportProjection() on a background thread, library.saveVariant(),
      * openFlatViewer(), and Toast.
-     * Flow: render the current projection, persist it as a local variant in the
-     * library, make it current, open the flat viewer, and report success/failure.
+     * Flow: disable controls, render the current projection off the UI thread, persist
+     * the variant, re-enable controls, open the flat viewer, and report success/failure.
      */
     private void saveCurrentExport() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
             return;
         }
-        try {
-            ProjectionExport export = projectionView.exportProjection();
-            String projection = projectionView.getMode() == GLProjectionView.Mode.TINY_PLANET
-                    ? "tinyplanet"
-                    : "sphere";
-            currentItem = library.saveVariant(currentItem, export, projection);
-            Toast.makeText(
-                    this,
-                    "Saved variant, thumbnail, and gallery export",
-                    Toast.LENGTH_LONG).show();
-            openFlatViewer(currentItem);
-        } catch (IOException e) {
-            Toast.makeText(this, "Export failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+        final LibraryItem sourceItem = currentItem;
+        final String exportProjection = projectionView.getMode() == GLProjectionView.Mode.TINY_PLANET
+                ? "tinyplanet" : "sphere";
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                ProjectionExport export = projectionView.exportProjection();
+                LibraryItem saved = library.saveVariant(sourceItem, export, exportProjection);
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    currentItem = saved;
+                    Toast.makeText(
+                            MainActivity.this,
+                            "Saved variant, thumbnail, and gallery export",
+                            Toast.LENGTH_LONG).show();
+                    openFlatViewer(currentItem);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Export failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
     }
 
     /*
      * Function: shareCurrentExport
      * Arguments: none.
-     * Calls: projectionView.exportProjection(), shareFile(), and Toast.
-     * Flow: render the current projection to a temporary app file and launch
-     * Android's share sheet for the generated image.
+     * Calls: projectionView.exportProjection() on a background thread, shareFile(), and Toast.
+     * Flow: disable controls, render the current projection off the UI thread, re-enable
+     * controls, launch Android's share sheet for the generated image.
      */
     private void shareCurrentExport() {
         if (currentItem != null && "flat".equals(currentItem.projection)) {
             openFlatViewer(currentItem);
             return;
         }
-        try {
-            ProjectionExport export = projectionView.exportProjection();
-            shareFile(export.imageFile);
-        } catch (IOException e) {
-            Toast.makeText(this, "Share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                ProjectionExport export = projectionView.exportProjection();
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    shareFile(export.imageFile);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /*
+     * Function: setExportControlsEnabled
+     * Arguments: enabled controls whether export/interaction is allowed.
+     * Calls: Button.setEnabled() and GLProjectionView.setEnabled().
+     * Flow: disable the export button and touch interaction on the projection view
+     * while a background render is in progress, and re-enable when it completes.
+     */
+    private void setExportControlsEnabled(boolean enabled) {
+        if (exportButton != null) exportButton.setEnabled(enabled);
+        if (projectionView != null) projectionView.setEnabled(enabled);
     }
 
     /*
@@ -1501,12 +1537,13 @@ public class MainActivity extends Activity {
     /*
      * Function: loadCurrentItem
      * Arguments: savedProjectionState optionally contains GLProjectionView state.
-     * Calls: updateLabels(), openFlatViewer(), BitmapFactory.decodeFile(),
-     * projectionView.setMode(), projectionView.setPanorama(), resetView(),
-     * restoreProjectionState(), and Toast.
+     * Calls: updateLabels(), openFlatViewer(), BitmapFactory.decodeFile() on a
+     * background thread, SpherifyLibrary.applyExifRotation(), projectionView.setMode(),
+     * projectionView.setPanorama(), resetView(), restoreProjectionState(), and Toast.
      * Flow: validate a current item, route flat images away from GL, decode source
-     * pixels for projected images, load them into GLProjectionView, restore or
-     * reset projection controls, and refresh labels.
+     * pixels on a background thread with EXIF rotation correction, load them into
+     * GLProjectionView on the UI thread, restore or reset projection controls, and
+     * refresh labels.
      */
     private void loadCurrentItem(Bundle savedProjectionState) {
         if (currentItem == null) {
@@ -1519,23 +1556,40 @@ public class MainActivity extends Activity {
             openFlatViewer(currentItem);
             return;
         }
-        Bitmap bitmap = BitmapFactory.decodeFile(currentItem.imagePath);
-        if (bitmap == null) {
-            Toast.makeText(this, "Could not load " + currentItem.title, Toast.LENGTH_LONG).show();
-            return;
+        final LibraryItem item = currentItem;
+        final Bundle projectionState = savedProjectionState;
+        if (statusText != null) {
+            statusText.setText(item.title + "  |  Loading\u2026");
         }
-        projectionView.setMode("tinyplanet".equals(currentItem.projection)
-                ? GLProjectionView.Mode.TINY_PLANET
-                : GLProjectionView.Mode.SPHERE);
-        projectionView.setPanorama(bitmap, currentItem.projection);
-        if (savedProjectionState == null) {
-            projectionView.resetView();
-        } else {
-            projectionView.restoreProjectionState(savedProjectionState, STATE_PROJECTION_PREFIX);
-        }
-        if (modeButton != null) {
-            updateLabels();
-        }
+        new Thread(() -> {
+            Bitmap bmp = BitmapFactory.decodeFile(item.imagePath);
+            if (bmp != null) {
+                bmp = SpherifyLibrary.applyExifRotation(bmp, item.imagePath);
+            }
+            final Bitmap finalBitmap = bmp;
+            runOnUiThread(() -> {
+                if (isFinishing()) {
+                    if (finalBitmap != null) finalBitmap.recycle();
+                    return;
+                }
+                if (finalBitmap == null) {
+                    Toast.makeText(MainActivity.this, "Could not load " + item.title, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                projectionView.setMode("tinyplanet".equals(item.projection)
+                        ? GLProjectionView.Mode.TINY_PLANET
+                        : GLProjectionView.Mode.SPHERE);
+                projectionView.setPanorama(finalBitmap, item.projection);
+                if (projectionState == null) {
+                    projectionView.resetView();
+                } else {
+                    projectionView.restoreProjectionState(projectionState, STATE_PROJECTION_PREFIX);
+                }
+                if (modeButton != null) {
+                    updateLabels();
+                }
+            });
+        }).start();
     }
 
     /*

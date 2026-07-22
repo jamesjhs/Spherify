@@ -127,6 +127,108 @@ Final decision:
 - Decision date: ____________________
 - Notes (required if NO-GO): ____________________
 
+---
+
+## Known Issues — Medium Severity (Pending Resolution)
+
+These issues do not block the current prototype but must be reviewed and resolved before any production or wide Play Store release. Each entry describes the problem in detail and proposes a concrete fix for the engineer who picks it up.
+
+---
+
+### M-1: Metadata file rewritten on every draft capture (O(items × frames) I/O)
+
+**Location:** `SpherifyLibrary.save()`, called from `captureFrame()` in `CaptureActivity`.
+
+**Description:** Every time a draft frame is captured, `SpherifyLibrary.save()` serialises the entire library metadata (all items, all fields) to `metadata.json` and overwrites the file in place. At prototype scale (tens of items, dozens of frames per session) this is imperceptible. As the library grows, the write amplification becomes significant: a session with 50 existing library entries and 30 captured frames performs 30 full rewrites of a file that grows with every import. On a mid-range device this will produce measurable latency spikes (50–200 ms per capture) and increases the risk of data loss from a partial write during a forced-stop.
+
+**Additional risk:** The file is written with a direct `FileOutputStream` overwrite, not an atomic rename. A crash or force-stop mid-write leaves a truncated or empty `metadata.json`, destroying all library references permanently.
+
+**Proposed fix:**
+1. Write via a rename pattern: serialize to `metadata.json.tmp`, then `tmp.renameTo(metadata.json)`. This makes every write atomic — a crash leaves either the old complete file or the new complete file.
+2. Add a dirty flag to `SpherifyLibrary` and expose a `flush()` method. Call `flush()` from `onPause()` in `CaptureActivity` and `MainActivity` rather than flushing on every mutation.
+3. For draft frame metadata specifically, consider a separate append-only `drafts.json` that accumulates new entries and is merged into `metadata.json` on session close rather than on every frame.
+
+---
+
+### M-2: `readDraftMetadataOrThrow()` uses a single non-guaranteed `InputStream.read()` call
+
+**Location:** `SpherifyLibrary.readDraftMetadataOrThrow()`.
+
+**Description:** The method reads the entire draft metadata file with a single `inputStream.read(data, 0, data.length)` call. The contract of `InputStream.read(byte[], int, int)` only guarantees that at least one byte is transferred; it may legally return fewer bytes than requested on certain file systems or under OS buffer constraints. If the read is short, the remaining bytes are left as zeros, causing `new String(data, StandardCharsets.UTF_8)` to produce a string with embedded null bytes. The subsequent `new JSONObject(json)` call throws a `JSONException`, which is caught and reported as "metadata corrupt" — a false-positive data loss message.
+
+**Proposed fix:** Replace the raw `InputStream.read()` call with either:
+- `DataInputStream.readFully(data)` — throws `EOFException` only when the file is genuinely truncated.
+- An explicit fill loop: `int offset = 0; int remaining = data.length; while (remaining > 0) { int n = stream.read(data, offset, remaining); if (n < 0) break; offset += n; remaining -= n; }`.
+
+Either approach guarantees a complete fill before the JSON parse and eliminates the false-corruption path.
+
+---
+
+### M-3: `captureFrame()` spawns an untracked `new Thread()` per capture tap
+
+**Location:** `captureFrame()` in `CaptureActivity`.
+
+**Description:** Each tap of the Capture button calls `new Thread(() -> { ... }).start()` with no reference stored and no lifecycle management. If the user taps rapidly (five frames in quick succession) five threads run concurrently, all potentially calling `SpherifyLibrary.save()` at the same time — `save()` is not synchronized. After the user backs out or the system kills the Activity mid-capture, in-flight threads continue executing, calling `runOnUiThread()` on a destroyed Activity and potentially leaving draft metadata in an inconsistent state.
+
+**Proposed fix:**
+1. Replace ad-hoc threads with a single-threaded `ExecutorService` field: `private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor()`. Submit captures via `captureExecutor.submit(...)`. Single-thread serialisation eliminates the concurrent write race.
+2. In `onDestroy()`, call `captureExecutor.shutdownNow()` to interrupt any in-flight capture.
+3. Guard every `runOnUiThread()` callback inside the capture runnable with `if (!isFinishing())` to prevent updating destroyed UI.
+
+---
+
+### M-4: `TargetGuideView.drawTiltWarning()` allocates a `new LinearGradient` on every `onDraw()`
+
+**Location:** `TargetGuideView.drawTiltWarning()`, called from `TargetGuideView.onDraw()`.
+
+**Description:** `drawTiltWarning()` creates a `new LinearGradient(...)` and calls `paint.setShader(gradient)` on every redraw. During an active capture sweep the view invalidates continuously at sensor update rate (50–100 Hz). Each `LinearGradient` allocation involves both a Java heap object and a native Skia shader object. On older or memory-constrained devices this contributes to GC pressure and jank during the critical capture window when the user is physically rotating the phone.
+
+**Proposed fix:**
+1. Cache the `LinearGradient` objects as fields of `TargetGuideView`.
+2. Invalidate the cache only when the view dimensions change (`onSizeChanged()`) or when the parameterizing colour/alpha values change.
+3. Store the last-rendered tilt direction as a field; rebuild the gradient only when direction or dimensions differ from the cached state.
+
+---
+
+### M-5: No content descriptions on any interactive UI element (accessibility gap)
+
+**Location:** All `makeButton()` calls in `CaptureActivity` and `MainActivity`; all `ImageView`s and custom `View`s that receive touch input.
+
+**Description:** No `View.setContentDescription()` call exists anywhere in the codebase. Android Accessibility Services (TalkBack, Switch Access, Voice Access) identify interactive elements by content description when no visible text is available. Custom views (`TargetGuideView`, `CalibrationProgressView`, `CompassNeedleView`) and all icon-only buttons are completely invisible to assistive technology. This is a Play Store policy requirement for apps targeting API level 36 and is enforced during new-app review.
+
+**Proposed fix:**
+1. Add `setContentDescription(String)` calls to every `Button`, `ImageView`, and custom interactive `View` during construction in `CaptureActivity.onCreate()`, `MainActivity.onCreate()`, and the `makeButton()` helper.
+2. For custom `View` subclasses, implement `onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info)` with a description that reflects current state (e.g. current tilt angle, calibration percentage).
+3. Call `setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES)` on all interactive surfaces that lack text labels.
+
+---
+
+### M-6: `GLProjectionView.setPanorama()` calls `getPixels()` on the UI thread unconditionally
+
+**Location:** `GLProjectionView.setPanorama()`.
+
+**Description:** `setPanorama()` immediately calls `bitmap.getPixels(panoramaPixels, ...)` to populate a flat `int[]` array used exclusively by the CPU export path (`renderProjectionOnCpu()`). For a 4K panorama this allocates and fills up to a 32 MB `int[]` on the UI thread. This is unconditional — even for users who only browse the library without exporting. The allocation and fill time (typically 80–300 ms for 4K) produces a visible UI thread stall on every library navigation step.
+
+**Proposed fix:**
+1. Remove `getPixels()` from `setPanorama()`. Store only the `Bitmap` reference and its dimensions.
+2. Call `getPixels()` lazily inside `exportProjection()` / `renderProjectionOnCpu()` immediately before the CPU render, on the background thread where export now executes (see fix C-3).
+3. Cache the resulting `panoramaPixels` array and invalidate it when `setPanorama()` is called with a new bitmap. This eliminates the UI stall for all users who browse without exporting.
+
+---
+
+### M-7: `SpherifyLibrary.describe()` parses `drafts.json` synchronously on the UI thread
+
+**Location:** `SpherifyLibrary.describe()`, called from `showMetadata()` in `MainActivity`.
+
+**Description:** `describe()` calls `listDraftFrames(item.id)`, which opens, reads, and parses `drafts.json` to count frames. `showMetadata()` calls `describe()` directly from the button click handler on the UI thread. For a session with many draft frames (100+) this is a synchronous file read on the UI thread, contributing to jank and following the same unthreaded I/O pattern that was fixed for bitmap loads in C-2 and C-3.
+
+**Proposed fix:**
+1. Move `library.describe(currentItem)` inside `showMetadata()` to a background thread; post the resulting string via `runOnUiThread()` before showing the `AlertDialog`.
+2. Alternatively, cache the draft frame count in the `LibraryItem` object when the item is first loaded or when a draft is saved, so `describe()` reads from memory instead of disk.
+3. Long-term: introduce a `loadAsync(callback)` pattern on `SpherifyLibrary` that shifts all file reads to a dedicated executor, consistent with the background-thread approach adopted for bitmap decodes.
+
+---
+
 ### Version 0.4.33 Progress
 
 This bugfix build separates compass readiness from capture reference imagery:

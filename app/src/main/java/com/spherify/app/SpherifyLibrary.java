@@ -50,6 +50,8 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -715,6 +717,7 @@ final class SpherifyLibrary {
         if (bitmap == null) {
             throw new IOException("could not decode image for thumbnail");
         }
+        bitmap = applyExifRotation(bitmap, imageFile.getAbsolutePath());
         Bitmap thumbnail = Bitmap.createScaledBitmap(bitmap, THUMBNAIL_SIZE, THUMBNAIL_SIZE, true);
         File thumbnailFile = new File(thumbnailsDir, id + ".jpg");
         try (FileOutputStream output = new FileOutputStream(thumbnailFile)) {
@@ -726,6 +729,30 @@ final class SpherifyLibrary {
             bitmap.recycle();
         }
         return thumbnailFile;
+    }
+
+    static Bitmap applyExifRotation(Bitmap bitmap, String path) {
+        try {
+            ExifInterface exif = new ExifInterface(path);
+            int orientation = exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL);
+            int degrees;
+            switch (orientation) {
+                case ExifInterface.ORIENTATION_ROTATE_90:  degrees = 90;  break;
+                case ExifInterface.ORIENTATION_ROTATE_180: degrees = 180; break;
+                case ExifInterface.ORIENTATION_ROTATE_270: degrees = 270; break;
+                default: return bitmap;
+            }
+            Matrix matrix = new Matrix();
+            matrix.postRotate(degrees);
+            Bitmap rotated = Bitmap.createBitmap(
+                    bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            bitmap.recycle();
+            return rotated;
+        } catch (IOException ignored) {
+            return bitmap;
+        }
     }
 
     /*
