@@ -158,7 +158,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.4.33");
+        version.setText("0.5.0");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -1172,10 +1172,11 @@ public class MainActivity extends Activity {
     /*
      * Function: showDraftSession
      * Arguments: item is a first-class draft capture LibraryItem.
-     * Calls: library.listDraftFrames(), DraftFrameAdapter, and AlertDialog.
+     * Calls: library.listDraftFrames(), DraftFrameAdapter, AlertDialog, and
+     * stitchDraftSession().
      * Flow: open only the frames that belong to the selected draft session, so
      * draft captures behave like browseable library records instead of loose
-     * files.
+     * files, with a Phase 5 action to generate a first equirectangular master.
      */
     private void showDraftSession(LibraryItem item) {
         List<File> drafts = library.listDraftFrames(item.id);
@@ -1193,6 +1194,68 @@ public class MainActivity extends Activity {
                 .setTitle(item.title + " - swipe left to delete")
                 .setView(listView)
                 .setNegativeButton("Close", null)
+                .setPositiveButton("Spherify", null)
+                .show();
+        activeLibraryDialog
+                .getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> stitchDraftSession(item));
+    }
+
+    /*
+     * Function: stitchDraftSession
+     * Arguments: item is the selected draft-session LibraryItem.
+     * Calls: SpherifyLibrary.createMasterFromDraftSession() on a background
+     * thread, loadCurrentItem(), and showStitchSummary().
+     * Flow: close the draft browser, run the experimental Phase 5 stitch without
+     * blocking UI input, then make the generated equirectangular master current.
+     */
+    private void stitchDraftSession(LibraryItem item) {
+        if (activeLibraryDialog != null) {
+            activeLibraryDialog.dismiss();
+            activeLibraryDialog = null;
+        }
+        Toast.makeText(this, "Generating Phase 5 master...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                StitchMasterResult result = library.createMasterFromDraftSession(item);
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    currentItem = result.item;
+                    loadCurrentItem(null);
+                    showStitchSummary(result);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    Toast.makeText(MainActivity.this, "Spherify failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /*
+     * Function: showStitchSummary
+     * Arguments: result contains the new master and Phase 5 quality summary.
+     * Calls: AlertDialog.Builder and StringBuilder.
+     * Flow: tell the user what the first-pass pipeline rendered and identify
+     * known weak areas instead of treating every generated master as map-ready.
+     */
+    private void showStitchSummary(StitchMasterResult result) {
+        StringBuilder message = new StringBuilder();
+        message.append("Created ").append(result.item.title)
+                .append("\nFrames used: ").append(result.stitch.renderedFrames)
+                .append("\nEstimated coverage: ").append(result.stitch.coveragePercent).append("%")
+                .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames);
+        if (!result.stitch.warnings.isEmpty()) {
+            message.append("\n\nWarnings:");
+            for (String warning : result.stitch.warnings) {
+                message.append("\n- ").append(warning);
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Phase 5 master created")
+                .setMessage(message.toString())
+                .setPositiveButton("Open", null)
                 .show();
     }
 

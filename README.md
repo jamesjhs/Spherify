@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.4.33
+Version: 0.5.0
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
-This repository now contains the first Android proof-of-concept application code. The 0.4.33 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, pitch-only one-shot polar capture, polar Capture/Next/Spherify button flow, polar-only guide overlay, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class draft-session library records, structured draft exposure metadata with non-blocking capture fallback, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, and confirmed bulk draft removal.
+This repository now contains the first Android proof-of-concept application code. The 0.5.0 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, pitch-only one-shot polar capture, polar Capture/Next/Spherify button flow, polar-only guide overlay, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class draft-session library records, structured draft exposure metadata with non-blocking capture fallback, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, and the first experimental Phase 5 draft-session-to-equirectangular-master generator.
 
 ## Developer Build and Run Runbook
 
@@ -15,7 +15,7 @@ Current status:
 - The repository has a Gradle wrapper, Android app module, launcher activity, bundled test panorama, and debug build.
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
-- The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, ARCore draft frame capture, an iterated Phase 4 guided capture flow that evolved from target dots into sweep-first paint layers, auto-capture for new sweep slices, first-class draft-session library records, structured exposure metadata for draft frames, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+- The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, ARCore draft frame capture, an iterated Phase 4 guided capture flow that evolved from target dots into sweep-first paint layers, auto-capture for new sweep slices, first-class draft-session library records, structured exposure metadata for draft frames, draft-frame deletion, a confirmed Remove All Drafts action for large draft sets, and an experimental Phase 5 Spherify action that creates a 4096 x 2048 equirectangular JPEG master from one draft session.
 
 ## Play Store Compliance Gate (Mandatory)
 
@@ -30,9 +30,9 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.4.33):
+Current repository compliance snapshot (0.5.0):
 
-- Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata.
+- Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata, experimental local draft stitching into app-created masters.
 - Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
 - Code-level sensitive permissions present: CAMERA, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION.
 - Background location permission is not declared.
@@ -228,6 +228,16 @@ Either approach guarantees a complete fill before the JSON parse and eliminates 
 3. Long-term: introduce a `loadAsync(callback)` pattern on `SpherifyLibrary` that shifts all file reads to a dedicated executor, consistent with the background-thread approach adopted for bitmap decodes.
 
 ---
+
+### Version 0.5.0 Progress
+
+This build starts Phase 5 master generation:
+
+- Adds a `Spherify` action to first-class draft sessions in the library.
+- Adds a typed draft-frame record layer for Phase 5 jobs, including orientation, target, capture mode, and exposure availability.
+- Adds an experimental 4096 x 2048 equirectangular JPEG generator that uses Phase 4 yaw/pitch metadata as initial placement, treats pole frames as top/bottom coverage bands, writes basic EXIF description metadata, creates a thumbnail, and saves the output as a normal PhotoSphere master.
+- Shows a post-stitch quality summary with frames used, estimated coverage, missing exposure references, and warnings so early outputs are not silently treated as map-ready.
+- Feature matching, drift correction, exposure balancing, seam blending, and Google Maps readiness validation are still pending Phase 5 work.
 
 ### Version 0.4.33 Progress
 
@@ -1578,7 +1588,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.4.33, license, acknowledgements.
+- About: current version, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 
@@ -1923,6 +1933,15 @@ Work:
 - Generate a 2:1 equirectangular JPEG master.
 - Add basic PhotoSphere/XMP-style metadata.
 - Validate output against Google Maps readiness requirements.
+
+Current implementation:
+
+- Draft sessions expose a `Spherify` action from the library.
+- Phase 5 can enumerate typed frame records for one selected draft session, including file path, timestamp, session id, approximate orientation, target pitch/yaw, capture mode, and exposure availability.
+- The first experimental stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates and treating polar captures as full-width top/bottom bands.
+- Generated masters are saved as normal `master` library records with the draft session as `parentId`, thumbnails are generated, and the main PhotoSphere viewer opens the result.
+- A post-stitch summary reports frames used, estimated grid coverage, missing exposure references, and warnings for weak/incomplete captures.
+- This is not map-ready yet: feature matching, drift correction, exposure/white-balance balancing, seam blending, gap repair, and formal Google Maps readiness checks are still pending.
 
 Exit criteria:
 

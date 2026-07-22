@@ -304,6 +304,84 @@ final class SpherifyLibrary {
     }
 
     /*
+     * Function: listDraftFrameRecords
+     * Arguments: sessionId identifies one draft capture session.
+     * Calls: readDraftMetadata(), JSONObject accessors, and File.exists().
+     * Flow: translate the JSON draft index into typed Phase 5 frame records so
+     * stitching can use orientation, target, capture, and exposure fields without
+     * re-parsing metadata at every call site.
+     */
+    List<DraftFrameRecord> listDraftFrameRecords(String sessionId) {
+        ArrayList<DraftFrameRecord> result = new ArrayList<>();
+        JSONArray metadata = readDraftMetadata();
+        for (int i = 0; i < metadata.length(); i++) {
+            JSONObject json = metadata.optJSONObject(i);
+            if (json == null || !sessionId.equals(json.optString("sessionId", ""))) {
+                continue;
+            }
+            File file = new File(json.optString("path", ""));
+            if (!file.exists()) {
+                continue;
+            }
+            JSONObject exposure = json.optJSONObject("exposure");
+            result.add(new DraftFrameRecord(
+                    file,
+                    json.optString("sessionId", ""),
+                    json.optLong("createdAt", file.lastModified()),
+                    json.optString("location", ""),
+                    (float) json.optDouble("headingDegrees", 0.0),
+                    (float) json.optDouble("pitchDegrees", 0.0),
+                    (float) json.optDouble("rollDegrees", 0.0),
+                    json.optInt("targetYawDegrees", 0),
+                    json.optInt("targetPitchDegrees", 0),
+                    json.optString("captureMode", "manual"),
+                    exposure != null && exposure.optBoolean("available", false)));
+        }
+        Collections.sort(result, Comparator.comparingLong(record -> record.createdAt));
+        return result;
+    }
+
+    /*
+     * Function: createMasterFromDraftSession
+     * Arguments: draftSession is the first-class library record selected by the
+     * user.
+     * Calls: listDraftFrameRecords(), Phase5Stitcher.stitch(), makeThumbnail(),
+     * LibraryItem constructor, and save().
+     * Flow: render the first Phase 5 equirectangular JPEG from one coherent
+     * draft capture session, add it as a normal master image, and return both the
+     * item and quality summary to MainActivity.
+     */
+    StitchMasterResult createMasterFromDraftSession(LibraryItem draftSession) throws IOException {
+        if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
+            throw new IOException("select a draft session first");
+        }
+        List<DraftFrameRecord> records = listDraftFrameRecords(draftSession.id);
+        if (records.isEmpty()) {
+            throw new IOException("draft session has no readable frames");
+        }
+
+        long now = System.currentTimeMillis();
+        String id = newId();
+        File imageFile = new File(mastersDir, id + ".jpg");
+        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile);
+        File thumbnailFile = makeThumbnail(imageFile, id);
+        LibraryItem item = new LibraryItem(
+                id,
+                "Stitched PhotoSphere " + compactSessionLabel(draftSession.id),
+                LibraryItem.TYPE_MASTER,
+                "phase5_stitch",
+                "sphere",
+                draftSession.id,
+                imageFile.getAbsolutePath(),
+                thumbnailFile.getAbsolutePath(),
+                now,
+                now);
+        items.add(item);
+        save();
+        return new StitchMasterResult(item, stitch);
+    }
+
+    /*
      * Function: deleteDraftFrame
      * Arguments: imageFile is a CameraX draft JPEG selected from the Draft Frames
      * browser.
