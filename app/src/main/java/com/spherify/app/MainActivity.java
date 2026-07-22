@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.2.6");
+        version.setText("0.4.2");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -962,10 +962,12 @@ public class MainActivity extends Activity {
     /*
      * Function: showDraftFrames
      * Arguments: none.
-     * Calls: library.listDraftFrames(), Toast, AlertDialog.Builder, and
-     * openExternalApp().
-     * Flow: list CameraX draft JPEGs captured by CaptureActivity and let the
-     * user open one in any installed image app.
+     * Calls: library.listDraftFrames(), Toast, DraftFrameAdapter, ListView, and
+     * AlertDialog.Builder.
+     * Flow: list CameraX draft JPEGs captured by CaptureActivity, render them
+     * with the same tap/open and left-swipe deletion pattern used by gallery
+     * images, offer a confirmed bulk-remove action, and keep a dialog reference
+     * for empty-list dismissal.
      */
     private void showDraftFrames() {
         List<File> drafts = library.listDraftFrames();
@@ -973,14 +975,66 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "No draft frames captured yet", Toast.LENGTH_SHORT).show();
             return;
         }
-        String[] labels = new String[drafts.size()];
-        for (int i = 0; i < drafts.size(); i++) {
-            labels[i] = drafts.get(i).getName();
+
+        ListView listView = new ListView(this);
+        DraftFrameAdapter adapter = new DraftFrameAdapter(drafts);
+        listView.setAdapter(adapter);
+        listView.setDividerHeight(1);
+
+        activeLibraryDialog = new AlertDialog.Builder(this)
+                .setTitle("Draft Frames - swipe left to delete")
+                .setView(listView)
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Remove All Drafts", null)
+                .show();
+        activeLibraryDialog
+                .getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> confirmDeleteAllDraftFrames());
+        Toast.makeText(this, "Swipe left on a draft frame to delete it", Toast.LENGTH_SHORT).show();
+    }
+
+    /*
+     * Function: confirmDeleteAllDraftFrames
+     * Arguments: none.
+     * Calls: library.listDraftFrames(), AlertDialog.Builder, and
+     * deleteAllDraftFrames().
+     * Flow: ask for explicit confirmation before bulk-deleting raw draft frames,
+     * including the current count so the user understands the scope.
+     */
+    private void confirmDeleteAllDraftFrames() {
+        int count = library.listDraftFrames().size();
+        if (count == 0) {
+            Toast.makeText(this, "No draft frames to delete", Toast.LENGTH_SHORT).show();
+            return;
         }
         new AlertDialog.Builder(this)
-                .setTitle("Draft Frames")
-                .setItems(labels, (dialog, which) -> openExternalApp(drafts.get(which)))
+                .setTitle("Remove all draft frames?")
+                .setMessage("This will delete " + count
+                        + " draft frame" + (count == 1 ? "" : "s")
+                        + " from app storage. This action cannot be undone.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Remove All", (dialog, which) -> deleteAllDraftFrames())
                 .show();
+    }
+
+    /*
+     * Function: deleteAllDraftFrames
+     * Arguments: none.
+     * Calls: library.deleteAllDraftFrames(), AlertDialog.dismiss(), and Toast.
+     * Flow: clear every draft JPEG and draft metadata row, close the draft list
+     * because it is now empty, and show a concise completion message.
+     */
+    private void deleteAllDraftFrames() {
+        try {
+            library.deleteAllDraftFrames();
+            if (activeLibraryDialog != null) {
+                activeLibraryDialog.dismiss();
+                activeLibraryDialog = null;
+            }
+            Toast.makeText(this, "All draft frames removed", Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     /*
@@ -1279,6 +1333,28 @@ public class MainActivity extends Activity {
     }
 
     /*
+     * Function: deleteDraftFrame
+     * Arguments: draft is the frame file; adapter/visibleDrafts back the list;
+     * swipedRow is the animated row to reset if deletion is canceled.
+     * Calls: AlertDialog.Builder, resetSwipedRow(), and performDraftDelete().
+     * Flow: mirror normal gallery deletion for draft frames, including a clear
+     * confirmation before removing local capture data.
+     */
+    private void deleteDraftFrame(
+            File draft,
+            BaseAdapter adapter,
+            List<File> visibleDrafts,
+            View swipedRow) {
+        new AlertDialog.Builder(this)
+                .setTitle("Delete draft frame")
+                .setMessage("Are you sure you want to delete? This action cannot be undone.\n\n" + draft.getName())
+                .setNegativeButton("Cancel", (dialog, which) -> resetSwipedRow(swipedRow))
+                .setOnCancelListener(dialog -> resetSwipedRow(swipedRow))
+                .setPositiveButton("Delete", (dialog, which) -> performDraftDelete(draft, adapter, visibleDrafts))
+                .show();
+    }
+
+    /*
      * Function: deleteGalleryItem
      * Arguments: item is the target; adapter refreshes the ListView; visibleItems
      * is the mutable list shown by the adapter; swipedRow is the animated row
@@ -1339,6 +1415,30 @@ public class MainActivity extends Activity {
                 loadCurrentItem(null);
             }
             Toast.makeText(this, "Deleted " + item.title, Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /*
+     * Function: performDraftDelete
+     * Arguments: draft is the file to remove; adapter and visibleDrafts keep the
+     * Draft Frames ListView synchronized.
+     * Calls: library.deleteDraftFrame(), adapter.notifyDataSetChanged(),
+     * AlertDialog.dismiss(), and Toast.
+     * Flow: remove the JPEG plus matching draft metadata, delete the row from
+     * the visible list, close the dialog if no drafts remain, and show feedback.
+     */
+    private void performDraftDelete(File draft, BaseAdapter adapter, List<File> visibleDrafts) {
+        try {
+            library.deleteDraftFrame(draft);
+            visibleDrafts.remove(draft);
+            adapter.notifyDataSetChanged();
+            if (visibleDrafts.isEmpty() && activeLibraryDialog != null) {
+                activeLibraryDialog.dismiss();
+                activeLibraryDialog = null;
+            }
+            Toast.makeText(this, "Deleted " + draft.getName(), Toast.LENGTH_SHORT).show();
         } catch (IOException e) {
             Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -1438,6 +1538,188 @@ public class MainActivity extends Activity {
          * the generic control can update a specific projection property.
          */
         void onValueChanged(int value);
+    }
+
+    /*
+     * Class: DraftFrameAdapter
+     * Educational overview:
+     * Adapter that renders raw CameraX draft JPEG files in the Draft Frames
+     * browser. Drafts are not full LibraryItem records yet, but the user should
+     * still be able to inspect and delete them with the same list behavior as
+     * normal gallery images.
+     *
+     * Data flow:
+     * showDraftFrames() provides a mutable file list -> getView() renders each
+     * row -> tap opens the JPEG externally -> left swipe calls deleteDraftFrame()
+     * -> performDraftDelete() mutates the same list and notifies this adapter.
+     *
+     * Key variables:
+     * drafts: mutable list currently visible in the Draft Frames dialog.
+     */
+    private final class DraftFrameAdapter extends BaseAdapter {
+        private final List<File> drafts;
+
+        /*
+         * Function: DraftFrameAdapter constructor
+         * Arguments: drafts is the visible draft-file list.
+         * Calls: no external functions.
+         * Flow: store the list reference so row rendering and deletion stay in
+         * sync with showDraftFrames().
+         */
+        DraftFrameAdapter(List<File> drafts) {
+            this.drafts = drafts;
+        }
+
+        /*
+         * Function: getCount
+         * Arguments: none.
+         * Calls: List.size().
+         * Flow: tell ListView how many draft rows to request.
+         */
+        @Override
+        public int getCount() {
+            return drafts.size();
+        }
+
+        /*
+         * Function: getItem
+         * Arguments: position is the row index requested by ListView.
+         * Calls: List.get().
+         * Flow: return the draft File for a row.
+         */
+        @Override
+        public File getItem(int position) {
+            return drafts.get(position);
+        }
+
+        /*
+         * Function: getItemId
+         * Arguments: position is the row index requested by ListView.
+         * Calls: no external functions.
+         * Flow: use the row position as a simple id for this in-memory draft
+         * dialog list.
+         */
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        /*
+         * Function: getView
+         * Arguments: position identifies the row; convertView is unused because
+         * this custom row is rebuilt; parent is the ListView container.
+         * Calls: getItem(), BitmapFactory.decodeFile(), openExternalApp(),
+         * deleteDraftFrame(), and animation APIs.
+         * Flow: build a thumbnail/name/detail row layered over a red delete
+         * background, open on tap, reveal delete on left swipe, and confirm once
+         * the swipe passes the threshold.
+         */
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            File draft = getItem(position);
+            FrameLayout container = new FrameLayout(MainActivity.this);
+            container.setBackgroundColor(0xFFB91C1C);
+            container.setMinimumHeight(92);
+
+            TextView deleteLabel = new TextView(MainActivity.this);
+            deleteLabel.setText("Delete");
+            deleteLabel.setTextColor(0xFFFFFFFF);
+            deleteLabel.setTextSize(15);
+            deleteLabel.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+            deleteLabel.setPadding(18, 0, 24, 0);
+            deleteLabel.setAlpha(0f);
+            container.addView(deleteLabel, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+
+            LinearLayout row = new LinearLayout(MainActivity.this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(18, 10, 18, 10);
+            row.setBackgroundColor(0xFFFFFFFF);
+            row.setMinimumHeight(92);
+
+            ImageView thumbnail = new ImageView(MainActivity.this);
+            thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            Bitmap bitmap = BitmapFactory.decodeFile(draft.getAbsolutePath());
+            if (bitmap != null) {
+                thumbnail.setImageBitmap(bitmap);
+            }
+            LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(72, 72);
+            imageParams.setMargins(0, 0, 16, 0);
+            row.addView(thumbnail, imageParams);
+
+            LinearLayout labels = new LinearLayout(MainActivity.this);
+            labels.setOrientation(LinearLayout.VERTICAL);
+
+            TextView title = new TextView(MainActivity.this);
+            title.setText(draft.getName());
+            title.setTextColor(0xFF0F172A);
+            title.setTextSize(16);
+
+            TextView detail = new TextView(MainActivity.this);
+            detail.setText("Draft frame  |  " + draft.length() / 1024L + " KB");
+            detail.setTextColor(0xFF475569);
+            detail.setTextSize(12);
+
+            labels.addView(title);
+            labels.addView(detail);
+            row.addView(labels, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+            container.addView(row, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT));
+
+            float[] downX = new float[1];
+            float[] downY = new float[1];
+            boolean[] swiping = new boolean[1];
+            boolean[] deleted = new boolean[1];
+            container.setOnTouchListener((view, event) -> {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX[0] = event.getRawX();
+                        downY[0] = event.getRawY();
+                        swiping[0] = false;
+                        deleted[0] = false;
+                        deleteLabel.setAlpha(0f);
+                        row.setAlpha(1f);
+                        row.setTranslationX(0f);
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getRawX() - downX[0];
+                        float dy = event.getRawY() - downY[0];
+                        if (dx < 0 && Math.abs(dy) < GALLERY_DELETE_VERTICAL_SLOP) {
+                            swiping[0] = true;
+                            view.getParent().requestDisallowInterceptTouchEvent(true);
+                            row.setTranslationX(Math.max(dx, -GALLERY_DELETE_SWIPE_DISTANCE));
+                            deleteLabel.setAlpha(Math.min(1f, Math.max(0f, (-dx - 24f) / 80f)));
+                            if (!deleted[0] && dx <= -GALLERY_DELETE_SWIPE_DISTANCE) {
+                                deleted[0] = true;
+                                row.animate().translationX(-GALLERY_DELETE_SWIPE_DISTANCE).alpha(0.9f).setDuration(120).start();
+                                deleteDraftFrame(draft, DraftFrameAdapter.this, drafts, row);
+                            }
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        float totalDx = event.getRawX() - downX[0];
+                        float totalDy = event.getRawY() - downY[0];
+                        if (!swiping[0] && !deleted[0]
+                                && Math.abs(totalDx) < 24f
+                                && Math.abs(totalDy) < 24f) {
+                            openExternalApp(draft);
+                        } else if (!deleted[0]) {
+                            row.animate().translationX(0f).alpha(1f).setDuration(120).start();
+                            deleteLabel.animate().alpha(0f).setDuration(120).start();
+                        }
+                        return true;
+                    default:
+                        return true;
+                }
+            });
+            return container;
+        }
     }
 
     /*

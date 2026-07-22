@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.2.6
+Version: 0.4.2
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
 
-This repository now contains the first Android proof-of-concept application code. The 0.2.6 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, and simplified capture status messaging.
+This repository now contains the first Android proof-of-concept application code. The 0.4.2 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, safer delete confirmations, rotation-state restore, Android launcher badge assets, and a portrait CameraX capture shell with draft frames, sensor overlay, north pointer, mandatory compass calibration, graphical calibration progress, simplified capture status messaging, smoother guided PhotoSphere target tracking, default auto-capture, draft-frame deletion, and confirmed bulk draft removal.
 
 ## Developer Build and Run Runbook
 
@@ -15,7 +15,40 @@ Current status:
 - The repository has a Gradle wrapper, Android app module, launcher activity, bundled test panorama, and debug build.
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
-- The current Phase 3 prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, and draft frame capture.
+- The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, draft frame capture, an initial guided target grid for Phase 4 capture sessions, auto-capture on locked targets, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+
+### Version 0.4.2 Progress
+
+This build improves large draft-session cleanup:
+
+- Adds `Remove All Drafts` to the Draft Frames browser.
+- Requires a second confirmation dialog before bulk removal.
+- Deletes all draft JPEGs from app storage and resets `drafts.json` to an empty array.
+- Keeps single draft-frame swipe deletion available for targeted cleanup.
+
+### Version 0.2.8 Progress
+
+This build improves the Phase 4 guided capture prototype:
+
+- Enables auto-capture by default when the camera is aligned with the active target dot.
+- Shows a one-second shrinking pie countdown over the active capture dot while target lock is held.
+- Continues the countdown without requiring extra device movement, so a steady phone can trigger capture.
+- Dampens the guide grid with additional yaw/pitch smoothing to reduce noisy dot movement.
+- Lets Draft Frames use the same left-swipe confirmation deletion pattern as library images.
+- Removes deleted draft JPEGs and their matching `drafts.json` metadata rows.
+
+### Version 0.2.7 Progress
+
+This build makes the first inroads into Phase 4 guided PhotoSphere capture:
+
+- Adds a live yaw/pitch target grid over the CameraX preview.
+- Adds a center reticle with alignment and steady-hold feedback.
+- Adds target coverage progress so missing/weak coverage is visible before stitching exists.
+- Gates manual capture on compass calibration, target alignment, and short stability dwell.
+- Adds prototype auto-capture that reuses the same alignment and stability checks when enabled.
+- Adds pause/resume, undo, cancel, and finish controls for guided capture sessions.
+- Persists a recoverable draft session id across interruptions until the user finishes or cancels.
+- Records per-frame session id, approximate heading, pitch, roll, target yaw/pitch, timestamp, location summary, and a placeholder exposure field in `drafts.json`.
 
 ### Version 0.2.6 Progress
 
@@ -62,22 +95,22 @@ Windows PowerShell:
 
 ```powershell
 New-Item -ItemType Directory -Force preview-apks
-Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.2.6-debug.apk
+Copy-Item app\build\outputs\apk\debug\app-debug.apk preview-apks\spherify-0.4.2-debug.apk
 ```
 
 macOS/Linux:
 
 ```bash
 mkdir -p preview-apks
-cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.2.6-debug.apk
+cp app/build/outputs/apk/debug/app-debug.apk preview-apks/spherify-0.4.2-debug.apk
 ```
 
 3. Commit the copied APK only when you intentionally want previewers to download that exact build from the repository.
 
-Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.2.6-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
+Previewers can install the APK on an Android device by downloading `preview-apks/spherify-0.4.2-debug.apk`, enabling installation from their browser or file manager if prompted, and opening the file on the device. Developers can also install it over USB with:
 
 ```powershell
-adb install -r preview-apks\spherify-0.2.6-debug.apk
+adb install -r preview-apks\spherify-0.4.2-debug.apk
 ```
 
 The repository contains:
@@ -1055,7 +1088,7 @@ The Settings screen should include:
 - Accounts: Google Photos connection, Google Maps/Street View publishing connection.
 - Privacy: location tagging default, metadata export choices, permission status.
 - Diagnostics: sensor availability, compass calibration, camera capabilities, export logs.
-- About: version 0.2.6, license, acknowledgements.
+- About: version 0.4.2, license, acknowledgements.
 
 ### Suggested Setup-First UI Workflow
 
@@ -1357,6 +1390,17 @@ Work:
 - Add undo, pause/resume, cancel, and finish.
 - Store each frame with approximate orientation, timestamp, exposure data, and location/session metadata.
 - Add draft recovery if capture is interrupted.
+
+Current inroads:
+
+- Implemented a 24-target yaw/pitch guide grid in the portrait CameraX capture screen.
+- Implemented a center reticle, nearest-target highlighting, target alignment checks, short steady-hold gating, and coverage progress.
+- Implemented default auto-capture with a one-second target-lock countdown, while keeping manual capture available.
+- Dampened guide-grid yaw/pitch movement so sensor noise is less visually distracting.
+- Implemented undo, pause/resume, cancel, and finish session controls.
+- Extended draft metadata with a persistent session id, approximate orientation, target orientation, timestamp, location summary, capture mode, and an exposure placeholder.
+- Persisted the active guided session id so an interrupted capture can resume into the same draft session.
+- Implemented left-swipe deletion for raw draft frames and matching draft metadata cleanup.
 
 Exit criteria:
 

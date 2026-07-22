@@ -4,8 +4,8 @@
  * Educational overview:
  * SpherifyLibrary is the app's local persistence layer. Activities ask it to
  * import images, create bundled demo content, save exported variants, list
- * gallery items, rename/delete entries, create draft capture files, and record
- * draft metadata. The class deliberately keeps storage details out of
+ * gallery items, rename/delete entries, create/delete draft capture files, and
+ * record draft metadata. The class deliberately keeps storage details out of
  * MainActivity and CaptureActivity so those screens can focus on UI flow.
  *
  * Data flow:
@@ -15,8 +15,8 @@
  * files and MainActivity passes a ProjectionExport here; this class copies the
  * files into the library and optionally publishes the image to Android
  * MediaStore. For capture drafts, CaptureActivity asks for a destination JPEG
- * File, CameraX writes it, and recordDraftFrame() appends path/location data to
- * drafts.json.
+ * File, CameraX writes it, and recordDraftFrame() appends path/location/
+ * orientation/session data to drafts.json.
  *
  * External files/functions:
  * Reads the bundled asset stream supplied by MainActivity.
@@ -263,6 +263,72 @@ final class SpherifyLibrary {
     }
 
     /*
+     * Function: deleteDraftFrame
+     * Arguments: imageFile is a CameraX draft JPEG selected from the Draft Frames
+     * browser.
+     * Calls: deleteFile(), JSONArray/JSONObject parsing, and FileOutputStream.
+     * Flow: remove the JPEG from local storage, remove any matching metadata
+     * rows from drafts.json, and rewrite the draft index so recovery/stitching
+     * experiments no longer see a deleted frame.
+     */
+    void deleteDraftFrame(File imageFile) throws IOException {
+        String deletedPath = imageFile.getAbsolutePath();
+        deleteFile(imageFile);
+        if (!draftMetadataFile.exists()) {
+            return;
+        }
+
+        JSONArray source;
+        try (FileInputStream input = new FileInputStream(draftMetadataFile)) {
+            byte[] data = new byte[(int) draftMetadataFile.length()];
+            int read = input.read(data);
+            source = read > 0
+                    ? new JSONArray(new String(data, 0, read, StandardCharsets.UTF_8))
+                    : new JSONArray();
+        } catch (JSONException e) {
+            throw new IOException("draft metadata is corrupt", e);
+        }
+
+        JSONArray kept = new JSONArray();
+        try {
+            for (int i = 0; i < source.length(); i++) {
+                JSONObject json = source.getJSONObject(i);
+                if (!deletedPath.equals(json.optString("path", ""))) {
+                    kept.put(json);
+                }
+            }
+            try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
+                output.write(kept.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (JSONException e) {
+            throw new IOException("could not update draft metadata", e);
+        }
+    }
+
+    /*
+     * Function: deleteAllDraftFrames
+     * Arguments: none.
+     * Calls: File.listFiles(), deleteFile(), JSONArray.toString(), and
+     * FileOutputStream.
+     * Flow: remove every CameraX draft JPEG from the drafts folder and reset
+     * drafts.json to an empty array so large draft sessions can be cleared in
+     * one confirmed action.
+     */
+    void deleteAllDraftFrames() throws IOException {
+        File[] files = draftsDir.listFiles((dir, name) -> name.endsWith(".jpg"));
+        if (files != null) {
+            for (File file : files) {
+                deleteFile(file);
+            }
+        }
+        try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
+            output.write(new JSONArray().toString(2).getBytes(StandardCharsets.UTF_8));
+        } catch (JSONException e) {
+            throw new IOException("could not reset draft metadata", e);
+        }
+    }
+
+    /*
      * Function: rename
      * Arguments: item is the LibraryItem to mutate; title is the replacement
      * user-visible label.
@@ -321,13 +387,25 @@ final class SpherifyLibrary {
 
     /*
      * Function: recordDraftFrame
-     * Arguments: imageFile is the CameraX-written draft JPEG; locationSummary is
-     * an optional lat/long string from CaptureActivity.
+     * Arguments: imageFile is the CameraX-written draft JPEG; sessionId groups
+     * frames into one guided capture attempt; locationSummary is an optional
+     * lat/long string; heading/pitch/roll approximate the phone orientation;
+     * targetYaw/targetPitch identify the guide target being covered; captureMode
+     * records whether the frame came from manual or auto capture.
      * Calls: JSONArray/JSONObject parsing and FileOutputStream.
      * Flow: load existing drafts.json if present, append a new path/timestamp/
-     * location object, and rewrite the formatted JSON file.
+     * location/orientation/target object, and rewrite the formatted JSON file.
      */
-    void recordDraftFrame(File imageFile, String locationSummary) throws IOException {
+    void recordDraftFrame(
+            File imageFile,
+            String sessionId,
+            String locationSummary,
+            float headingDegrees,
+            float pitchDegrees,
+            float rollDegrees,
+            int targetYawDegrees,
+            int targetPitchDegrees,
+            String captureMode) throws IOException {
         JSONArray array = new JSONArray();
         if (draftMetadataFile.exists()) {
             try (FileInputStream input = new FileInputStream(draftMetadataFile)) {
@@ -343,8 +421,16 @@ final class SpherifyLibrary {
         try {
             JSONObject json = new JSONObject();
             json.put("path", imageFile.getAbsolutePath());
+            json.put("sessionId", sessionId == null ? "" : sessionId);
             json.put("createdAt", System.currentTimeMillis());
             json.put("location", locationSummary == null ? "" : locationSummary);
+            json.put("headingDegrees", headingDegrees);
+            json.put("pitchDegrees", pitchDegrees);
+            json.put("rollDegrees", rollDegrees);
+            json.put("targetYawDegrees", targetYawDegrees);
+            json.put("targetPitchDegrees", targetPitchDegrees);
+            json.put("captureMode", captureMode == null ? "manual" : captureMode);
+            json.put("exposure", "not recorded yet");
             array.put(json);
             try (FileOutputStream output = new FileOutputStream(draftMetadataFile)) {
                 output.write(array.toString(2).getBytes(StandardCharsets.UTF_8));

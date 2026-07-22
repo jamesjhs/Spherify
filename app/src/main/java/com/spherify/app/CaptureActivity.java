@@ -2,12 +2,13 @@
  * CaptureActivity.java
  *
  * Educational overview:
- * CaptureActivity is the Phase 3 capture shell. It shows a live CameraX preview,
- * captures draft JPEG frames, reads available motion/orientation sensors, and
- * optionally displays those sensor readings as an overlay on top of the preview.
- * It does not stitch a full Photo Sphere yet; instead it creates draft frame
- * files and draft metadata that later phases can use for guided capture,
- * alignment, and review.
+ * CaptureActivity is the Phase 3 capture shell with Phase 4 guided-capture
+ * scaffolding. It shows a live CameraX preview, captures draft JPEG frames,
+ * reads available motion/orientation sensors, displays optional diagnostics, and
+ * overlays a simple yaw/pitch target grid so a user can begin collecting sphere
+ * coverage deliberately. It does not stitch a full Photo Sphere yet; instead it
+ * creates draft frame files and draft metadata that later phases can use for
+ * guided capture, alignment, and review.
  *
  * Data flow:
  * User taps Capture in MainActivity -> MainActivity opens this Activity after
@@ -16,7 +17,8 @@
  * writes a JPEG -> readLocationSummary() optionally adds last-known location ->
  * SpherifyLibrary appends draft metadata to drafts.json. In parallel, Android's
  * SensorManager sends accelerometer/gyroscope/magnetometer/rotation-vector
- * events to onSensorChanged(), which refreshes the overlay TextView.
+ * events to onSensorChanged(), which refreshes both the diagnostic TextView and
+ * the guided target overlay.
  *
  * External files/functions:
  * Uses CameraX classes from androidx.camera.* to bind preview and image capture.
@@ -34,12 +36,15 @@
  * sensorManager and sensor fields: Android motion/orientation sensor handles.
  * sensorOverlayVisible: current overlay visibility state.
  * compassAccuracy: most recent magnetometer calibration status.
+ * guideView: Phase 4 target grid and reticle overlay.
+ * sessionId: persistent id for this interrupted/resumed guided capture draft.
  * *Reading strings: latest formatted sensor values or "waiting".
  */
 package com.spherify.app;
 
 import android.Manifest;
 import android.app.AlertDialog;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Paint;
@@ -75,19 +80,27 @@ import com.google.common.util.concurrent.ListenableFuture;
 import java.io.File;
 import java.io.IOException;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class CaptureActivity extends ComponentActivity implements SensorEventListener {
+    private static final String PREFS = "spherify_capture";
+    private static final String PREF_ACTIVE_SESSION_ID = "activeSessionId";
     private static final long REQUIRED_COMPASS_HIGH_ACCURACY_MS = 2000L;
     private static final long REQUIRED_CALIBRATION_DURATION_MS = 8000L;
     private static final long REQUIRED_HEADING_STABILITY_MS = 1000L;
+    private static final long REQUIRED_TARGET_LOCK_MS = 1000L;
     private static final int REQUIRED_HEADING_BINS = 8;
     private static final float MAX_STABLE_HEADING_DELTA_DEGREES = 4f;
+    private static final float MAX_TARGET_YAW_DELTA_DEGREES = 10f;
+    private static final float MAX_TARGET_PITCH_DELTA_DEGREES = 9f;
     private static final float REQUIRED_TILT_VARIATION = 0.55f;
     private static final int HEADING_BIN_COUNT = 12;
     private static final float SENSOR_LOW_PASS_ALPHA = 0.18f;
     private static final float HEADING_SMOOTHING_ALPHA = 0.14f;
+    private static final float GUIDE_HEADING_SMOOTHING_ALPHA = 0.08f;
+    private static final float GUIDE_PITCH_SMOOTHING_ALPHA = 0.10f;
 
     private PreviewView previewView;
     private TextView statusText;
@@ -95,12 +108,16 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private TextView compassStatusText;
     private CompassNeedleView compassNeedleView;
     private CalibrationProgressView calibrationProgressView;
+    private TargetGuideView guideView;
     private Button captureButton;
     private Button sensorOverlayButton;
     private Button calibrationButton;
+    private Button pauseButton;
+    private Button autoCaptureButton;
     private ImageCapture imageCapture;
     private ExecutorService cameraExecutor;
     private SpherifyLibrary library;
+    private SharedPreferences capturePrefs;
     private SensorManager sensorManager;
     private Sensor accelerometer;
     private Sensor gyroscope;
@@ -126,13 +143,30 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private boolean hasFilteredMagnetometerReading;
     private boolean hasHeadingReading;
     private boolean hasSmoothedHeadingReading;
+    private boolean hasPitchRollReading;
     private boolean calibrationStarted;
+    private boolean capturePaused;
+    private boolean autoCaptureEnabled = true;
+    private boolean captureInProgress;
+    private boolean guideRefreshPosted;
     private long calibrationStartedAt;
     private long highAccuracyStartedAt;
     private long stableHeadingStartedAt;
+    private long targetAlignedStartedAt;
+    private long lastAutoCaptureAt;
     private float compassHeadingDegrees;
     private float rawCompassHeadingDegrees;
     private float lastCompassHeadingDegrees;
+    private float pitchDegrees;
+    private float rollDegrees;
+    private float guideHeadingDegrees;
+    private float guidePitchDegrees;
+    private String sessionId;
+    private int activeTargetIndex;
+    private int lastCapturedTargetIndex = -1;
+    private boolean hasGuideHeadingReading;
+    private boolean hasGuidePitchReading;
+    private final CaptureTarget[] captureTargets = buildCaptureTargets();
     private float minAccelX = Float.MAX_VALUE;
     private float maxAccelX = -Float.MAX_VALUE;
     private float minAccelY = Float.MAX_VALUE;
@@ -158,6 +192,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             library = new SpherifyLibrary(this);
         } catch (IOException e) {
             throw new IllegalStateException("could not open capture library", e);
+        }
+        capturePrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        sessionId = capturePrefs.getString(PREF_ACTIVE_SESSION_ID, "");
+        if (sessionId.isEmpty()) {
+            sessionId = newSessionId();
+            capturePrefs.edit().putString(PREF_ACTIVE_SESSION_ID, sessionId).apply();
         }
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         if (sensorManager != null) {
@@ -212,6 +252,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         calibrationParams.setMargins(12, 0, 12, 14);
         previewFrame.addView(calibrationProgressView, calibrationParams);
 
+        guideView = new TargetGuideView(this);
+        previewFrame.addView(guideView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
         sensorOverlayText = new TextView(this);
         sensorOverlayText.setTextColor(0xFFFFFFFF);
         sensorOverlayText.setTextSize(12);
@@ -236,19 +281,36 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         controls.setGravity(Gravity.CENTER);
         controls.setPadding(10, 10, 10, 14);
 
-        captureButton = makeButton("Capture Frame");
+        captureButton = makeButton("Capture");
         captureButton.setOnClickListener(v -> captureFrame());
+        Button undoButton = makeButton("Undo");
+        undoButton.setOnClickListener(v -> undoLastTarget());
+        pauseButton = makeButton("Pause");
+        pauseButton.setOnClickListener(v -> toggleCapturePaused());
+        autoCaptureButton = makeButton("Auto On");
+        autoCaptureButton.setOnClickListener(v -> toggleAutoCapture());
         sensorOverlayButton = makeButton("Show Sensors");
         sensorOverlayButton.setOnClickListener(v -> toggleSensorOverlay());
         calibrationButton = makeButton("Calibrate");
         calibrationButton.setOnClickListener(v -> startCompassCalibration());
         Button finishButton = makeButton("Finish");
-        finishButton.setOnClickListener(v -> finish());
+        finishButton.setOnClickListener(v -> finishCaptureSession());
+        Button cancelButton = makeButton("Cancel");
+        cancelButton.setOnClickListener(v -> cancelCaptureSession());
         controls.addView(captureButton);
-        controls.addView(calibrationButton);
-        controls.addView(sensorOverlayButton);
-        controls.addView(finishButton);
+        controls.addView(undoButton);
+        controls.addView(pauseButton);
+        controls.addView(autoCaptureButton);
+        controls.addView(cancelButton);
         root.addView(controls);
+
+        LinearLayout secondaryControls = new LinearLayout(this);
+        secondaryControls.setGravity(Gravity.CENTER);
+        secondaryControls.setPadding(10, 0, 10, 14);
+        secondaryControls.addView(calibrationButton);
+        secondaryControls.addView(sensorOverlayButton);
+        secondaryControls.addView(finishButton);
+        root.addView(secondaryControls);
 
         setContentView(root);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -467,6 +529,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 + "Gyroscope: " + sensorLine(gyroscope, gyroscopeReading) + "\n"
                 + "Compass/magnetometer: " + sensorLine(magnetometer, magnetometerReading) + "\n"
                 + "Rotation vector: " + sensorLine(rotationVector, rotationVectorReading) + "\n"
+                + "Guide orientation: " + guideOrientationSummary() + "\n"
                 + "Compass calibration: " + compassCalibrationStatus() + "\n"
                 + "Calibration progress: " + compassCalibrationProgress());
     }
@@ -611,6 +674,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return;
         }
         SensorManager.getOrientation(rotationMatrix, orientationValues);
+        acceptPitchRoll();
         acceptCompassHeading((float) Math.toDegrees(orientationValues[0]));
     }
 
@@ -626,7 +690,23 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private void updateCompassHeadingFromRotationVector(float[] values) {
         SensorManager.getRotationMatrixFromVector(rotationVectorMatrix, values);
         SensorManager.getOrientation(rotationVectorMatrix, orientationValues);
+        acceptPitchRoll();
         acceptCompassHeading((float) Math.toDegrees(orientationValues[0]));
+    }
+
+    /*
+     * Function: acceptPitchRoll
+     * Arguments: none; reads the latest values in orientationValues.
+     * Calls: Math.toDegrees() and updateGuideState().
+     * Flow: convert Android's pitch/roll radians into degrees, store them for
+     * draft metadata, and refresh Phase 4 target alignment whenever orientation
+     * data changes.
+     */
+    private void acceptPitchRoll() {
+        pitchDegrees = (float) Math.toDegrees(orientationValues[1]);
+        rollDegrees = (float) Math.toDegrees(orientationValues[2]);
+        hasPitchRollReading = true;
+        updateGuideState();
     }
 
     /*
@@ -646,6 +726,57 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (compassNeedleView != null) {
             compassNeedleView.setHeadingDegrees(compassHeadingDegrees);
         }
+        updateGuideState();
+    }
+
+    /*
+     * Function: updateGuideState
+     * Arguments: none.
+     * Calls: nearestOpenTargetIndex(), targetAligned(), coverageProgress(),
+     * TargetGuideView.setGuideState(), and maybeAutoCapture().
+     * Flow: select the next useful sphere target, measure yaw/pitch alignment
+     * and dwell stability, update the overlay, then optionally trigger capture
+     * when the user has enabled auto mode.
+     */
+    private void updateGuideState() {
+        if (!hasHeadingReading || !hasPitchRollReading) {
+            return;
+        }
+        guideHeadingDegrees = smoothGuideHeading(compassHeadingDegrees);
+        guidePitchDegrees = smoothGuidePitch(pitchDegrees);
+        int nearest = nearestOpenTargetIndex();
+        boolean aligned = nearest >= 0 && targetAligned(captureTargets[nearest]);
+        long now = System.currentTimeMillis();
+        if (aligned) {
+            if (nearest != activeTargetIndex || targetAlignedStartedAt == 0L) {
+                targetAlignedStartedAt = now;
+            }
+        } else {
+            targetAlignedStartedAt = 0L;
+        }
+        activeTargetIndex = nearest;
+        boolean stable = isTargetStable();
+        float lockProgress = targetLockProgress();
+        if (guideView != null) {
+            guideView.setGuideState(
+                    captureTargets,
+                    activeTargetIndex,
+                    guideHeadingDegrees,
+                    guidePitchDegrees,
+                    aligned,
+                    stable,
+                    lockProgress,
+                    coverageProgress(),
+                    capturePaused);
+            if (aligned && !stable && !guideRefreshPosted) {
+                guideRefreshPosted = true;
+                guideView.postDelayed(() -> {
+                    guideRefreshPosted = false;
+                    updateGuideState();
+                }, 33L);
+            }
+        }
+        maybeAutoCapture();
     }
 
     /*
@@ -669,6 +800,42 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         double y = (1.0 - HEADING_SMOOTHING_ALPHA) * Math.sin(currentRadians)
                 + HEADING_SMOOTHING_ALPHA * Math.sin(targetRadians);
         return normalizeHeading((float) Math.toDegrees(Math.atan2(y, x)));
+    }
+
+    /*
+     * Function: smoothGuideHeading
+     * Arguments: headingDegrees is the already-smoothed compass heading.
+     * Calls: normalizeHeading(), Math.sin(), Math.cos(), and Math.atan2().
+     * Flow: apply a second, slower circular smoothing pass for overlay movement
+     * so the target grid feels calm even while raw sensor callbacks are noisy.
+     */
+    private float smoothGuideHeading(float headingDegrees) {
+        if (!hasGuideHeadingReading) {
+            hasGuideHeadingReading = true;
+            return normalizeHeading(headingDegrees);
+        }
+        double currentRadians = Math.toRadians(guideHeadingDegrees);
+        double targetRadians = Math.toRadians(headingDegrees);
+        double x = (1.0 - GUIDE_HEADING_SMOOTHING_ALPHA) * Math.cos(currentRadians)
+                + GUIDE_HEADING_SMOOTHING_ALPHA * Math.cos(targetRadians);
+        double y = (1.0 - GUIDE_HEADING_SMOOTHING_ALPHA) * Math.sin(currentRadians)
+                + GUIDE_HEADING_SMOOTHING_ALPHA * Math.sin(targetRadians);
+        return normalizeHeading((float) Math.toDegrees(Math.atan2(y, x)));
+    }
+
+    /*
+     * Function: smoothGuidePitch
+     * Arguments: pitchDegrees is the latest measured device pitch.
+     * Calls: no external helpers.
+     * Flow: apply a slow moving average to vertical guide movement so pitch noise
+     * does not make the active dot flicker around the reticle.
+     */
+    private float smoothGuidePitch(float pitchDegrees) {
+        if (!hasGuidePitchReading) {
+            hasGuidePitchReading = true;
+            return pitchDegrees;
+        }
+        return guidePitchDegrees + GUIDE_PITCH_SMOOTHING_ALPHA * (pitchDegrees - guidePitchDegrees);
     }
 
     /*
@@ -754,7 +921,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     ready ? "ready" : "calibrate"));
         }
         if (captureButton != null) {
-            captureButton.setEnabled(ready);
+            captureButton.setEnabled(ready && !capturePaused && imageCapture != null);
         }
         if (calibrationButton != null) {
             calibrationButton.setText(ready ? "Recalibrate" : "Calibrate");
@@ -773,9 +940,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             if (!ready) {
                 statusText.setText("Calibration needed");
             } else if (!"Image captured".contentEquals(statusText.getText())) {
-                statusText.setText("Capture ready");
+                statusText.setText(capturePaused ? "Capture paused" : "Capture ready");
             }
         }
+        updateGuideState();
     }
 
     /*
@@ -935,6 +1103,268 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
+     * Function: guideOrientationSummary
+     * Arguments: none.
+     * Calls: String.format(Locale.US).
+     * Flow: provide a compact yaw/pitch/roll line for the optional sensor
+     * overlay so Phase 4 guidance can be debugged without reading raw vectors.
+     */
+    private String guideOrientationSummary() {
+        if (!hasHeadingReading || !hasPitchRollReading) {
+            return "waiting";
+        }
+        return String.format(
+                Locale.US,
+                "yaw %.0f, pitch %.0f, roll %.0f",
+                compassHeadingDegrees,
+                pitchDegrees,
+                rollDegrees);
+    }
+
+    /*
+     * Function: nearestOpenTargetIndex
+     * Arguments: none.
+     * Calls: targetDistanceScore().
+     * Flow: choose the uncovered guide target closest to the current phone
+     * orientation, giving the reticle one clear place to guide the user.
+     */
+    private int nearestOpenTargetIndex() {
+        int bestIndex = -1;
+        float bestScore = Float.MAX_VALUE;
+        for (int i = 0; i < captureTargets.length; i++) {
+            if (captureTargets[i].captured) {
+                continue;
+            }
+            float score = targetDistanceScore(captureTargets[i]);
+            if (score < bestScore) {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+        return bestIndex;
+    }
+
+    /*
+     * Function: targetDistanceScore
+     * Arguments: target is one yaw/pitch guide point.
+     * Calls: headingDeltaDegrees() and Math.abs().
+     * Flow: combine yaw and pitch distance into one simple score for nearest
+     * target selection.
+     */
+    private float targetDistanceScore(CaptureTarget target) {
+        return headingDeltaDegrees(guideHeadingDegrees, target.yawDegrees)
+                + Math.abs(guidePitchDegrees - target.pitchDegrees) * 1.4f;
+    }
+
+    /*
+     * Function: targetAligned
+     * Arguments: target is the candidate guide point.
+     * Calls: headingDeltaDegrees() and Math.abs().
+     * Flow: decide whether the reticle is close enough to capture a useful
+     * overlapping frame for this prototype grid.
+     */
+    private boolean targetAligned(CaptureTarget target) {
+        return headingDeltaDegrees(guideHeadingDegrees, target.yawDegrees)
+                <= MAX_TARGET_YAW_DELTA_DEGREES
+                && Math.abs(guidePitchDegrees - target.pitchDegrees)
+                <= MAX_TARGET_PITCH_DELTA_DEGREES;
+    }
+
+    /*
+     * Function: isTargetStable
+     * Arguments: none.
+     * Calls: System.currentTimeMillis().
+     * Flow: require the phone to dwell on a target briefly before calling the
+     * alignment stable enough for manual or automatic capture.
+     */
+    private boolean isTargetStable() {
+        return targetAlignedStartedAt > 0L
+                && System.currentTimeMillis() - targetAlignedStartedAt >= REQUIRED_TARGET_LOCK_MS;
+    }
+
+    /*
+     * Function: targetLockProgress
+     * Arguments: none.
+     * Calls: System.currentTimeMillis() and clamp01().
+     * Flow: convert the current active-target lock time into a 0..1 countdown
+     * fraction for the pie chart drawn over the active dot.
+     */
+    private float targetLockProgress() {
+        if (targetAlignedStartedAt == 0L) {
+            return 0f;
+        }
+        return clamp01((System.currentTimeMillis() - targetAlignedStartedAt)
+                / (float) REQUIRED_TARGET_LOCK_MS);
+    }
+
+    /*
+     * Function: coverageProgress
+     * Arguments: none.
+     * Calls: no helpers.
+     * Flow: count captured targets and convert them into a fraction for the
+     * overlay and finish summary.
+     */
+    private float coverageProgress() {
+        int captured = 0;
+        for (CaptureTarget target : captureTargets) {
+            if (target.captured) {
+                captured++;
+            }
+        }
+        return captured / (float) captureTargets.length;
+    }
+
+    /*
+     * Function: capturedTargetCount
+     * Arguments: none.
+     * Calls: no helpers.
+     * Flow: count covered targets for user-facing completion text.
+     */
+    private int capturedTargetCount() {
+        int captured = 0;
+        for (CaptureTarget target : captureTargets) {
+            if (target.captured) {
+                captured++;
+            }
+        }
+        return captured;
+    }
+
+    /*
+     * Function: maybeAutoCapture
+     * Arguments: none.
+     * Calls: captureFrame() and System.currentTimeMillis().
+     * Flow: auto-capture once calibration, reticle alignment, and the one-second
+     * lock countdown are all satisfied.
+     */
+    private void maybeAutoCapture() {
+        long now = System.currentTimeMillis();
+        if (autoCaptureEnabled
+                && isCaptureAllowed()
+                && isTargetStable()
+                && now - lastAutoCaptureAt > 1300L) {
+            lastAutoCaptureAt = now;
+            captureFrame("auto");
+        }
+    }
+
+    /*
+     * Function: isCaptureAllowed
+     * Arguments: none.
+     * Calls: isCompassCalibrationReady().
+     * Flow: centralize all capture gates so manual and auto-capture follow the
+     * same paused/calibrated/camera-ready/in-progress rules.
+     */
+    private boolean isCaptureAllowed() {
+        return !capturePaused
+                && !captureInProgress
+                && imageCapture != null
+                && isCompassCalibrationReady()
+                && activeTargetIndex >= 0;
+    }
+
+    /*
+     * Function: toggleCapturePaused
+     * Arguments: none; invoked by the Pause/Resume button.
+     * Calls: Button.setText(), updateGuideState(), and Toast.
+     * Flow: pause guidance and capture without leaving the Activity, letting the
+     * user reposition or take a break mid-session.
+     */
+    private void toggleCapturePaused() {
+        capturePaused = !capturePaused;
+        pauseButton.setText(capturePaused ? "Resume" : "Pause");
+        Toast.makeText(this, capturePaused ? "Capture paused" : "Capture resumed", Toast.LENGTH_SHORT).show();
+        updateGuideState();
+    }
+
+    /*
+     * Function: toggleAutoCapture
+     * Arguments: none; invoked by the Auto button.
+     * Calls: Button.setText(), Toast, and maybeAutoCapture().
+     * Flow: expose the Phase 4 auto-capture prototype while keeping manual
+     * capture as the default path.
+     */
+    private void toggleAutoCapture() {
+        autoCaptureEnabled = !autoCaptureEnabled;
+        autoCaptureButton.setText(autoCaptureEnabled ? "Auto On" : "Auto Off");
+        Toast.makeText(
+                this,
+                autoCaptureEnabled ? "Auto capture waits for stable alignment" : "Manual capture only",
+                Toast.LENGTH_SHORT).show();
+        maybeAutoCapture();
+    }
+
+    /*
+     * Function: undoLastTarget
+     * Arguments: none.
+     * Calls: Toast and updateGuideState().
+     * Flow: remove the latest target coverage mark. The already-written JPEG
+     * remains in the draft folder for recovery, but the guide lets the user
+     * recapture that direction.
+     */
+    private void undoLastTarget() {
+        if (lastCapturedTargetIndex < 0) {
+            Toast.makeText(this, "No target to undo", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        captureTargets[lastCapturedTargetIndex].captured = false;
+        lastCapturedTargetIndex = -1;
+        Toast.makeText(this, "Last target reopened", Toast.LENGTH_SHORT).show();
+        updateGuideState();
+    }
+
+    /*
+     * Function: finishCaptureSession
+     * Arguments: none; invoked by Finish.
+     * Calls: AlertDialog.Builder, clearActiveSession(), and finish().
+     * Flow: summarize coverage before ending the draft session so the user knows
+     * whether enough frames exist for later stitching experiments.
+     */
+    private void finishCaptureSession() {
+        int captured = capturedTargetCount();
+        new AlertDialog.Builder(this)
+                .setTitle("Finish draft capture?")
+                .setMessage("Captured " + captured + " of " + captureTargets.length
+                        + " guide targets.\n\nDraft frames remain saved for Phase 5 stitching experiments.")
+                .setNegativeButton("Keep capturing", null)
+                .setPositiveButton("Finish", (dialog, which) -> {
+                    clearActiveSession();
+                    finish();
+                })
+                .show();
+    }
+
+    /*
+     * Function: cancelCaptureSession
+     * Arguments: none; invoked by Cancel.
+     * Calls: AlertDialog.Builder, clearActiveSession(), and finish().
+     * Flow: leave already-saved draft files intact but abandon this active
+     * guidance session id so the next capture starts fresh.
+     */
+    private void cancelCaptureSession() {
+        new AlertDialog.Builder(this)
+                .setTitle("Cancel capture?")
+                .setMessage("Saved draft frames will stay in app storage, but this guided session will close.")
+                .setNegativeButton("Keep capturing", null)
+                .setPositiveButton("Cancel capture", (dialog, which) -> {
+                    clearActiveSession();
+                    finish();
+                })
+                .show();
+    }
+
+    /*
+     * Function: clearActiveSession
+     * Arguments: none.
+     * Calls: SharedPreferences.Editor.remove().
+     * Flow: remove the persisted session id once the user explicitly finishes or
+     * cancels, while interruption without either action keeps the draft recoverable.
+     */
+    private void clearActiveSession() {
+        capturePrefs.edit().remove(PREF_ACTIVE_SESSION_ID).apply();
+    }
+
+    /*
      * Function: normalizeHeading
      * Arguments: degrees is any heading angle.
      * Calls: modulo arithmetic only.
@@ -1025,15 +1455,31 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
+     * Function: captureFrame overload
+     * Arguments: none; invoked by the Capture button.
+     * Calls: captureFrame("manual").
+     * Flow: route user-initiated capture through the shared capture path while
+     * preserving the capture mode for draft metadata.
+     */
+    private void captureFrame() {
+        captureFrame("manual");
+    }
+
+    /*
      * Function: captureFrame
-     * Arguments: none; invoked by the Capture Frame button.
+     * Arguments: captureMode is "manual" or "auto" for draft metadata.
      * Calls: SpherifyLibrary.createDraftFrameFile(), ImageCapture.takePicture(),
      * readLocationSummary(), SpherifyLibrary.recordDraftFrame(), Toast, and
      * runOnUiThread().
-     * Flow: ensure CameraX is ready, allocate an output JPEG, capture into it on
-     * the background executor, then record metadata and notify the UI.
+     * Flow: ensure CameraX/calibration/guidance are ready, allocate an output
+     * JPEG, capture into it on the background executor, then record metadata,
+     * mark target coverage, and notify the UI.
      */
-    private void captureFrame() {
+    private void captureFrame(String captureMode) {
+        if (capturePaused) {
+            Toast.makeText(this, "Capture is paused", Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (!isCompassCalibrationReady()) {
             String message = "Capture locked until compass calibration completes. "
                     + compassCalibrationProgress();
@@ -1045,6 +1491,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             Toast.makeText(this, "Camera is not ready yet", Toast.LENGTH_SHORT).show();
             return;
         }
+        if (activeTargetIndex < 0 || !targetAligned(captureTargets[activeTargetIndex])) {
+            Toast.makeText(this, "Line up the reticle with an open target first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!isTargetStable()) {
+            Toast.makeText(this, "Hold steady on the target", Toast.LENGTH_SHORT).show();
+            return;
+        }
 
         File outputFile;
         try {
@@ -1054,6 +1508,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return;
         }
 
+        captureInProgress = true;
+        int targetIndex = activeTargetIndex;
+        CaptureTarget target = captureTargets[targetIndex];
         ImageCapture.OutputFileOptions outputOptions =
                 new ImageCapture.OutputFileOptions.Builder(outputFile).build();
         imageCapture.takePicture(outputOptions, cameraExecutor, new ImageCapture.OnImageSavedCallback() {
@@ -1070,16 +1527,32 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             public void onImageSaved(ImageCapture.OutputFileResults outputFileResults) {
                 String location = readLocationSummary();
                 try {
-                    library.recordDraftFrame(outputFile, location);
+                    library.recordDraftFrame(
+                            outputFile,
+                            sessionId,
+                            location,
+                            compassHeadingDegrees,
+                            pitchDegrees,
+                            rollDegrees,
+                            target.yawDegrees,
+                            target.pitchDegrees,
+                            captureMode);
                     runOnUiThread(() -> {
+                        captureInProgress = false;
+                        target.captured = true;
+                        lastCapturedTargetIndex = targetIndex;
                         statusText.setText("Image captured");
+                        updateGuideState();
                         Toast.makeText(CaptureActivity.this, "Draft frame saved", Toast.LENGTH_SHORT).show();
                     });
                 } catch (IOException e) {
-                    runOnUiThread(() -> Toast.makeText(
-                            CaptureActivity.this,
-                            "Metadata failed: " + e.getMessage(),
-                            Toast.LENGTH_LONG).show());
+                    runOnUiThread(() -> {
+                        captureInProgress = false;
+                        Toast.makeText(
+                                CaptureActivity.this,
+                                "Metadata failed: " + e.getMessage(),
+                                Toast.LENGTH_LONG).show();
+                    });
                 }
             }
 
@@ -1092,10 +1565,13 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
              */
             @Override
             public void onError(ImageCaptureException exception) {
-                runOnUiThread(() -> Toast.makeText(
-                        CaptureActivity.this,
-                        "Capture failed: " + exception.getMessage(),
-                        Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> {
+                    captureInProgress = false;
+                    Toast.makeText(
+                            CaptureActivity.this,
+                            "Capture failed: " + exception.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
             }
         });
     }
@@ -1130,6 +1606,312 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return "";
         }
         return String.format(Locale.US, "%.6f,%.6f", location.getLatitude(), location.getLongitude());
+    }
+
+    /*
+     * Function: buildCaptureTargets
+     * Arguments: none.
+     * Calls: CaptureTarget constructor.
+     * Flow: create the first Phase 4 sphere guide as three pitch bands and eight
+     * yaw positions, enough overlap for future stitching experiments without
+     * overwhelming this prototype UI.
+     */
+    private static CaptureTarget[] buildCaptureTargets() {
+        int[] pitchRows = {-35, 0, 35};
+        int[] yawColumns = {0, 45, 90, 135, 180, 225, 270, 315};
+        CaptureTarget[] targets = new CaptureTarget[pitchRows.length * yawColumns.length];
+        int index = 0;
+        for (int pitch : pitchRows) {
+            for (int yaw : yawColumns) {
+                targets[index] = new CaptureTarget(yaw, pitch);
+                index++;
+            }
+        }
+        return targets;
+    }
+
+    /*
+     * Function: newSessionId
+     * Arguments: none.
+     * Calls: UUID.randomUUID() and String.replace().
+     * Flow: create a compact stable id for all frames in one guided capture
+     * attempt so interrupted drafts can be recognized later.
+     */
+    private static String newSessionId() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
+    /*
+     * Class: CaptureTarget
+     * Educational overview:
+     * Value object for one target in the Phase 4 guided capture grid. A target is
+     * deliberately small: approximate yaw, approximate pitch, and whether the
+     * user has already captured a frame for that coverage point.
+     */
+    private static final class CaptureTarget {
+        final int yawDegrees;
+        final int pitchDegrees;
+        boolean captured;
+
+        /*
+         * Function: CaptureTarget constructor
+         * Arguments: yawDegrees and pitchDegrees define the desired orientation.
+         * Calls: no helpers.
+         * Flow: store the orientation target used by TargetGuideView and draft
+         * metadata recording.
+         */
+        CaptureTarget(int yawDegrees, int pitchDegrees) {
+            this.yawDegrees = yawDegrees;
+            this.pitchDegrees = pitchDegrees;
+        }
+    }
+
+    /*
+     * Class: TargetGuideView
+     * Educational overview:
+     * Draws the Phase 4 capture guide over the live CameraX preview. It shows a
+     * fixed reticle in the middle, nearby yaw/pitch targets around it, captured
+     * targets as green dots, the active target as a larger ring with a one-
+     * second countdown pie, and a coverage bar so missing areas are obvious
+     * before stitching exists.
+     *
+     * Data flow:
+     * Sensor readings -> updateGuideState() -> setGuideState() stores a snapshot
+     * -> invalidate() schedules onDraw() -> onDraw() maps angular deltas into
+     * preview coordinates and paints the guidance overlay.
+     */
+    private static final class TargetGuideView extends View {
+        private final Paint reticlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint targetPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint activePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint capturedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint progressTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint progressFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF rect = new RectF();
+        private CaptureTarget[] targets = new CaptureTarget[0];
+        private int activeTargetIndex;
+        private float headingDegrees;
+        private float pitchDegrees;
+        private float coverageProgress;
+        private float lockProgress;
+        private boolean aligned;
+        private boolean stable;
+        private boolean paused;
+
+        /*
+         * Function: TargetGuideView constructor
+         * Arguments: context is the Android owner used by the View base class.
+         * Calls: Paint setters.
+         * Flow: configure reusable paint objects for transparent overlay drawing.
+         */
+        TargetGuideView(android.content.Context context) {
+            super(context);
+            setWillNotDraw(false);
+            reticlePaint.setColor(0xFFFFFFFF);
+            reticlePaint.setStyle(Paint.Style.STROKE);
+            reticlePaint.setStrokeWidth(3f);
+            targetPaint.setColor(0xAAE2E8F0);
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(3f);
+            activePaint.setColor(0xFFFACC15);
+            activePaint.setStyle(Paint.Style.STROKE);
+            activePaint.setStrokeWidth(5f);
+            capturedPaint.setColor(0xFF22C55E);
+            capturedPaint.setStyle(Paint.Style.FILL);
+            textPaint.setColor(0xFFFFFFFF);
+            textPaint.setTextSize(24f);
+            panelPaint.setColor(0x9905070A);
+            panelPaint.setStyle(Paint.Style.FILL);
+            progressTrackPaint.setColor(0x77334155);
+            progressTrackPaint.setStyle(Paint.Style.FILL);
+            progressFillPaint.setColor(0xFF38BDF8);
+            progressFillPaint.setStyle(Paint.Style.FILL);
+        }
+
+        /*
+         * Function: setGuideState
+         * Arguments: targets are the capture points; activeTargetIndex is the
+         * current target; heading/pitch are the damped guide orientation;
+         * aligned/stable describe reticle readiness; lockProgress is the one-
+         * second capture countdown; coverageProgress is 0..1; paused gates UI.
+         * Calls: invalidate().
+         * Flow: store a drawing snapshot from CaptureActivity and request a
+         * repaint on the UI thread.
+         */
+        void setGuideState(
+                CaptureTarget[] targets,
+                int activeTargetIndex,
+                float headingDegrees,
+                float pitchDegrees,
+                boolean aligned,
+                boolean stable,
+                float lockProgress,
+                float coverageProgress,
+                boolean paused) {
+            this.targets = targets;
+            this.activeTargetIndex = activeTargetIndex;
+            this.headingDegrees = headingDegrees;
+            this.pitchDegrees = pitchDegrees;
+            this.aligned = aligned;
+            this.stable = stable;
+            this.lockProgress = lockProgress;
+            this.coverageProgress = coverageProgress;
+            this.paused = paused;
+            invalidate();
+        }
+
+        /*
+         * Function: onDraw
+         * Arguments: canvas is Android's drawing target.
+         * Calls: drawTargets(), drawReticle(), drawProgress(), and Canvas APIs.
+         * Flow: paint only lightweight overlay elements so CameraX remains the
+         * visual base of the capture experience.
+         */
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            drawTargets(canvas);
+            drawReticle(canvas);
+            drawProgress(canvas);
+        }
+
+        /*
+         * Function: drawTargets
+         * Arguments: canvas is Android's drawing target.
+         * Calls: angularToX(), angularToY(), and Canvas circle APIs.
+         * Flow: map each target's angular offset from the current phone
+         * orientation into preview space, skipping far-away targets to keep the
+         * guide readable.
+         */
+        private void drawTargets(Canvas canvas) {
+            for (int i = 0; i < targets.length; i++) {
+                CaptureTarget target = targets[i];
+                float yawDelta = signedHeadingDelta(target.yawDegrees, headingDegrees);
+                float pitchDelta = target.pitchDegrees - pitchDegrees;
+                if (Math.abs(yawDelta) > 85f || Math.abs(pitchDelta) > 70f) {
+                    continue;
+                }
+                float x = angularToX(yawDelta);
+                float y = angularToY(pitchDelta);
+                if (target.captured) {
+                    canvas.drawCircle(x, y, 8f, capturedPaint);
+                } else if (i == activeTargetIndex) {
+                    float radius = aligned ? 24f : 18f;
+                    canvas.drawCircle(x, y, radius, activePaint);
+                    if (aligned && !target.captured) {
+                        drawLockPie(canvas, x, y, radius + 8f);
+                    }
+                } else {
+                    canvas.drawCircle(x, y, 12f, targetPaint);
+                }
+            }
+        }
+
+        /*
+         * Function: drawLockPie
+         * Arguments: canvas is the target; x/y center the active dot; radius
+         * sizes the countdown ring.
+         * Calls: Canvas.drawArc() and RectF.set().
+         * Flow: draw a shrinking pie segment over the active target so the user
+         * can see the one-second auto-capture lock expire.
+         */
+        private void drawLockPie(Canvas canvas, float x, float y, float radius) {
+            float remaining = Math.max(0f, Math.min(1f, 1f - lockProgress));
+            rect.set(x - radius, y - radius, x + radius, y + radius);
+            activePaint.setStyle(Paint.Style.FILL);
+            activePaint.setColor(stable ? 0x8822C55E : 0x88FACC15);
+            canvas.drawArc(rect, -90f, 360f * remaining, true, activePaint);
+            activePaint.setStyle(Paint.Style.STROKE);
+            activePaint.setColor(0xFFFACC15);
+        }
+
+        /*
+         * Function: drawReticle
+         * Arguments: canvas is Android's drawing target.
+         * Calls: Canvas line/circle/text APIs.
+         * Flow: keep a stable center reference and plain status text near the
+         * reticle without blocking the camera preview.
+         */
+        private void drawReticle(Canvas canvas) {
+            float centerX = getWidth() * 0.5f;
+            float centerY = getHeight() * 0.5f;
+            reticlePaint.setColor(stable ? 0xFF22C55E : aligned ? 0xFFFACC15 : 0xFFFFFFFF);
+            canvas.drawCircle(centerX, centerY, 34f, reticlePaint);
+            canvas.drawLine(centerX - 48f, centerY, centerX - 18f, centerY, reticlePaint);
+            canvas.drawLine(centerX + 18f, centerY, centerX + 48f, centerY, reticlePaint);
+            canvas.drawLine(centerX, centerY - 48f, centerX, centerY - 18f, reticlePaint);
+            canvas.drawLine(centerX, centerY + 18f, centerX, centerY + 48f, reticlePaint);
+
+            String text = paused
+                    ? "Paused"
+                    : stable
+                    ? "Hold steady - capture ready"
+                    : aligned
+                    ? "Hold steady"
+                    : "Move to target";
+            textPaint.setTextAlign(Paint.Align.CENTER);
+            canvas.drawText(text, centerX, centerY + 76f, textPaint);
+        }
+
+        /*
+         * Function: drawProgress
+         * Arguments: canvas is Android's drawing target.
+         * Calls: Canvas rectangle/text APIs and clamp01().
+         * Flow: show total target coverage as a bottom progress bar so missing
+         * coverage is visible before any stitching UI exists.
+         */
+        private void drawProgress(Canvas canvas) {
+            float left = 18f;
+            float right = getWidth() - 18f;
+            float bottom = getHeight() - 184f;
+            rect.set(left, bottom, right, bottom + 54f);
+            canvas.drawRoundRect(rect, 10f, 10f, panelPaint);
+            textPaint.setTextAlign(Paint.Align.LEFT);
+            textPaint.setTextSize(20f);
+            canvas.drawText(
+                    String.format(Locale.US, "Coverage %.0f%%", coverageProgress * 100f),
+                    left + 14f,
+                    bottom + 24f,
+                    textPaint);
+            rect.set(left + 14f, bottom + 34f, right - 14f, bottom + 44f);
+            canvas.drawRoundRect(rect, 5f, 5f, progressTrackPaint);
+            rect.set(left + 14f, bottom + 34f, left + 14f + (right - left - 28f) * coverageProgress, bottom + 44f);
+            canvas.drawRoundRect(rect, 5f, 5f, progressFillPaint);
+        }
+
+        /*
+         * Function: angularToX
+         * Arguments: yawDelta is signed angular distance from center.
+         * Calls: getWidth().
+         * Flow: project a horizontal angular offset into preview coordinates.
+         */
+        private float angularToX(float yawDelta) {
+            return getWidth() * 0.5f + yawDelta / 70f * getWidth() * 0.5f;
+        }
+
+        /*
+         * Function: angularToY
+         * Arguments: pitchDelta is signed angular distance from center.
+         * Calls: getHeight().
+         * Flow: project a vertical angular offset into preview coordinates.
+         */
+        private float angularToY(float pitchDelta) {
+            return getHeight() * 0.5f - pitchDelta / 55f * getHeight() * 0.45f;
+        }
+
+        /*
+         * Function: signedHeadingDelta
+         * Arguments: target and current are headings in degrees.
+         * Calls: modulo arithmetic only.
+         * Flow: return the shortest signed turn from current heading to target
+         * heading, preserving left/right direction for overlay placement.
+         */
+        private static float signedHeadingDelta(float target, float current) {
+            float delta = (target - current + 540f) % 360f - 180f;
+            return delta < -180f ? delta + 360f : delta;
+        }
     }
 
     /*
