@@ -2,7 +2,7 @@
 
 Version: 0.4.33
 
-Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally and optionally publishing them to Google Maps or Google Photos.
+Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
 This repository now contains the first Android proof-of-concept application code. The 0.4.33 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, pitch-only one-shot polar capture, polar Capture/Next/Spherify button flow, polar-only guide overlay, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class draft-session library records, structured draft exposure metadata with non-blocking capture fallback, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, and confirmed bulk draft removal.
 
@@ -16,6 +16,116 @@ Current status:
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
 - The current prototype is local-first, does not require broad photo-library permission for normal use, and now includes a portrait capture shell with sensor readiness, compass calibration, ARCore draft frame capture, an iterated Phase 4 guided capture flow that evolved from target dots into sweep-first paint layers, auto-capture for new sweep slices, first-class draft-session library records, structured exposure metadata for draft frames, draft-frame deletion, and a confirmed Remove All Drafts action for large draft sets.
+
+## Play Store Compliance Gate (Mandatory)
+
+This section is normative. All new code, features, permissions, and release artifacts must satisfy these requirements before any Play Store submission.
+
+Hard blockers (must be complete before upload):
+
+- Release artifact must be an Android App Bundle from a release variant, signed for Play upload. Debug APKs are never upload candidates.
+- Target API level must meet current Google Play target API requirements at release time.
+- Data safety form entries must exactly match shipped behavior for collection, processing, and sharing.
+- A public privacy policy URL must exist and describe camera, optional location metadata, local storage, sharing/export behavior, retention, and deletion controls.
+- Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
+- Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
+
+Current repository compliance snapshot (0.4.33):
+
+- Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata.
+- Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
+- Code-level sensitive permissions present: CAMERA, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION.
+- Background location permission is not declared.
+- Broad media-library read permission is not declared for normal operation.
+- Draft privacy/data handling policy file: `PRIVACY_DATA_HANDLING_POLICY_DRAFT.md`.
+
+Engineering mandates for all future changes:
+
+- Do not add a new permission until a concrete user flow exists with:
+	- contextual in-app prompt text,
+	- graceful deny path,
+	- README update,
+	- Play Console declaration impact documented.
+- Do not ship hidden data collection. Any newly persisted metadata field (image, sensor, location, account, diagnostics) must be documented in README and reflected in Data safety inputs.
+- Keep location optional. Core capture, local save, and reprojection must remain functional when location access is denied.
+- Keep Google integrations optional. Local create/save must remain functional with no sign-in.
+- Any feature touching public upload must include a preflight review UI and explicit user confirmation.
+
+Pre-release policy checklist (required sign-off):
+
+- Build and package:
+	- release AAB built and signed,
+	- debuggable false in release,
+	- versionCode/versionName updated and consistent.
+- Permissions and data handling:
+	- manifest permissions reviewed for least privilege,
+	- runtime request timing is contextual and skippable where possible,
+	- Data safety responses updated from current code,
+	- privacy policy reviewed against current behavior.
+- Store/listing integrity:
+	- no claims for unimplemented Google integrations,
+	- ARCore-required-device behavior clearly disclosed,
+	- known device limitations documented.
+- Quality and safety:
+	- crash/perf logging excludes sensitive payloads,
+	- accessibility pass completed for critical flows,
+	- basic regression pass on camera/sensor/location deny scenarios.
+
+Definition of done for any Play-affecting pull request:
+
+- README updated for feature and policy impact.
+- Manifest and runtime permission rationale documented.
+- Data-safety delta documented (or explicitly "no data-safety change").
+- Reviewer confirms no Play policy blocker remains.
+
+## Play Console Submission Checklist (Owners and Signoff)
+
+Use this section as the final gate before creating or rolling out any Play release.
+
+Release details:
+
+- Release name: ____________________
+- Version name: ____________________
+- Version code: ____________________
+- Track: Internal / Closed / Open / Production
+- Build artifact (AAB path): ____________________
+- Commit/Tag: ____________________
+- Submission date: ____________________
+
+Owners and signoff:
+
+- Engineering owner: ____________________ | Date: __________ | Signoff: Approved / Blocked
+- QA owner: ____________________ | Date: __________ | Signoff: Approved / Blocked
+- Privacy/Data Safety owner: ____________________ | Date: __________ | Signoff: Approved / Blocked
+- Release manager: ____________________ | Date: __________ | Signoff: Approved / Blocked
+
+Strict go/no-go rules:
+
+- Any row marked `No` in the table below is an automatic `NO-GO`.
+- The release is `GO` only when every row is `Yes` and all owners are `Approved`.
+- Do not substitute "known issue" notes for blocker rows.
+
+| Gate | Owner | Evidence | Pass (Yes/No) | Blocker if No |
+| --- | --- | --- | --- | --- |
+| Release AAB built from release variant and signed for Play upload | Engineering | CI/build artifact and signing output |  | NO-GO |
+| targetSdk meets current Play requirement at submission time | Engineering | `app/build.gradle` and Play policy check |  | NO-GO |
+| `versionCode` is incremented and unique for this upload | Engineering | `app/build.gradle` and Play upload validation |  | NO-GO |
+| Data Safety form exactly matches shipped behavior | Privacy/Data Safety | Completed Play Console questionnaire diff/review |  | NO-GO |
+| Privacy policy URL is public, reachable, and behavior-accurate | Privacy/Data Safety | Published URL and content review |  | NO-GO |
+| Store listing does not claim unimplemented features | Release manager | Listing text/screenshot review |  | NO-GO |
+| Permission declarations are least-privilege and justified | Engineering | Manifest review and feature mapping |  | NO-GO |
+| Runtime permission prompts are contextual with deny path verified | QA | Test evidence on deny/allow flows |  | NO-GO |
+| Core app works without optional location permission | QA | Test run notes/screenshots |  | NO-GO |
+| ARCore-required-device limitation is disclosed in listing | Release manager | Listing/device support text review |  | NO-GO |
+| Crash/perf telemetry excludes sensitive image/location payloads | Engineering | Logging/telemetry configuration review |  | NO-GO |
+| Final QA smoke pass complete on intended track build | QA | Test report and signoff |  | NO-GO |
+
+Final decision:
+
+- GO / NO-GO: ____________________
+- Decision owner: ____________________
+- Decision date: ____________________
+- Notes (required if NO-GO): ____________________
 
 ### Version 0.4.33 Progress
 
