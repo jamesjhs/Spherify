@@ -234,6 +234,67 @@ final class SpherifyLibrary {
         return item;
     }
 
+    LibraryItem saveFullResolutionPhotoSphereVariant(LibraryItem parent) throws IOException {
+        if (parent == null || parent.imagePath == null || parent.imagePath.isEmpty()) {
+            throw new IOException("select a PhotoSphere first");
+        }
+        File sourceFile = parent.imageFile();
+        if (!sourceFile.exists()) {
+            throw new IOException("source image is missing");
+        }
+        long now = System.currentTimeMillis();
+        String id = newId();
+        String extension = fileExtension(sourceFile.getName());
+        File imageFile = new File(variantsDir, id + extension);
+        copy(sourceFile, imageFile);
+        File thumbnailFile = makeThumbnail(imageFile, id);
+
+        LibraryItem item = new LibraryItem(
+                id,
+                "Full PhotoSphere Export",
+                LibraryItem.TYPE_VARIANT,
+                "local",
+                "sphere",
+                parent.id,
+                imageFile.getAbsolutePath(),
+                thumbnailFile.getAbsolutePath(),
+                now,
+                now);
+        items.add(item);
+        saveToMediaStore(imageFile, item.title);
+        save();
+        return item;
+    }
+
+    File createFullResolutionPhotoSphereShareFile(LibraryItem item) throws IOException {
+        if (item == null || item.imagePath == null || item.imagePath.isEmpty()) {
+            throw new IOException("select a PhotoSphere first");
+        }
+        File sourceFile = item.imageFile();
+        if (!sourceFile.exists()) {
+            throw new IOException("source image is missing");
+        }
+        File directory = new File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "Spherify");
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IOException("could not create export directory");
+        }
+        File destination = new File(
+                directory,
+                "photosphere-full-" + System.currentTimeMillis() + fileExtension(sourceFile.getName()));
+        copy(sourceFile, destination);
+        return destination;
+    }
+
+    void updateTinyPlanetCenter(LibraryItem item, float centerX, float centerY) throws IOException {
+        if (item == null) {
+            throw new IOException("select a Tiny Planet first");
+        }
+        item.tinyPlanetCenterX = clamp01(centerX);
+        item.tinyPlanetCenterY = clamp01(centerY);
+        item.updatedAt = System.currentTimeMillis();
+        save();
+    }
+
     /*
      * Function: list
      * Arguments: filter is a LibraryItem.FILTER_* value requested by MainActivity.
@@ -351,6 +412,24 @@ final class SpherifyLibrary {
             float sensorPhysicalHeightMm = exposure == null || exposure.isNull("sensorPhysicalHeightMm")
                     ? 0f
                     : (float) exposure.optDouble("sensorPhysicalHeightMm", 0.0);
+            float imageFocalLengthXPixels = exposure == null || exposure.isNull("imageFocalLengthXPixels")
+                    ? 0f
+                    : (float) exposure.optDouble("imageFocalLengthXPixels", 0.0);
+            float imageFocalLengthYPixels = exposure == null || exposure.isNull("imageFocalLengthYPixels")
+                    ? 0f
+                    : (float) exposure.optDouble("imageFocalLengthYPixels", 0.0);
+            float imagePrincipalPointXPixels = exposure == null || exposure.isNull("imagePrincipalPointXPixels")
+                    ? 0f
+                    : (float) exposure.optDouble("imagePrincipalPointXPixels", 0.0);
+            float imagePrincipalPointYPixels = exposure == null || exposure.isNull("imagePrincipalPointYPixels")
+                    ? 0f
+                    : (float) exposure.optDouble("imagePrincipalPointYPixels", 0.0);
+            int imageIntrinsicsWidth = exposure == null || exposure.isNull("imageIntrinsicsWidth")
+                    ? 0
+                    : exposure.optInt("imageIntrinsicsWidth", 0);
+            int imageIntrinsicsHeight = exposure == null || exposure.isNull("imageIntrinsicsHeight")
+                    ? 0
+                    : exposure.optInt("imageIntrinsicsHeight", 0);
             result.add(new DraftFrameRecord(
                     file,
                     json.optString("sessionId", ""),
@@ -359,13 +438,21 @@ final class SpherifyLibrary {
                     (float) json.optDouble("headingDegrees", 0.0),
                     (float) json.optDouble("pitchDegrees", 0.0),
                     (float) json.optDouble("rollDegrees", 0.0),
+                    json.has("headingDegrees") && json.has("pitchDegrees") && json.has("rollDegrees"),
+                    json.optString("captureProfile", "handheld"),
                     json.optInt("targetYawDegrees", 0),
                     json.optInt("targetPitchDegrees", 0),
                     json.optString("captureMode", "manual"),
                     exposure != null && exposure.optBoolean("available", false),
                     lensFocalLengthMm,
                     sensorPhysicalWidthMm,
-                    sensorPhysicalHeightMm));
+                    sensorPhysicalHeightMm,
+                    imageFocalLengthXPixels,
+                    imageFocalLengthYPixels,
+                    imagePrincipalPointXPixels,
+                    imagePrincipalPointYPixels,
+                    imageIntrinsicsWidth,
+                    imageIntrinsicsHeight));
         }
         Collections.sort(result, Comparator.comparingLong(record -> record.createdAt));
         return result;
@@ -383,7 +470,8 @@ final class SpherifyLibrary {
      */
     StitchMasterResult createMasterFromDraftSession(
             LibraryItem draftSession,
-            String movementSensitivity) throws IOException {
+            String movementSensitivity,
+            String renderMode) throws IOException {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
             throw new IOException("select a draft session first");
         }
@@ -395,7 +483,7 @@ final class SpherifyLibrary {
         long now = System.currentTimeMillis();
         String id = newId();
         File imageFile = new File(mastersDir, id + ".jpg");
-        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity);
+        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity, renderMode);
         File thumbnailFile = makeThumbnail(imageFile, id);
         LibraryItem item = new LibraryItem(
                 id,
@@ -517,6 +605,13 @@ final class SpherifyLibrary {
                 + (LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)
                 ? "\nDraft frames: " + listDraftFrames(item.id).size()
                 : "")
+                + ("tinyplanet".equals(item.projection)
+                ? String.format(
+                java.util.Locale.US,
+                "\nTiny Planet center: %.1f%% x, %.1f%% y",
+                item.tinyPlanetCenterX * 100f,
+                item.tinyPlanetCenterY * 100f)
+                : "")
                 + "\nImage: " + item.imagePath
                 + "\nThumbnail: " + item.thumbnailPath
                 + "\nCreated: " + item.createdAt;
@@ -555,6 +650,7 @@ final class SpherifyLibrary {
             int targetYawDegrees,
             int targetPitchDegrees,
             String captureMode,
+            String captureProfile,
             String exposureJson) throws IOException {
         JSONArray array = readDraftMetadataOrThrow();
         long now = System.currentTimeMillis();
@@ -570,6 +666,7 @@ final class SpherifyLibrary {
             json.put("targetYawDegrees", targetYawDegrees);
             json.put("targetPitchDegrees", targetPitchDegrees);
             json.put("captureMode", captureMode == null ? "manual" : captureMode);
+            json.put("captureProfile", normalizeCaptureProfile(captureProfile));
             json.put("exposure", parseExposureJson(exposureJson));
             array.put(json);
             writeDraftMetadata(array);
@@ -577,6 +674,10 @@ final class SpherifyLibrary {
         } catch (JSONException e) {
             throw new IOException("could not write draft metadata", e);
         }
+    }
+
+    private static String normalizeCaptureProfile(String captureProfile) {
+        return "fixed_gimbal".equals(captureProfile) ? "fixed_gimbal" : "handheld";
     }
 
     /*
@@ -909,6 +1010,19 @@ final class SpherifyLibrary {
         return thumbnailFile;
     }
 
+    private static float clamp01(float value) {
+        return Math.max(0f, Math.min(1f, value));
+    }
+
+    private static String fileExtension(String name) {
+        int dot = name == null ? -1 : name.lastIndexOf('.');
+        if (dot < 0 || dot >= name.length() - 1) {
+            return ".jpg";
+        }
+        String extension = name.substring(dot).toLowerCase(java.util.Locale.US);
+        return extension.length() > 6 ? ".jpg" : extension;
+    }
+
     static Bitmap applyExifRotation(Bitmap bitmap, String path) {
         try {
             ExifInterface exif = new ExifInterface(path);
@@ -946,8 +1060,9 @@ final class SpherifyLibrary {
         }
         ContentResolver resolver = context.getContentResolver();
         ContentValues values = new ContentValues();
-        values.put(MediaStore.Images.Media.DISPLAY_NAME, title.replaceAll("[^a-zA-Z0-9_-]+", "-") + ".png");
-        values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+        String extension = fileExtension(imageFile.getName());
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, title.replaceAll("[^a-zA-Z0-9_-]+", "-") + extension);
+        values.put(MediaStore.Images.Media.MIME_TYPE, ".png".equals(extension) ? "image/png" : "image/jpeg");
         values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Spherify");
         values.put(MediaStore.Images.Media.IS_PENDING, 1);
 

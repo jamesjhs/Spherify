@@ -58,6 +58,8 @@ final class LibraryItem {
     String thumbnailPath;
     final long createdAt;
     long updatedAt;
+    float tinyPlanetCenterX;
+    float tinyPlanetCenterY;
 
     /*
      * Function: LibraryItem constructor
@@ -78,6 +80,34 @@ final class LibraryItem {
             String thumbnailPath,
             long createdAt,
             long updatedAt) {
+        this(
+                id,
+                title,
+                type,
+                source,
+                projection,
+                parentId,
+                imagePath,
+                thumbnailPath,
+                createdAt,
+                updatedAt,
+                0.5f,
+                0.5f);
+    }
+
+    LibraryItem(
+            String id,
+            String title,
+            String type,
+            String source,
+            String projection,
+            String parentId,
+            String imagePath,
+            String thumbnailPath,
+            long createdAt,
+            long updatedAt,
+            float tinyPlanetCenterX,
+            float tinyPlanetCenterY) {
         this.id = id;
         this.title = title;
         this.type = type;
@@ -88,6 +118,8 @@ final class LibraryItem {
         this.thumbnailPath = thumbnailPath;
         this.createdAt = createdAt;
         this.updatedAt = updatedAt;
+        this.tinyPlanetCenterX = tinyPlanetCenterX;
+        this.tinyPlanetCenterY = tinyPlanetCenterY;
     }
 
     /*
@@ -161,6 +193,8 @@ final class LibraryItem {
         json.put("thumbnailPath", thumbnailPath);
         json.put("createdAt", createdAt);
         json.put("updatedAt", updatedAt);
+        json.put("tinyPlanetCenterX", tinyPlanetCenterX);
+        json.put("tinyPlanetCenterY", tinyPlanetCenterY);
         return json;
     }
 
@@ -183,6 +217,8 @@ final class LibraryItem {
                 json.getString("imagePath"),
                 json.getString("thumbnailPath"),
                 json.getLong("createdAt"),
-                json.optLong("updatedAt", json.getLong("createdAt")));
+                json.optLong("updatedAt", json.getLong("createdAt")),
+                (float) json.optDouble("tinyPlanetCenterX", 0.5),
+                (float) json.optDouble("tinyPlanetCenterY", 0.5));
     }
 }

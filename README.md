@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.5.7
+Version: 0.5.10
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
-This repository now contains the first Android proof-of-concept application code. The 0.5.7 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, guided four-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata for FOV estimation, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, central-source weighted blending, movement-sensitive overlap rejection, conservative pose nudges, and corrected polar sizing.
+This repository now contains the first Android proof-of-concept application code. The 0.5.10 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere capture with still-keyframe auto capture, guided eight-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata and ARCore intrinsics for FOV estimation, safer delete confirmations, rotation-state restore, Android launcher badge assets, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, capture profiles for hand-held versus fixed-gimbal sessions, Tiny Planet import center marking, full-resolution PhotoSphere export, sharp-source and contributor-map stitch outputs, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, OpenCV ORB/RANSAC pose-graph matching, inlier control-point storage, graph-relaxed pose correction, movement-sensitive overlap rejection, conservative pose nudges, parallax-risk reporting, and corrected polar sizing.
 
 ## Developer Build and Run Runbook
 
@@ -30,7 +30,7 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.5.7):
+Current repository compliance snapshot (0.5.10):
 
 - Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata, experimental local draft stitching into app-created masters.
 - Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
@@ -228,6 +228,39 @@ Either approach guarantees a complete fill before the JSON parse and eliminates 
 3. Long-term: introduce a `loadAsync(callback)` pattern on `SpherifyLibrary` that shifts all file reads to a dedicated executor, consistent with the background-thread approach adopted for bitmap decodes.
 
 ---
+
+### Version 0.5.10 Progress
+
+This build changes the next stitching phase from continuous moving-frame capture toward still keyframes and a broader OpenCV pose graph:
+
+- Auto capture now waits for yaw, pitch, and roll motion to stay quiet for a short dwell before saving a sweep frame, so the live preview remains continuous but transitional moving frames are discarded.
+- Sweep status now prompts for keyframe steadiness instead of encouraging continuous painting as the primary capture mode.
+- Expands OpenCV-backed matching from the next same-row neighbor to predicted nearby overlap pairs across yaw, adjacent pitch rows, and 360-degree wraparound.
+- Stores OpenCV/RANSAC inlier control-point pairs on each feature edge instead of keeping only an averaged dx/dy correction.
+- Applies a balanced graph relaxation over accepted feature edges so yaw, pitch, and roll corrections are solved from a shared pose graph with ARCore/capture pose as the prior.
+- Keeps sharp best-source rendering as the first diagnostic output before seam finding or multiband blending.
+
+### Version 0.5.9 Progress
+
+This build makes Phase 5 more useful for diagnosing and reducing ghosting:
+
+- Makes sharp best-source stitching the first stitch output choice, so misalignment appears as visible seams instead of being hidden as blur.
+- Adds a contributor-map stitch output that paints each chosen source frame in a different colour to show which frames own each equirectangular region.
+- Adds the official OpenCV Android AAR and uses OpenCV ORB, BFMatcher/Hamming, Lowe-style ratio plus cross-check filtering, and homography RANSAC for predicted overlap pairs, falling back to the Java matcher and older strip correlation when feature evidence is too weak.
+- Enables a simple confidence-weighted global pose relaxation over the overlap graph instead of relying only on independent per-frame nudges.
+- Expands the high upper/lower capture rows from four cardinal shots to eight 45-degree shots for stronger polar-extreme overlap.
+- Carries feature residuals into sparse depth/parallax warnings so hand-held near-object conflict can be identified before seam-routing work.
+
+### Version 0.5.8 Progress
+
+This build makes the Phase 5 stitcher more diagnostic and less dependent on ideal target placement:
+
+- Stores ARCore image intrinsics with each draft frame when available, so FOV estimation can use focal length in pixels instead of only physical sensor heuristics.
+- Uses captured heading, pitch, and roll as the primary projection pose, with target yaw/pitch retained as fallback for older metadata.
+- Adds a stitch output choice between blended masters and geometry-debug strongest-source rendering.
+- Adds Capture profile selection for Hand-held versus Fixed gimbal sessions and records that profile in draft metadata.
+- Treats hand-held parallax as an expected error mode in stitch metadata and warnings while leaving true depth-aware correction as a future feature-match/RANSAC step.
+- Adds sparse overlap/depth-hint scaffolding for later seam selection and global pose optimization.
 
 ### Version 0.5.7 Progress
 

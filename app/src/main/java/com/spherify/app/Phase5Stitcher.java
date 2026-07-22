@@ -15,6 +15,20 @@ import android.graphics.BitmapFactory;
 import android.graphics.RectF;
 import android.media.ExifInterface;
 
+import org.opencv.android.OpenCVLoader;
+import org.opencv.core.Core;
+import org.opencv.core.CvType;
+import org.opencv.core.DMatch;
+import org.opencv.core.KeyPoint;
+import org.opencv.core.Mat;
+import org.opencv.core.MatOfDMatch;
+import org.opencv.core.MatOfKeyPoint;
+import org.opencv.core.MatOfPoint2f;
+import org.opencv.core.Point;
+import org.opencv.features.BFMatcher;
+import org.opencv.features.ORB;
+import org.opencv.geometry.Geometry;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -41,13 +55,39 @@ final class Phase5Stitcher {
     private static final int OVERLAP_SEARCH_Y_PIXELS = 18;
     private static final int OVERLAP_SEARCH_ROLL_PIXELS = 8;
     private static final int OVERLAP_STRIP_WIDTH = 36;
+    private static final int FEATURE_MAX_POINTS = 140;
+    private static final int FEATURE_DESCRIPTOR_RADIUS = 8;
+    private static final int FEATURE_MIN_MATCHES = 10;
+    private static final int RANSAC_TRANSLATION_TOLERANCE_PIXELS = 10;
     private static final int COVERAGE_COLUMNS = 48;
     private static final int COVERAGE_ROWS = 24;
+    private static final int[] CONTRIBUTOR_COLORS = {
+            0xFFE11D48, 0xFF2563EB, 0xFF16A34A, 0xFFF59E0B,
+            0xFF7C3AED, 0xFF0891B2, 0xFFDB2777, 0xFF65A30D,
+            0xFFEA580C, 0xFF4F46E5, 0xFF0D9488, 0xFF9333EA
+    };
+    private static final boolean OPENCV_AVAILABLE = initializeOpenCv();
 
     private Phase5Stitcher() {
     }
 
-    static Result stitch(List<DraftFrameRecord> records, File outputFile, String movementSensitivityMode) throws IOException {
+    private static boolean initializeOpenCv() {
+        try {
+            return OpenCVLoader.initLocal();
+        } catch (Throwable localFailure) {
+            try {
+                return OpenCVLoader.initDebug();
+            } catch (Throwable ignored) {
+                return false;
+            }
+        }
+    }
+
+    static Result stitch(
+            List<DraftFrameRecord> records,
+            File outputFile,
+            String movementSensitivityMode,
+            String renderModeName) throws IOException {
         ArrayList<DraftFrameRecord> usable = new ArrayList<>();
         for (DraftFrameRecord record : records) {
             if (record.imageFile.exists()) {
@@ -59,7 +99,9 @@ final class Phase5Stitcher {
             throw new IOException("draft session has no readable frames");
         }
         MovementSensitivity movementSensitivity = MovementSensitivity.from(movementSensitivityMode);
-        Calibration calibration = calibrate(usable, movementSensitivity);
+        RenderMode renderMode = RenderMode.from(renderModeName);
+        CaptureProfile captureProfile = CaptureProfile.from(usable);
+        Calibration calibration = calibrate(usable, movementSensitivity, captureProfile);
 
         float[] red = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         float[] green = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
@@ -79,7 +121,16 @@ final class Phase5Stitcher {
             }
             FrameProjection projection = projectionFor(record, calibration);
             markCoverage(coverage, projection.bounds);
-            blendWrapped(frame, projection, calibration.lensModel, red, green, blue, weights);
+            blendWrapped(
+                    frame,
+                    projection,
+                    calibration.lensModel,
+                    renderMode,
+                    rendered,
+                    red,
+                    green,
+                    blue,
+                    weights);
             frame.recycle();
             rendered++;
         }
@@ -98,7 +149,7 @@ final class Phase5Stitcher {
         }
 
         int coveragePercent = Math.round(100f * coveredCells(coverage) / (COVERAGE_COLUMNS * COVERAGE_ROWS));
-        writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity);
+        writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity, renderMode);
         return new Result(rendered, coveragePercent, missingExposure, warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity));
     }
 
@@ -116,7 +167,10 @@ final class Phase5Stitcher {
         return bitmap == null ? null : SpherifyLibrary.applyExifRotation(bitmap, file.getAbsolutePath());
     }
 
-    private static Calibration calibrate(List<DraftFrameRecord> records, MovementSensitivity movementSensitivity) {
+    private static Calibration calibrate(
+            List<DraftFrameRecord> records,
+            MovementSensitivity movementSensitivity,
+            CaptureProfile captureProfile) {
         LensModel lensModel = estimateLensModel(records);
         ArrayList<CalibrationFrame> frames = new ArrayList<>();
         for (DraftFrameRecord record : records) {
@@ -131,43 +185,70 @@ final class Phase5Stitcher {
         });
 
         HashMap<String, PoseCorrection> corrections = new HashMap<>();
+        ArrayList<FeatureMatchEdge> matchEdges = new ArrayList<>();
         int matchedPairs = 0;
+        int openCvMatchedPairs = 0;
         float confidenceTotal = 0f;
-        for (int i = 0; i < frames.size(); i++) {
-            CalibrationFrame left = frames.get(i);
-            CalibrationFrame right = nextFrameInLayer(frames, i);
-            if (right == null) {
-                continue;
+        for (FramePair framePair : predictedOverlapPairs(frames, lensModel)) {
+            CalibrationFrame left = framePair.left;
+            CalibrationFrame right = framePair.right;
+            PairAdjustment adjustment = matchFeatureOverlap(left, right, movementSensitivity);
+            if (adjustment == null) {
+                adjustment = correlateOverlap(left, right, movementSensitivity);
             }
-            PairAdjustment adjustment = correlateOverlap(left, right, movementSensitivity);
             if (adjustment == null || adjustment.confidence < movementSensitivity.minimumConfidence) {
                 continue;
             }
-            PoseCorrection correction = corrections.computeIfAbsent(
-                    right.record.imageFile.getAbsolutePath(),
-                    ignored -> new PoseCorrection());
-            correction.yawDegrees -= adjustment.horizontalOffsetPixels
+            float yawCorrection = -adjustment.horizontalOffsetPixels
                     / Math.max(1f, right.width)
                     * lensModel.horizontalFovDegrees
                     * movementSensitivity.correctionScale;
-            correction.pitchDegrees -= adjustment.verticalOffsetPixels
+            float pitchCorrection = -adjustment.verticalOffsetPixels
                     / Math.max(1f, right.height)
                     * lensModel.verticalFovDegrees
                     * movementSensitivity.correctionScale;
+            float rollCorrection = 0f;
             if (adjustment.confidence >= movementSensitivity.rollMinimumConfidence) {
-                correction.rollDegrees += adjustment.rollPixels
+                rollCorrection = adjustment.rollPixels
                         / Math.max(1f, right.height)
                         * lensModel.verticalFovDegrees
                         * movementSensitivity.rollCorrectionScale;
             }
-            correction.samples++;
+            matchEdges.add(new FeatureMatchEdge(
+                    left.record.imageFile.getAbsolutePath(),
+                    right.record.imageFile.getAbsolutePath(),
+                    yawCorrection,
+                    pitchCorrection,
+                    rollCorrection,
+                    adjustment.confidence,
+                    adjustment.score,
+                    adjustment.featureBased,
+                    adjustment.inlierControlPoints));
+            PoseCorrection correction = corrections.computeIfAbsent(
+                    right.record.imageFile.getAbsolutePath(),
+                    ignored -> new PoseCorrection());
+            correction.add(yawCorrection, pitchCorrection, rollCorrection, adjustment.confidence);
             matchedPairs++;
+            if (adjustment.featureBased) {
+                openCvMatchedPairs++;
+            }
             confidenceTotal += adjustment.confidence;
         }
         for (PoseCorrection correction : corrections.values()) {
             correction.averageAndClamp();
         }
-        return new Calibration(lensModel, corrections, matchedPairs, matchedPairs == 0 ? 0f : confidenceTotal / matchedPairs);
+        FeatureMatchGraph featureMatchGraph = new FeatureMatchGraph(matchEdges, true);
+        GlobalPoseOptimization poseOptimization = GlobalPoseOptimization.from(featureMatchGraph, corrections);
+        poseOptimization.apply();
+        SparseDepthHints sparseDepthHints = SparseDepthHints.from(featureMatchGraph, captureProfile);
+        return new Calibration(
+                lensModel,
+                corrections,
+                matchedPairs,
+                openCvMatchedPairs,
+                matchedPairs == 0 ? 0f : confidenceTotal / matchedPairs,
+                captureProfile,
+                sparseDepthHints);
     }
 
     private static LensModel estimateLensModel(List<DraftFrameRecord> records) {
@@ -192,6 +273,10 @@ final class Phase5Stitcher {
         float physicalVertical = physicalSizeCount == 0 ? 0f : physicalVerticalTotal / physicalSizeCount;
         float horizontalFov = DEFAULT_HORIZONTAL_FOV_DEGREES;
         float verticalFov = clamp(horizontalFov * 1.25f, MIN_VERTICAL_FOV_DEGREES, MAX_VERTICAL_FOV_DEGREES);
+        LensModel intrinsicsModel = estimateIntrinsicsLensModel(records, focalLength);
+        if (intrinsicsModel != null) {
+            return intrinsicsModel;
+        }
         if (focalLength > 0f) {
             if (physicalHorizontal > 0f && physicalVertical > 0f) {
                 horizontalFov = clamp(
@@ -222,6 +307,35 @@ final class Phase5Stitcher {
         float k1 = focalLength > 0f && focalLength <= 3.2f ? -0.12f : RADIAL_COMPENSATION_K1;
         float k2 = focalLength > 0f && focalLength <= 3.2f ? 0.035f : RADIAL_COMPENSATION_K2;
         return new LensModel(horizontalFov, verticalFov, k1, k2, focalLength);
+    }
+
+    private static LensModel estimateIntrinsicsLensModel(List<DraftFrameRecord> records, float focalLengthMm) {
+        float horizontalTotal = 0f;
+        float verticalTotal = 0f;
+        int count = 0;
+        for (DraftFrameRecord record : records) {
+            if (record.imageFocalLengthXPixels <= 0f
+                    || record.imageFocalLengthYPixels <= 0f
+                    || record.imageIntrinsicsWidth <= 0
+                    || record.imageIntrinsicsHeight <= 0) {
+                continue;
+            }
+            float rawHorizontal = (float) Math.toDegrees(
+                    2.0 * Math.atan(record.imageIntrinsicsWidth / (2.0 * record.imageFocalLengthXPixels)));
+            float rawVertical = (float) Math.toDegrees(
+                    2.0 * Math.atan(record.imageIntrinsicsHeight / (2.0 * record.imageFocalLengthYPixels)));
+            horizontalTotal += Math.min(rawHorizontal, rawVertical);
+            verticalTotal += Math.max(rawHorizontal, rawVertical);
+            count++;
+        }
+        if (count == 0) {
+            return null;
+        }
+        float horizontalFov = clamp(horizontalTotal / count, 42f, 86f);
+        float verticalFov = clamp(verticalTotal / count, MIN_VERTICAL_FOV_DEGREES, MAX_VERTICAL_FOV_DEGREES);
+        float k1 = focalLengthMm > 0f && focalLengthMm <= 3.2f ? -0.12f : RADIAL_COMPENSATION_K1;
+        float k2 = focalLengthMm > 0f && focalLengthMm <= 3.2f ? 0.035f : RADIAL_COMPENSATION_K2;
+        return new LensModel(horizontalFov, verticalFov, k1, k2, focalLengthMm);
     }
 
     private static int largestSameLayerCount(List<DraftFrameRecord> records) {
@@ -255,6 +369,378 @@ final class Phase5Stitcher {
             }
         }
         return best;
+    }
+
+    private static List<FramePair> predictedOverlapPairs(List<CalibrationFrame> frames, LensModel lensModel) {
+        ArrayList<FramePair> pairs = new ArrayList<>();
+        for (int i = 0; i < frames.size(); i++) {
+            CalibrationFrame left = frames.get(i);
+            for (int j = i + 1; j < frames.size(); j++) {
+                CalibrationFrame right = frames.get(j);
+                float yawDelta = headingDeltaDegrees(left.baseYawDegrees, right.baseYawDegrees);
+                float pitchDelta = Math.abs(left.basePitchDegrees - right.basePitchDegrees);
+                boolean sameRow = pitchDelta <= 2f
+                        && yawDelta <= lensModel.horizontalFovDegrees * 0.72f;
+                boolean adjacentRow = pitchDelta <= lensModel.verticalFovDegrees * 0.82f
+                        && yawDelta <= lensModel.horizontalFovDegrees * 0.55f;
+                if (sameRow || adjacentRow) {
+                    pairs.add(new FramePair(left, right));
+                }
+            }
+        }
+        return pairs;
+    }
+
+    private static PairAdjustment matchFeatureOverlap(
+            CalibrationFrame left,
+            CalibrationFrame right,
+            MovementSensitivity movementSensitivity) {
+        PairAdjustment openCvAdjustment = matchOpenCvFeatureOverlap(left, right, movementSensitivity);
+        if (openCvAdjustment != null) {
+            return openCvAdjustment;
+        }
+        List<ImageFeature> leftFeatures = detectOverlapFeatures(left, true);
+        List<ImageFeature> rightFeatures = detectOverlapFeatures(right, false);
+        if (leftFeatures.size() < FEATURE_MIN_MATCHES || rightFeatures.size() < FEATURE_MIN_MATCHES) {
+            return null;
+        }
+        ArrayList<FeaturePair> matches = new ArrayList<>();
+        for (ImageFeature leftFeature : leftFeatures) {
+            ImageFeature best = null;
+            int bestDistance = Integer.MAX_VALUE;
+            int secondDistance = Integer.MAX_VALUE;
+            for (ImageFeature rightFeature : rightFeatures) {
+                int distance = descriptorDistance(leftFeature.descriptor, rightFeature.descriptor);
+                if (distance < bestDistance) {
+                    secondDistance = bestDistance;
+                    bestDistance = distance;
+                    best = rightFeature;
+                } else if (distance < secondDistance) {
+                    secondDistance = distance;
+                }
+            }
+            if (best != null && bestDistance < 92 && bestDistance * 100 < secondDistance * 78) {
+                matches.add(new FeaturePair(leftFeature, best, bestDistance));
+            }
+        }
+        if (matches.size() < FEATURE_MIN_MATCHES) {
+            return null;
+        }
+
+        int bestInliers = 0;
+        float bestDx = 0f;
+        float bestDy = 0f;
+        float bestResidual = Float.MAX_VALUE;
+        for (FeaturePair seed : matches) {
+            float dx = seed.right.matchX - seed.left.matchX;
+            float dy = seed.right.matchY - seed.left.matchY;
+            int inliers = 0;
+            float residual = 0f;
+            for (FeaturePair candidate : matches) {
+                float candidateDx = candidate.right.matchX - candidate.left.matchX;
+                float candidateDy = candidate.right.matchY - candidate.left.matchY;
+                float error = Math.abs(candidateDx - dx) + Math.abs(candidateDy - dy);
+                if (error <= RANSAC_TRANSLATION_TOLERANCE_PIXELS) {
+                    inliers++;
+                    residual += error;
+                }
+            }
+            if (inliers > bestInliers || (inliers == bestInliers && residual < bestResidual)) {
+                bestInliers = inliers;
+                bestDx = dx;
+                bestDy = dy;
+                bestResidual = residual;
+            }
+        }
+        if (bestInliers < FEATURE_MIN_MATCHES) {
+            return null;
+        }
+        float refinedDx = 0f;
+        float refinedDy = 0f;
+        float descriptorTotal = 0f;
+        int refinedInliers = 0;
+        for (FeaturePair candidate : matches) {
+            float candidateDx = candidate.right.matchX - candidate.left.matchX;
+            float candidateDy = candidate.right.matchY - candidate.left.matchY;
+            float error = Math.abs(candidateDx - bestDx) + Math.abs(candidateDy - bestDy);
+            if (error <= RANSAC_TRANSLATION_TOLERANCE_PIXELS) {
+                refinedDx += candidateDx;
+                refinedDy += candidateDy;
+                descriptorTotal += candidate.distance;
+                refinedInliers++;
+            }
+        }
+        if (refinedInliers == 0) {
+            return null;
+        }
+        refinedDx /= refinedInliers;
+        refinedDy /= refinedInliers;
+        float inlierFraction = refinedInliers / (float) Math.max(1, matches.size());
+        float meanDescriptorDistance = descriptorTotal / refinedInliers;
+        float confidence = clamp(inlierFraction * (1f - meanDescriptorDistance / 128f), 0f, 1f);
+        if (confidence < movementSensitivity.minimumConfidence) {
+            return null;
+        }
+        return new PairAdjustment(
+                Math.round(refinedDx),
+                Math.round(refinedDy),
+                0,
+                bestResidual / Math.max(1, refinedInliers),
+                confidence);
+    }
+
+    private static PairAdjustment matchOpenCvFeatureOverlap(
+            CalibrationFrame left,
+            CalibrationFrame right,
+            MovementSensitivity movementSensitivity) {
+        if (!OPENCV_AVAILABLE) {
+            return null;
+        }
+        Mat leftMat = null;
+        Mat rightMat = null;
+        Mat leftOverlap = null;
+        Mat rightOverlap = null;
+        MatOfKeyPoint leftKeypoints = new MatOfKeyPoint();
+        MatOfKeyPoint rightKeypoints = new MatOfKeyPoint();
+        Mat leftDescriptors = new Mat();
+        Mat rightDescriptors = new Mat();
+        try {
+            leftMat = left.toOpenCvMat();
+            rightMat = right.toOpenCvMat();
+            float yawDelta = headingDeltaDegrees(left.baseYawDegrees, right.baseYawDegrees);
+            float pitchDelta = Math.abs(left.basePitchDegrees - right.basePitchDegrees);
+            if (pitchDelta > yawDelta * 0.7f) {
+                int leftStartY = left.basePitchDegrees > right.basePitchDegrees
+                        ? Math.max(0, left.height - left.height / 2)
+                        : 0;
+                int rightStartY = left.basePitchDegrees > right.basePitchDegrees
+                        ? 0
+                        : Math.max(0, right.height - right.height / 2);
+                int leftHeight = Math.max(1, left.height / 2);
+                int rightHeight = Math.max(1, right.height / 2);
+                leftOverlap = leftMat.submat(new org.opencv.core.Rect(0, leftStartY, left.width, leftHeight));
+                rightOverlap = rightMat.submat(new org.opencv.core.Rect(0, rightStartY, right.width, rightHeight));
+            } else {
+                boolean rightIsClockwise = normalizeDegrees(right.baseYawDegrees - left.baseYawDegrees) <= 180f;
+                int leftStartX = rightIsClockwise ? Math.max(0, left.width - left.width / 2) : 0;
+                int rightStartX = rightIsClockwise ? 0 : Math.max(0, right.width - right.width / 2);
+                int leftWidth = Math.max(1, left.width / 2);
+                int rightWidth = Math.max(1, right.width / 2);
+                leftOverlap = leftMat.submat(new org.opencv.core.Rect(leftStartX, 0, leftWidth, left.height));
+                rightOverlap = rightMat.submat(new org.opencv.core.Rect(rightStartX, 0, rightWidth, right.height));
+            }
+
+            ORB orb = ORB.create(500);
+            orb.detectAndCompute(leftOverlap, new Mat(), leftKeypoints, leftDescriptors);
+            orb.detectAndCompute(rightOverlap, new Mat(), rightKeypoints, rightDescriptors);
+            if (leftDescriptors.empty() || rightDescriptors.empty()) {
+                return null;
+            }
+
+            List<MatOfDMatch> knnLeftToRight = new ArrayList<>();
+            List<MatOfDMatch> knnRightToLeft = new ArrayList<>();
+            BFMatcher matcher = BFMatcher.create(Core.NORM_HAMMING, false);
+            matcher.knnMatch(leftDescriptors, rightDescriptors, knnLeftToRight, 2);
+            matcher.knnMatch(rightDescriptors, leftDescriptors, knnRightToLeft, 2);
+            boolean[][] reverseAccepted = acceptedReverseMatches(knnRightToLeft);
+            KeyPoint[] leftPoints = leftKeypoints.toArray();
+            KeyPoint[] rightPoints = rightKeypoints.toArray();
+            ArrayList<OpenCvFeaturePair> accepted = new ArrayList<>();
+            for (MatOfDMatch pair : knnLeftToRight) {
+                DMatch[] matches = pair.toArray();
+                if (matches.length < 2) {
+                    continue;
+                }
+                DMatch best = matches[0];
+                DMatch second = matches[1];
+                if (best.distance >= second.distance * 0.78f) {
+                    continue;
+                }
+                if (best.queryIdx < 0 || best.queryIdx >= leftPoints.length
+                        || best.trainIdx < 0 || best.trainIdx >= rightPoints.length
+                        || best.trainIdx >= reverseAccepted.length
+                        || best.queryIdx >= reverseAccepted[best.trainIdx].length
+                        || !reverseAccepted[best.trainIdx][best.queryIdx]) {
+                    continue;
+                }
+                accepted.add(new OpenCvFeaturePair(leftPoints[best.queryIdx].pt, rightPoints[best.trainIdx].pt, best.distance));
+            }
+            if (accepted.size() < FEATURE_MIN_MATCHES) {
+                return null;
+            }
+
+            MatOfPoint2f leftControlPoints = new MatOfPoint2f();
+            MatOfPoint2f rightControlPoints = new MatOfPoint2f();
+            Point[] leftArray = new Point[accepted.size()];
+            Point[] rightArray = new Point[accepted.size()];
+            for (int i = 0; i < accepted.size(); i++) {
+                leftArray[i] = accepted.get(i).left;
+                rightArray[i] = accepted.get(i).right;
+            }
+            leftControlPoints.fromArray(leftArray);
+            rightControlPoints.fromArray(rightArray);
+            Mat inlierMask = new Mat();
+            Mat homography = Geometry.findHomography(
+                    leftControlPoints,
+                    rightControlPoints,
+                    Geometry.RANSAC,
+                    RANSAC_TRANSLATION_TOLERANCE_PIXELS,
+                    inlierMask);
+            if (homography.empty() || inlierMask.empty()) {
+                return null;
+            }
+
+            byte[] mask = new byte[(int) inlierMask.total()];
+            inlierMask.get(0, 0, mask);
+            float dxTotal = 0f;
+            float dyTotal = 0f;
+            float descriptorTotal = 0f;
+            float residualTotal = 0f;
+            int inliers = 0;
+            ArrayList<ControlPointPair> inlierControlPoints = new ArrayList<>();
+            for (int i = 0; i < mask.length && i < accepted.size(); i++) {
+                if (mask[i] == 0) {
+                    continue;
+                }
+                OpenCvFeaturePair pair = accepted.get(i);
+                float dx = (float) (pair.right.x - pair.left.x);
+                float dy = (float) (pair.right.y - pair.left.y);
+                dxTotal += dx;
+                dyTotal += dy;
+                descriptorTotal += pair.distance;
+                inlierControlPoints.add(new ControlPointPair(
+                        (float) pair.left.x,
+                        (float) pair.left.y,
+                        (float) pair.right.x,
+                        (float) pair.right.y,
+                        pair.distance));
+                inliers++;
+            }
+            if (inliers < FEATURE_MIN_MATCHES) {
+                return null;
+            }
+            float meanDx = dxTotal / inliers;
+            float meanDy = dyTotal / inliers;
+            for (int i = 0; i < mask.length && i < accepted.size(); i++) {
+                if (mask[i] == 0) {
+                    continue;
+                }
+                OpenCvFeaturePair pair = accepted.get(i);
+                residualTotal += Math.abs((float) (pair.right.x - pair.left.x) - meanDx)
+                        + Math.abs((float) (pair.right.y - pair.left.y) - meanDy);
+            }
+            float meanDescriptor = descriptorTotal / inliers;
+            float inlierFraction = inliers / (float) Math.max(1, accepted.size());
+            float confidence = clamp(inlierFraction * (1f - meanDescriptor / 96f), 0f, 1f);
+            if (confidence < movementSensitivity.minimumConfidence) {
+                return null;
+            }
+            return new PairAdjustment(
+                    Math.round(meanDx),
+                    Math.round(meanDy),
+                    0,
+                    residualTotal / Math.max(1, inliers),
+                    confidence,
+                    true,
+                    inlierControlPoints);
+        } catch (Throwable ignored) {
+            return null;
+        } finally {
+            releaseMat(leftMat);
+            releaseMat(rightMat);
+            releaseMat(leftOverlap);
+            releaseMat(rightOverlap);
+            releaseMat(leftKeypoints);
+            releaseMat(rightKeypoints);
+            releaseMat(leftDescriptors);
+            releaseMat(rightDescriptors);
+        }
+    }
+
+    private static boolean[][] acceptedReverseMatches(List<MatOfDMatch> knnMatches) {
+        boolean[][] accepted = new boolean[knnMatches.size()][];
+        for (int query = 0; query < knnMatches.size(); query++) {
+            DMatch[] matches = knnMatches.get(query).toArray();
+            int maxTrain = 0;
+            for (DMatch match : matches) {
+                maxTrain = Math.max(maxTrain, match.trainIdx);
+            }
+            accepted[query] = new boolean[Math.max(0, maxTrain + 1)];
+            if (matches.length < 2) {
+                continue;
+            }
+            DMatch best = matches[0];
+            DMatch second = matches[1];
+            if (best.trainIdx >= 0 && best.distance < second.distance * 0.78f) {
+                accepted[query][best.trainIdx] = true;
+            }
+        }
+        return accepted;
+    }
+
+    private static void releaseMat(Mat mat) {
+        if (mat != null) {
+            mat.release();
+        }
+    }
+
+    private static List<ImageFeature> detectOverlapFeatures(CalibrationFrame frame, boolean rightSide) {
+        ArrayList<ImageFeature> features = new ArrayList<>();
+        int startX = rightSide ? Math.max(1, frame.width - frame.width / 2) : 1;
+        int endX = rightSide ? frame.width - 1 : Math.min(frame.width - 1, frame.width / 2);
+        int step = Math.max(3, Math.min(frame.width, frame.height) / 80);
+        for (int y = FEATURE_DESCRIPTOR_RADIUS + 1; y < frame.height - FEATURE_DESCRIPTOR_RADIUS - 1; y += step) {
+            for (int x = startX + FEATURE_DESCRIPTOR_RADIUS; x < endX - FEATURE_DESCRIPTOR_RADIUS; x += step) {
+                int gx = frame.grayAt(x + 1, y) - frame.grayAt(x - 1, y);
+                int gy = frame.grayAt(x, y + 1) - frame.grayAt(x, y - 1);
+                int diagonalA = frame.grayAt(x + 1, y + 1) - frame.grayAt(x - 1, y - 1);
+                int diagonalB = frame.grayAt(x + 1, y - 1) - frame.grayAt(x - 1, y + 1);
+                int score = Math.abs(gx) + Math.abs(gy) + Math.abs(diagonalA) + Math.abs(diagonalB);
+                if (score < 72) {
+                    continue;
+                }
+                float matchX = rightSide ? x - startX : x;
+                insertFeature(features, new ImageFeature(x, y, matchX, y, score, buildBriefDescriptor(frame, x, y)));
+            }
+        }
+        return features;
+    }
+
+    private static void insertFeature(ArrayList<ImageFeature> features, ImageFeature feature) {
+        int index = 0;
+        while (index < features.size() && features.get(index).score >= feature.score) {
+            index++;
+        }
+        features.add(index, feature);
+        if (features.size() > FEATURE_MAX_POINTS) {
+            features.remove(features.size() - 1);
+        }
+    }
+
+    private static long[] buildBriefDescriptor(CalibrationFrame frame, int x, int y) {
+        long first = 0L;
+        long second = 0L;
+        for (int i = 0; i < 64; i++) {
+            if (sampleBriefBit(frame, x, y, i)) {
+                first |= 1L << i;
+            }
+            if (sampleBriefBit(frame, x, y, i + 64)) {
+                second |= 1L << i;
+            }
+        }
+        return new long[]{first, second};
+    }
+
+    private static boolean sampleBriefBit(CalibrationFrame frame, int x, int y, int index) {
+        int ax = ((index * 37 + 11) % 17) - 8;
+        int ay = ((index * 19 + 7) % 17) - 8;
+        int bx = ((index * 29 + 5) % 17) - 8;
+        int by = ((index * 43 + 13) % 17) - 8;
+        return frame.grayAt(x + ax, y + ay) > frame.grayAt(x + bx, y + by);
+    }
+
+    private static int descriptorDistance(long[] left, long[] right) {
+        return Long.bitCount(left[0] ^ right[0]) + Long.bitCount(left[1] ^ right[1]);
     }
 
     private static PairAdjustment correlateOverlap(
@@ -339,17 +825,24 @@ final class Phase5Stitcher {
 
     private static FrameProjection projectionFor(DraftFrameRecord record, Calibration calibration) {
         boolean polar = Math.abs(record.targetPitchDegrees) >= 70;
-        float pitch = polar
-                ? clamp(record.targetPitchDegrees, -89f, 89f)
-                : clamp(record.targetPitchDegrees != 0 ? record.targetPitchDegrees : record.pitchDegrees, -89f, 89f);
+        float baseYaw = record.capturedPoseAvailable
+                ? record.headingDegrees
+                : record.targetYawDegrees;
+        float basePitch = record.capturedPoseAvailable
+                ? record.pitchDegrees
+                : record.targetPitchDegrees;
+        float baseRoll = record.capturedPoseAvailable
+                ? record.rollDegrees
+                : 0f;
+        float pitch = clamp(basePitch, -89f, 89f);
         float horizontalFov = polar ? POLAR_HORIZONTAL_FOV_DEGREES : calibration.lensModel.horizontalFovDegrees;
         float verticalFov = polar
                 ? POLAR_VERTICAL_FOV_DEGREES
                 : clamp(calibration.lensModel.verticalFovDegrees, MIN_VERTICAL_FOV_DEGREES, MAX_VERTICAL_FOV_DEGREES);
         PoseCorrection correction = calibration.corrections.get(record.imageFile.getAbsolutePath());
-        float yaw = normalizeDegrees(record.targetYawDegrees + (correction == null ? 0f : correction.yawDegrees));
+        float yaw = normalizeDegrees(baseYaw + (correction == null ? 0f : correction.yawDegrees));
         pitch = clamp(pitch + (correction == null ? 0f : correction.pitchDegrees), -89f, 89f);
-        float roll = polar ? 0f : clamp(record.rollDegrees * 0.10f + (correction == null ? 0f : correction.rollDegrees), -5f, 5f);
+        float roll = polar ? 0f : clamp(baseRoll * 0.10f + (correction == null ? 0f : correction.rollDegrees), -5f, 5f);
         float centerX = yaw / 360f * OUTPUT_WIDTH;
         float centerY = (90f - pitch) / 180f * OUTPUT_HEIGHT;
         float width = horizontalFov / 360f * OUTPUT_WIDTH;
@@ -362,20 +855,22 @@ final class Phase5Stitcher {
             Bitmap frame,
             FrameProjection projection,
             LensModel lensModel,
+            RenderMode renderMode,
+            int frameIndex,
             float[] red,
             float[] green,
             float[] blue,
             float[] weights) {
-        blendOne(frame, projection, lensModel, projection.bounds, red, green, blue, weights);
+        blendOne(frame, projection, lensModel, renderMode, frameIndex, projection.bounds, red, green, blue, weights);
         if (projection.bounds.left < 0f) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, shifted, red, green, blue, weights);
         }
         if (projection.bounds.right > OUTPUT_WIDTH) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(-OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, shifted, red, green, blue, weights);
         }
     }
 
@@ -383,6 +878,8 @@ final class Phase5Stitcher {
             Bitmap frame,
             FrameProjection projection,
             LensModel lensModel,
+            RenderMode renderMode,
+            int frameIndex,
             RectF bounds,
             float[] red,
             float[] green,
@@ -437,11 +934,24 @@ final class Phase5Stitcher {
                     continue;
                 }
                 int color = pixels[sourceY * frameWidth + sourceX];
+                if (renderMode == RenderMode.CONTRIBUTOR_MAP) {
+                    color = contributorColor(frameIndex, sourceU, sourceV);
+                }
                 int index = outputRow + x;
-                red[index] += ((color >> 16) & 0xFF) * weight;
-                green[index] += ((color >> 8) & 0xFF) * weight;
-                blue[index] += (color & 0xFF) * weight;
-                weights[index] += weight;
+                if (renderMode.selectsBestSource && weight <= weights[index]) {
+                    continue;
+                }
+                if (renderMode.selectsBestSource) {
+                    red[index] = ((color >> 16) & 0xFF) * weight;
+                    green[index] = ((color >> 8) & 0xFF) * weight;
+                    blue[index] = (color & 0xFF) * weight;
+                    weights[index] = weight;
+                } else {
+                    red[index] += ((color >> 16) & 0xFF) * weight;
+                    green[index] += ((color >> 8) & 0xFF) * weight;
+                    blue[index] += (color & 0xFF) * weight;
+                    weights[index] += weight;
+                }
             }
         }
     }
@@ -483,6 +993,15 @@ final class Phase5Stitcher {
         return clamp(1f - 0.72f * radiusSquared, 0.16f, 1f);
     }
 
+    private static int contributorColor(int frameIndex, float sourceU, float sourceV) {
+        int base = CONTRIBUTOR_COLORS[Math.abs(frameIndex) % CONTRIBUTOR_COLORS.length];
+        float grid = sourceU < 0.04f || sourceU > 0.96f || sourceV < 0.04f || sourceV > 0.96f ? 0.55f : 1f;
+        int r = Math.round(((base >> 16) & 0xFF) * grid);
+        int g = Math.round(((base >> 8) & 0xFF) * grid);
+        int b = Math.round((base & 0xFF) * grid);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
     private static void markCoverage(boolean[][] coverage, RectF target) {
         int startColumn = (int) Math.floor(target.left / OUTPUT_WIDTH * COVERAGE_COLUMNS);
         int endColumn = (int) Math.ceil(target.right / OUTPUT_WIDTH * COVERAGE_COLUMNS);
@@ -515,12 +1034,13 @@ final class Phase5Stitcher {
             int coveragePercent,
             int missingExposure,
             Calibration calibration,
-            MovementSensitivity movementSensitivity) {
+            MovementSensitivity movementSensitivity,
+            RenderMode renderMode) {
         try {
             ExifInterface exif = new ExifInterface(file.getAbsolutePath());
             exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, String.format(
                     Locale.US,
-                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; movementSensitivity=%s",
+                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; sparseDepthHints=%s",
                     sessionId,
                     renderedFrames,
                     coveragePercent,
@@ -530,7 +1050,11 @@ final class Phase5Stitcher {
                     calibration.lensModel.radialK1,
                     calibration.lensModel.radialK2,
                     calibration.matchedOverlapCount,
-                    movementSensitivity.label));
+                    calibration.openCvMatchedOverlapCount,
+                    movementSensitivity.label,
+                    renderMode.label,
+                    calibration.captureProfile.label,
+                    calibration.sparseDepthHints.metadataLabel));
             exif.setAttribute(ExifInterface.TAG_MAKE, "Spherify");
             exif.setAttribute(ExifInterface.TAG_MODEL, "Phase 5 draft stitcher");
             exif.saveAttributes();
@@ -557,11 +1081,14 @@ final class Phase5Stitcher {
         }
         if (calibration.matchedOverlapCount == 0) {
             warnings.add("No reliable overlap correlations found");
+        } else if (calibration.openCvMatchedOverlapCount == 0) {
+            warnings.add("OpenCV/RANSAC accepted no overlap pairs; fallback matching drove the alignment");
         } else {
             warnings.add(String.format(
                     Locale.US,
-                    "Applied %d overlap pose nudges at %.2f confidence",
+                    "Applied %d overlap pose nudges, %d from OpenCV/RANSAC, at %.2f confidence",
                     calibration.matchedOverlapCount,
+                    calibration.openCvMatchedOverlapCount,
                     calibration.averageOverlapConfidence));
         }
         warnings.add(String.format(
@@ -570,6 +1097,13 @@ final class Phase5Stitcher {
                 calibration.lensModel.horizontalFovDegrees,
                 calibration.lensModel.radialK1,
                 calibration.lensModel.radialK2));
+        warnings.add("Capture profile: " + calibration.captureProfile.label);
+        if (calibration.captureProfile == CaptureProfile.HANDHELD) {
+            warnings.add("Hand-held parallax expected; use geometry debug output to inspect close-object conflicts");
+        }
+        if (calibration.sparseDepthHints.hasNearObjectRisk) {
+            warnings.add(calibration.sparseDepthHints.warningLabel);
+        }
         warnings.add("Movement sensitivity: " + movementSensitivity.label);
         return warnings;
     }
@@ -577,6 +1111,11 @@ final class Phase5Stitcher {
     private static float normalizeDegrees(float value) {
         float result = value % 360f;
         return result < 0f ? result + 360f : result;
+    }
+
+    private static float headingDeltaDegrees(float first, float second) {
+        float delta = Math.abs(normalizeDegrees(first) - normalizeDegrees(second));
+        return delta > 180f ? 360f - delta : delta;
     }
 
     private static float clamp(float value, float minimum, float maximum) {
@@ -672,21 +1211,82 @@ final class Phase5Stitcher {
         }
     }
 
+    private enum RenderMode {
+        STRONGEST_SOURCE("sharp-best-source", true),
+        CONTRIBUTOR_MAP("contributor-map", true),
+        BLENDED("blended", false);
+
+        final String label;
+        final boolean selectsBestSource;
+
+        RenderMode(String label, boolean selectsBestSource) {
+            this.label = label;
+            this.selectsBestSource = selectsBestSource;
+        }
+
+        static RenderMode from(String mode) {
+            if ("blended".equals(mode)) {
+                return BLENDED;
+            }
+            if ("contributors".equals(mode)) {
+                return CONTRIBUTOR_MAP;
+            }
+            return STRONGEST_SOURCE;
+        }
+    }
+
+    private enum CaptureProfile {
+        HANDHELD("hand-held", 0.20f, 0.05f),
+        FIXED_GIMBAL("fixed gimbal", 0f, 0f);
+
+        final String label;
+        final float expectedPivotOffsetMeters;
+        final float expectedRowHeightOffsetMeters;
+
+        CaptureProfile(String label, float expectedPivotOffsetMeters, float expectedRowHeightOffsetMeters) {
+            this.label = label;
+            this.expectedPivotOffsetMeters = expectedPivotOffsetMeters;
+            this.expectedRowHeightOffsetMeters = expectedRowHeightOffsetMeters;
+        }
+
+        static CaptureProfile from(List<DraftFrameRecord> records) {
+            int gimbal = 0;
+            int handheld = 0;
+            for (DraftFrameRecord record : records) {
+                if ("fixed_gimbal".equals(record.captureProfile)) {
+                    gimbal++;
+                } else {
+                    handheld++;
+                }
+            }
+            return gimbal > handheld ? FIXED_GIMBAL : HANDHELD;
+        }
+    }
+
     private static final class Calibration {
         final LensModel lensModel;
         final Map<String, PoseCorrection> corrections;
         final int matchedOverlapCount;
+        final int openCvMatchedOverlapCount;
         final float averageOverlapConfidence;
+        final CaptureProfile captureProfile;
+        final SparseDepthHints sparseDepthHints;
 
         Calibration(
                 LensModel lensModel,
                 Map<String, PoseCorrection> corrections,
                 int matchedOverlapCount,
-                float averageOverlapConfidence) {
+                int openCvMatchedOverlapCount,
+                float averageOverlapConfidence,
+                CaptureProfile captureProfile,
+                SparseDepthHints sparseDepthHints) {
             this.lensModel = lensModel;
             this.corrections = corrections;
             this.matchedOverlapCount = matchedOverlapCount;
+            this.openCvMatchedOverlapCount = openCvMatchedOverlapCount;
             this.averageOverlapConfidence = averageOverlapConfidence;
+            this.captureProfile = captureProfile;
+            this.sparseDepthHints = sparseDepthHints;
         }
     }
 
@@ -695,9 +1295,23 @@ final class Phase5Stitcher {
         float pitchDegrees;
         float rollDegrees;
         int samples;
+        float weightTotal;
+
+        void add(float yawDegrees, float pitchDegrees, float rollDegrees, float weight) {
+            float safeWeight = Math.max(0.01f, weight);
+            this.yawDegrees += yawDegrees * safeWeight;
+            this.pitchDegrees += pitchDegrees * safeWeight;
+            this.rollDegrees += rollDegrees * safeWeight;
+            this.weightTotal += safeWeight;
+            this.samples++;
+        }
 
         void averageAndClamp() {
-            if (samples > 1) {
+            if (weightTotal > 0f) {
+                yawDegrees /= weightTotal;
+                pitchDegrees /= weightTotal;
+                rollDegrees /= weightTotal;
+            } else if (samples > 1) {
                 yawDegrees /= samples;
                 pitchDegrees /= samples;
                 rollDegrees /= samples;
@@ -708,12 +1322,252 @@ final class Phase5Stitcher {
         }
     }
 
+    private static final class FeatureMatchGraph {
+        final List<FeatureMatchEdge> edges;
+        final boolean globallyOptimizable;
+
+        private FeatureMatchGraph(List<FeatureMatchEdge> edges) {
+            this(edges, false);
+        }
+
+        private FeatureMatchGraph(List<FeatureMatchEdge> edges, boolean globallyOptimizable) {
+            this.edges = edges;
+            this.globallyOptimizable = globallyOptimizable;
+        }
+
+        static FeatureMatchGraph empty() {
+            return new FeatureMatchGraph(new ArrayList<>());
+        }
+    }
+
+    private static final class SparseDepthHints {
+        final boolean hasNearObjectRisk;
+        final String metadataLabel;
+        final String warningLabel;
+
+        private SparseDepthHints(boolean hasNearObjectRisk, String metadataLabel, String warningLabel) {
+            this.hasNearObjectRisk = hasNearObjectRisk;
+            this.metadataLabel = metadataLabel;
+            this.warningLabel = warningLabel;
+        }
+
+        static SparseDepthHints from(FeatureMatchGraph graph, CaptureProfile captureProfile) {
+            if (captureProfile == CaptureProfile.FIXED_GIMBAL) {
+                return new SparseDepthHints(false, "rotation-only-prior", "No near-object parallax risk detected");
+            }
+            if (graph.edges.isEmpty()) {
+                return new SparseDepthHints(
+                        true,
+                        "pending-feature-graph-handheld-prior",
+                        "Sparse depth hints pending; hand-held offset treated as near-object risk");
+            }
+            if (graph.edges.size() < 4) {
+                return new SparseDepthHints(
+                        true,
+                        "weak-sparse-overlap-graph-handheld-prior",
+                        "Sparse depth hints weak; hand-held near-object conflicts may remain");
+            }
+            float residualTotal = 0f;
+            int featureEdges = 0;
+            for (FeatureMatchEdge edge : graph.edges) {
+                if (edge.featureBased) {
+                    residualTotal += edge.residualScore;
+                    featureEdges++;
+                }
+            }
+            float meanResidual = featureEdges == 0 ? 0f : residualTotal / featureEdges;
+            if (meanResidual > 8f) {
+                return new SparseDepthHints(
+                        true,
+                        "high-residual-feature-graph-handheld-prior",
+                        "High feature residuals suggest nearby parallax; prefer sharp source selection and seam routing");
+            }
+            return new SparseDepthHints(
+                    false,
+                    "sparse-overlap-graph-no-depth-outliers",
+                    "Sparse depth hints found no strong near-object conflicts");
+        }
+    }
+
+    private static final class FeatureMatchEdge {
+        final String fromPath;
+        final String toPath;
+        final float relativeYawDegrees;
+        final float relativePitchDegrees;
+        final float relativeRollDegrees;
+        final float confidence;
+        final float residualScore;
+        final boolean featureBased;
+        final List<ControlPointPair> inlierControlPoints;
+
+        FeatureMatchEdge(
+                String fromPath,
+                String toPath,
+                float relativeYawDegrees,
+                float relativePitchDegrees,
+                float relativeRollDegrees,
+                float confidence) {
+            this(fromPath, toPath, relativeYawDegrees, relativePitchDegrees, relativeRollDegrees, confidence, 0f, false, new ArrayList<>());
+        }
+
+        FeatureMatchEdge(
+                String fromPath,
+                String toPath,
+                float relativeYawDegrees,
+                float relativePitchDegrees,
+                float relativeRollDegrees,
+                float confidence,
+                float residualScore,
+                boolean featureBased) {
+            this(fromPath, toPath, relativeYawDegrees, relativePitchDegrees, relativeRollDegrees, confidence, residualScore, featureBased, new ArrayList<>());
+        }
+
+        FeatureMatchEdge(
+                String fromPath,
+                String toPath,
+                float relativeYawDegrees,
+                float relativePitchDegrees,
+                float relativeRollDegrees,
+                float confidence,
+                float residualScore,
+                boolean featureBased,
+                List<ControlPointPair> inlierControlPoints) {
+            this.fromPath = fromPath;
+            this.toPath = toPath;
+            this.relativeYawDegrees = relativeYawDegrees;
+            this.relativePitchDegrees = relativePitchDegrees;
+            this.relativeRollDegrees = relativeRollDegrees;
+            this.confidence = confidence;
+            this.residualScore = residualScore;
+            this.featureBased = featureBased;
+            this.inlierControlPoints = inlierControlPoints;
+        }
+    }
+
+    private static final class GlobalPoseOptimization {
+        final FeatureMatchGraph graph;
+        final Map<String, PoseCorrection> corrections;
+
+        private GlobalPoseOptimization(FeatureMatchGraph graph, Map<String, PoseCorrection> corrections) {
+            this.graph = graph;
+            this.corrections = corrections;
+        }
+
+        static GlobalPoseOptimization from(FeatureMatchGraph graph, Map<String, PoseCorrection> corrections) {
+            return new GlobalPoseOptimization(graph, corrections);
+        }
+
+        void apply() {
+            if (!graph.globallyOptimizable || graph.edges.isEmpty()) {
+                return;
+            }
+            for (int iteration = 0; iteration < 5; iteration++) {
+                HashMap<String, PoseCorrection> optimized = new HashMap<>();
+                for (FeatureMatchEdge edge : graph.edges) {
+                    if (edge.confidence <= 0f) {
+                        continue;
+                    }
+                    float graphWeight = edge.featureBased
+                            ? edge.confidence * Math.max(1f, edge.inlierControlPoints.size() / 12f)
+                            : edge.confidence * 0.45f;
+                    PoseCorrection source = optimized.computeIfAbsent(edge.fromPath, ignored -> new PoseCorrection());
+                    PoseCorrection target = optimized.computeIfAbsent(edge.toPath, ignored -> new PoseCorrection());
+                    source.add(
+                            -edge.relativeYawDegrees * 0.35f,
+                            -edge.relativePitchDegrees * 0.35f,
+                            -edge.relativeRollDegrees * 0.35f,
+                            graphWeight);
+                    target.add(
+                            edge.relativeYawDegrees * 0.65f,
+                            edge.relativePitchDegrees * 0.65f,
+                            edge.relativeRollDegrees * 0.65f,
+                            graphWeight);
+                }
+                for (Map.Entry<String, PoseCorrection> entry : optimized.entrySet()) {
+                    PoseCorrection correction = entry.getValue();
+                    correction.averageAndClamp();
+                    corrections.put(entry.getKey(), correction);
+                }
+            }
+        }
+    }
+
+    private static final class ImageFeature {
+        final int x;
+        final int y;
+        final float matchX;
+        final float matchY;
+        final int score;
+        final long[] descriptor;
+
+        ImageFeature(int x, int y, float matchX, float matchY, int score, long[] descriptor) {
+            this.x = x;
+            this.y = y;
+            this.matchX = matchX;
+            this.matchY = matchY;
+            this.score = score;
+            this.descriptor = descriptor;
+        }
+    }
+
+    private static final class FeaturePair {
+        final ImageFeature left;
+        final ImageFeature right;
+        final int distance;
+
+        FeaturePair(ImageFeature left, ImageFeature right, int distance) {
+            this.left = left;
+            this.right = right;
+            this.distance = distance;
+        }
+    }
+
+    private static final class OpenCvFeaturePair {
+        final Point left;
+        final Point right;
+        final float distance;
+
+        OpenCvFeaturePair(Point left, Point right, float distance) {
+            this.left = left;
+            this.right = right;
+            this.distance = distance;
+        }
+    }
+
+    private static final class ControlPointPair {
+        final float leftX;
+        final float leftY;
+        final float rightX;
+        final float rightY;
+        final float descriptorDistance;
+
+        ControlPointPair(float leftX, float leftY, float rightX, float rightY, float descriptorDistance) {
+            this.leftX = leftX;
+            this.leftY = leftY;
+            this.rightX = rightX;
+            this.rightY = rightY;
+            this.descriptorDistance = descriptorDistance;
+        }
+    }
+
+    private static final class FramePair {
+        final CalibrationFrame left;
+        final CalibrationFrame right;
+
+        FramePair(CalibrationFrame left, CalibrationFrame right) {
+            this.left = left;
+            this.right = right;
+        }
+    }
+
     private static final class PairAdjustment {
         final int horizontalOffsetPixels;
         final int verticalOffsetPixels;
         final int rollPixels;
         final float score;
         final float confidence;
+        final boolean featureBased;
+        final List<ControlPointPair> inlierControlPoints;
 
         PairAdjustment(
                 int horizontalOffsetPixels,
@@ -721,11 +1575,34 @@ final class Phase5Stitcher {
                 int rollPixels,
                 float score,
                 float confidence) {
+            this(horizontalOffsetPixels, verticalOffsetPixels, rollPixels, score, confidence, false, new ArrayList<>());
+        }
+
+        PairAdjustment(
+                int horizontalOffsetPixels,
+                int verticalOffsetPixels,
+                int rollPixels,
+                float score,
+                float confidence,
+                boolean featureBased) {
+            this(horizontalOffsetPixels, verticalOffsetPixels, rollPixels, score, confidence, featureBased, new ArrayList<>());
+        }
+
+        PairAdjustment(
+                int horizontalOffsetPixels,
+                int verticalOffsetPixels,
+                int rollPixels,
+                float score,
+                float confidence,
+                boolean featureBased,
+                List<ControlPointPair> inlierControlPoints) {
             this.horizontalOffsetPixels = horizontalOffsetPixels;
             this.verticalOffsetPixels = verticalOffsetPixels;
             this.rollPixels = rollPixels;
             this.score = score;
             this.confidence = confidence;
+            this.featureBased = featureBased;
+            this.inlierControlPoints = inlierControlPoints;
         }
     }
 
@@ -800,6 +1677,16 @@ final class Phase5Stitcher {
 
         int grayAt(int x, int y) {
             return grayscale[clamp(y, 0, height - 1) * width + clamp(x, 0, width - 1)];
+        }
+
+        Mat toOpenCvMat() {
+            Mat mat = new Mat(height, width, CvType.CV_8UC1);
+            byte[] bytes = new byte[grayscale.length];
+            for (int i = 0; i < grayscale.length; i++) {
+                bytes[i] = (byte) clamp(grayscale[i], 0, 255);
+            }
+            mat.put(0, 0, bytes);
+            return mat;
         }
     }
 

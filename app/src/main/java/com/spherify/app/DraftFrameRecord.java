@@ -18,6 +18,8 @@ final class DraftFrameRecord {
     final float headingDegrees;
     final float pitchDegrees;
     final float rollDegrees;
+    final boolean capturedPoseAvailable;
+    final String captureProfile;
     final int targetYawDegrees;
     final int targetPitchDegrees;
     final String captureMode;
@@ -25,6 +27,12 @@ final class DraftFrameRecord {
     final float lensFocalLengthMm;
     final float sensorPhysicalWidthMm;
     final float sensorPhysicalHeightMm;
+    final float imageFocalLengthXPixels;
+    final float imageFocalLengthYPixels;
+    final float imagePrincipalPointXPixels;
+    final float imagePrincipalPointYPixels;
+    final int imageIntrinsicsWidth;
+    final int imageIntrinsicsHeight;
 
     DraftFrameRecord(
             File imageFile,
@@ -34,13 +42,21 @@ final class DraftFrameRecord {
             float headingDegrees,
             float pitchDegrees,
             float rollDegrees,
+            boolean capturedPoseAvailable,
+            String captureProfile,
             int targetYawDegrees,
             int targetPitchDegrees,
             String captureMode,
             boolean exposureAvailable,
             float lensFocalLengthMm,
             float sensorPhysicalWidthMm,
-            float sensorPhysicalHeightMm) {
+            float sensorPhysicalHeightMm,
+            float imageFocalLengthXPixels,
+            float imageFocalLengthYPixels,
+            float imagePrincipalPointXPixels,
+            float imagePrincipalPointYPixels,
+            int imageIntrinsicsWidth,
+            int imageIntrinsicsHeight) {
         this.imageFile = imageFile;
         this.sessionId = sessionId;
         this.createdAt = createdAt;
@@ -48,6 +64,8 @@ final class DraftFrameRecord {
         this.headingDegrees = headingDegrees;
         this.pitchDegrees = pitchDegrees;
         this.rollDegrees = rollDegrees;
+        this.capturedPoseAvailable = capturedPoseAvailable;
+        this.captureProfile = captureProfile;
         this.targetYawDegrees = targetYawDegrees;
         this.targetPitchDegrees = targetPitchDegrees;
         this.captureMode = captureMode;
@@ -55,5 +73,11 @@ final class DraftFrameRecord {
         this.lensFocalLengthMm = lensFocalLengthMm;
         this.sensorPhysicalWidthMm = sensorPhysicalWidthMm;
         this.sensorPhysicalHeightMm = sensorPhysicalHeightMm;
+        this.imageFocalLengthXPixels = imageFocalLengthXPixels;
+        this.imageFocalLengthYPixels = imageFocalLengthYPixels;
+        this.imagePrincipalPointXPixels = imagePrincipalPointXPixels;
+        this.imagePrincipalPointYPixels = imagePrincipalPointYPixels;
+        this.imageIntrinsicsWidth = imageIntrinsicsWidth;
+        this.imageIntrinsicsHeight = imageIntrinsicsHeight;
     }
 }

@@ -86,6 +86,7 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.ar.core.ArCoreApk;
+import com.google.ar.core.CameraIntrinsics;
 import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.ImageMetadata;
@@ -118,13 +119,16 @@ import javax.microedition.khronos.opengles.GL10;
 public class CaptureActivity extends ComponentActivity implements SensorEventListener {
     private static final String PREFS = "spherify_capture";
     private static final String PREF_ACTIVE_SESSION_ID = "activeSessionId";
+    private static final String PREF_CAPTURE_PROFILE = "captureProfile";
+    private static final String CAPTURE_PROFILE_HANDHELD = "handheld";
+    private static final String CAPTURE_PROFILE_FIXED_GIMBAL = "fixed_gimbal";
     private static final long REQUIRED_COMPASS_HIGH_ACCURACY_MS = 2000L;
     private static final long REQUIRED_CALIBRATION_DURATION_MS = 8000L;
     private static final long REQUIRED_HEADING_STABILITY_MS = 1000L;
     private static final long REQUIRED_TARGET_LOCK_MS = 1000L;
     private static final int REQUIRED_HEADING_BINS = 8;
-    private static final int HORIZON_REFERENCE_BIN_COUNT = 24;
-    private static final int REQUIRED_HORIZON_REFERENCE_BINS = 22;
+    private static final int HORIZON_REFERENCE_BIN_COUNT = 16;
+    private static final int REQUIRED_HORIZON_REFERENCE_BINS = 14;
     private static final int HORIZON_REFERENCE_SAMPLE_WIDTH = 96;
     private static final int HORIZON_REFERENCE_SAMPLE_HEIGHT = 144;
     private static final float MAX_HORIZON_SWEEP_PITCH_DEGREES = 18f;
@@ -136,20 +140,24 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private static final float TILT_WARNING_START_DEGREES = 2f;
     private static final float TILT_WARNING_FULL_DEGREES = 12f;
     private static final float HORIZON_REFERENCE_VIEW_DEGREES = 82f;
-    private static final int SWEEP_CAPTURE_BIN_COUNT = 24;
-    private static final int REQUIRED_SWEEP_CAPTURE_BINS = 22;
+    private static final int SWEEP_CAPTURE_BIN_COUNT = 16;
+    private static final int REQUIRED_SWEEP_CAPTURE_BINS = 14;
     private static final int[] SWEEP_LAYER_PITCH_DEGREES = {0, 30, -30, 65, -65};
     private static final int SWEEP_LAYER_HIGH_UPPER_INDEX = 3;
     private static final int SWEEP_LAYER_HIGH_LOWER_INDEX = 4;
-    private static final int[] HIGH_PITCH_RING_YAW_DEGREES = {0, 90, 180, 270};
-    private static final int[] HIGH_PITCH_RING_SWEEP_BINS = {0, 6, 12, 18};
-    private static final float MAX_HIGH_PITCH_RING_YAW_DELTA_DEGREES = 18f;
+    private static final int[] HIGH_PITCH_RING_YAW_DEGREES = {0, 45, 90, 135, 180, 225, 270, 315};
+    private static final int[] HIGH_PITCH_RING_SWEEP_BINS = {0, 2, 4, 6, 8, 10, 12, 14};
+    private static final float MAX_HIGH_PITCH_RING_YAW_DELTA_DEGREES = 14f;
     private static final float MAX_SWEEP_LAYER_PITCH_DELTA_DEGREES = 12f;
     private static final int[] POLAR_ROLL_SLOT_TARGETS = {0};
     private static final int[] POLAR_ROLL_SLOT_SWEEP_BINS = {12};
     private static final float COMPASS_SCREEN_FLIP_PITCH_DEGREES = 30f;
     private static final long MIN_SWEEP_CAPTURE_INTERVAL_MS = 850L;
+    private static final long REQUIRED_KEYFRAME_STILL_MS = 700L;
     private static final float MAX_STABLE_HEADING_DELTA_DEGREES = 4f;
+    private static final float MAX_KEYFRAME_YAW_RATE_DEGREES_PER_SECOND = 4.5f;
+    private static final float MAX_KEYFRAME_PITCH_RATE_DEGREES_PER_SECOND = 3.5f;
+    private static final float MAX_KEYFRAME_ROLL_RATE_DEGREES_PER_SECOND = 5.0f;
     private static final float MAX_TARGET_YAW_DELTA_DEGREES = 10f;
     private static final float MAX_TARGET_PITCH_DELTA_DEGREES = 9f;
     private static final float REQUIRED_TILT_VARIATION = 0.55f;
@@ -172,6 +180,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private Button calibrationButton;
     private Button pauseButton;
     private Button autoCaptureButton;
+    private Button captureProfileButton;
     private SpherifyLibrary library;
     private SharedPreferences capturePrefs;
     private SensorManager sensorManager;
@@ -257,12 +266,21 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private float lastSweepSpeedHeadingDegrees;
     private float sweepYawRateDegreesPerSecond;
     private String sweepSpeedMessage = "";
+    private long lastKeyframeMotionAt;
+    private long keyframeStillStartedAt;
+    private float lastKeyframeHeadingDegrees;
+    private float lastKeyframePitchDegrees;
+    private float lastKeyframeRollDegrees;
+    private float keyframeYawRateDegreesPerSecond;
+    private float keyframePitchRateDegreesPerSecond;
+    private float keyframeRollRateDegreesPerSecond;
     private final Object arFrameLock = new Object();
     private Session arSession;
     private SharedCamera sharedCamera;
     private int arCameraTextureId;
     private byte[] latestArJpeg;
     private String latestExposureMetadataJson;
+    private String captureProfile = CAPTURE_PROFILE_HANDHELD;
     private Bitmap latestArPreviewBitmap;
     private SizeF cameraSensorPhysicalSize;
     private float minAccelX = Float.MAX_VALUE;
@@ -297,6 +315,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             throw new IllegalStateException("could not open capture library", e);
         }
         capturePrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        captureProfile = normalizeCaptureProfile(capturePrefs.getString(PREF_CAPTURE_PROFILE, CAPTURE_PROFILE_HANDHELD));
         sessionId = capturePrefs.getString(PREF_ACTIVE_SESSION_ID, "");
         if (sessionId.isEmpty()) {
             sessionId = newSessionId();
@@ -401,6 +420,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
 
         sensorOverlayButton = makeButton("Show Sensors");
         sensorOverlayButton.setOnClickListener(v -> toggleSensorOverlay());
+        captureProfileButton = makeButton(captureProfileLabel());
+        captureProfileButton.setOnClickListener(v -> chooseCaptureProfile());
         Button skipPolesButton = makeButton("Skip Poles");
         skipPolesButton.setOnClickListener(v -> skipHighAndLowLayers());
         Button cancelButton = makeButton("Cancel");
@@ -411,6 +432,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         secondaryControls.setGravity(Gravity.CENTER);
         secondaryControls.setPadding(10, 0, 10, 14);
         secondaryControls.addView(sensorOverlayButton);
+        secondaryControls.addView(captureProfileButton);
         secondaryControls.addView(skipPolesButton);
         secondaryControls.addView(cancelButton);
         root.addView(secondaryControls);
@@ -946,9 +968,30 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             endHorizonReferenceSweep();
         } else if (horizonSweepComplete) {
             handleSweepLayerButton();
+        } else if (horizonSweepStarted) {
+            confirmRestartHorizonReferenceSweep();
         } else {
             startHorizonReferenceSweep();
         }
+    }
+
+    private void confirmRestartHorizonReferenceSweep() {
+        new AlertDialog.Builder(this)
+                .setTitle("Restart horizon set?")
+                .setMessage("This clears the initial horizon reference samples and lets you set a fresh start point. Later capture layers are not affected.")
+                .setNegativeButton("Keep Going", null)
+                .setPositiveButton("Restart", (dialog, which) -> restartHorizonReferenceSweep())
+                .show();
+    }
+
+    private void restartHorizonReferenceSweep() {
+        resetHorizonReferenceSweep(false);
+        horizonSweepStarted = false;
+        horizonSweepComplete = false;
+        horizonSweepAwaitingClose = false;
+        statusText.setText("Align start point");
+        Toast.makeText(this, "Horizon set cleared. Align a start point and tap Start.", Toast.LENGTH_LONG).show();
+        updateCompassUi();
     }
 
     /*
@@ -1007,7 +1050,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             updateCompassUi();
             return;
         }
-        resetHorizonReferenceSweep();
+        resetHorizonReferenceSweep(true);
         horizonSweepStarted = true;
         horizonSweepComplete = false;
         horizonSweepAwaitingClose = false;
@@ -1023,7 +1066,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         statusText.setText("Sweep horizon");
         Toast.makeText(
                 this,
-                "Reference point set. Slowly sweep the phone around the horizon once.",
+                "Reference point set. Move dot to dot around the horizon and hold still for each capture.",
                 Toast.LENGTH_LONG).show();
         updateCompassUi();
     }
@@ -1064,6 +1107,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * pass can replace the translucent overlay.
      */
     private void resetHorizonReferenceSweep() {
+        resetHorizonReferenceSweep(true);
+    }
+
+    private void resetHorizonReferenceSweep(boolean resetAllCoverage) {
         for (int i = 0; i < horizonReferenceBins.length; i++) {
             horizonReferenceBins[i] = false;
             if (horizonReferenceFrames[i] != null) {
@@ -1079,10 +1126,21 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         currentSweepLayerIndex = 0;
         sweepLayerStartHeadingDegrees = compassHeadingDegrees;
         sweepLayerPaintingActive = false;
-        resetSweepCaptureCoverage();
+        if (resetAllCoverage) {
+            resetSweepCaptureCoverage();
+        } else {
+            for (int i = 0; i < sweepCaptureBins[0].length; i++) {
+                sweepCaptureBins[0][i] = false;
+                if (sweepCapturePreviewFrames[0][i] != null) {
+                    sweepCapturePreviewFrames[0][i].recycle();
+                    sweepCapturePreviewFrames[0][i] = null;
+                }
+            }
+            rebuildPaintedPhotospherePreview();
+        }
         resetSweepMotionFeedback();
         if (guideView != null) {
-            guideView.setHorizonReference(null, false, false, 0f, false, false, "", 0f);
+            guideView.setHorizonReference(null, false, false, 0f, false, false, "", 0f, null, 0);
             guideView.setSweepPaintState(
                     false,
                     "Horizon",
@@ -1096,6 +1154,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     false,
                     null,
                     0,
+                    0f,
                     false,
                     false);
         }
@@ -1491,6 +1550,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         rawCompassHeadingDegrees = normalizeHeading(headingDegrees);
         compassHeadingDegrees = smoothHeading(rawCompassHeadingDegrees);
         hasHeadingReading = true;
+        if (hasPitchRollReading) {
+            updateKeyframeStillness();
+        }
         updateHeadingStability();
         recordHeadingCoverage();
         recordHorizonReferenceSample();
@@ -1521,6 +1583,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         rollDegrees = (float) Math.toDegrees(Math.atan2(latestArPoseMatrix[1], latestArPoseMatrix[5]));
         hasHeadingReading = true;
         hasPitchRollReading = true;
+        updateKeyframeStillness();
         updateHeadingStability();
         recordHeadingCoverage();
         updateSweepMotionFeedback();
@@ -1550,9 +1613,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         guideHeadingDegrees = smoothGuideHeading(compassHeadingDegrees);
         guidePitchDegrees = smoothGuidePitch(effectiveGuidePitchDegrees());
         activeTargetIndex = -1;
-        boolean aligned = horizonSweepComplete && isSweepLayerPitchAligned();
-        boolean stable = aligned && !"Move slower".equals(currentSweepSpeedMessage());
-        float lockProgress = sweepLayerProgress(currentSweepLayerIndex);
+        boolean aligned = horizonSweepComplete
+                ? isSweepLayerPitchAligned()
+                : horizonSweepStarted && Math.abs(pitchDegrees) <= MAX_HORIZON_SWEEP_PITCH_DEGREES;
+        boolean stable = aligned && isKeyframeStable();
+        float lockProgress = keyframeLockProgress();
         if (guideView != null) {
             guideView.setHorizonReference(
                     paintedPhotospherePreview,
@@ -1562,7 +1627,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     horizonSweepAwaitingClose,
                     isAlignedWithHorizonStart(),
                     currentSweepSpeedMessage(),
-                    currentSweepTiltDeltaDegrees());
+                    currentSweepTiltDeltaDegrees(),
+                    horizonReferenceBins,
+                    horizonReferenceBinForHeading(compassHeadingDegrees));
             guideView.setGuideState(
                     captureTargets,
                     activeTargetIndex,
@@ -1586,6 +1653,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     isAlignedWithSweepLayerStart(),
                     currentSweepLayerBins(),
                     currentOverlayBin(),
+                    relativeSweepYawDegrees(guideHeadingDegrees),
                     previewDragActive,
                     isCurrentPolarLayer());
             if (aligned && !stable && !guideRefreshPosted) {
@@ -1994,6 +2062,76 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         lastSweepSpeedHeadingDegrees = compassHeadingDegrees;
         sweepYawRateDegreesPerSecond = 0f;
         sweepSpeedMessage = "Begin sweep";
+        resetKeyframeStillness();
+    }
+
+    private void updateKeyframeStillness() {
+        long now = System.currentTimeMillis();
+        if (lastKeyframeMotionAt == 0L) {
+            lastKeyframeMotionAt = now;
+            lastKeyframeHeadingDegrees = compassHeadingDegrees;
+            lastKeyframePitchDegrees = pitchDegrees;
+            lastKeyframeRollDegrees = rollDegrees;
+            keyframeStillStartedAt = now;
+            return;
+        }
+        long elapsedMs = now - lastKeyframeMotionAt;
+        if (elapsedMs < 80L) {
+            return;
+        }
+        keyframeYawRateDegreesPerSecond = headingDeltaDegrees(compassHeadingDegrees, lastKeyframeHeadingDegrees)
+                * 1000f / Math.max(1L, elapsedMs);
+        keyframePitchRateDegreesPerSecond = Math.abs(pitchDegrees - lastKeyframePitchDegrees)
+                * 1000f / Math.max(1L, elapsedMs);
+        keyframeRollRateDegreesPerSecond = Math.abs(rollDegrees - lastKeyframeRollDegrees)
+                * 1000f / Math.max(1L, elapsedMs);
+        if (!isKeyframeMotionQuiet()) {
+            keyframeStillStartedAt = 0L;
+        } else if (keyframeStillStartedAt == 0L) {
+            keyframeStillStartedAt = now;
+        }
+        lastKeyframeMotionAt = now;
+        lastKeyframeHeadingDegrees = compassHeadingDegrees;
+        lastKeyframePitchDegrees = pitchDegrees;
+        lastKeyframeRollDegrees = rollDegrees;
+    }
+
+    private void resetKeyframeStillness() {
+        lastKeyframeMotionAt = 0L;
+        keyframeStillStartedAt = 0L;
+        keyframeYawRateDegreesPerSecond = 0f;
+        keyframePitchRateDegreesPerSecond = 0f;
+        keyframeRollRateDegreesPerSecond = 0f;
+    }
+
+    private boolean isKeyframeMotionQuiet() {
+        return keyframeYawRateDegreesPerSecond <= MAX_KEYFRAME_YAW_RATE_DEGREES_PER_SECOND
+                && keyframePitchRateDegreesPerSecond <= MAX_KEYFRAME_PITCH_RATE_DEGREES_PER_SECOND
+                && keyframeRollRateDegreesPerSecond <= MAX_KEYFRAME_ROLL_RATE_DEGREES_PER_SECOND;
+    }
+
+    private boolean isKeyframeStable() {
+        return keyframeStillStartedAt > 0L
+                && System.currentTimeMillis() - keyframeStillStartedAt >= REQUIRED_KEYFRAME_STILL_MS
+                && isKeyframeMotionQuiet();
+    }
+
+    private float keyframeLockProgress() {
+        if (keyframeStillStartedAt == 0L || !isKeyframeMotionQuiet()) {
+            return 0f;
+        }
+        return clamp01((System.currentTimeMillis() - keyframeStillStartedAt)
+                / (float) REQUIRED_KEYFRAME_STILL_MS);
+    }
+
+    private String keyframeStillnessMessage() {
+        if (!isKeyframeMotionQuiet()) {
+            return "Hold still";
+        }
+        if (!isKeyframeStable()) {
+            return "Hold for keyframe";
+        }
+        return "Keyframe ready";
     }
 
     /*
@@ -2004,6 +2142,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * user is building the horizon strip.
      */
     private String currentSweepStatusText() {
+        if (horizonSweepStarted && !horizonSweepComplete) {
+            return keyframeStillnessMessage();
+        }
         String message = currentSweepSpeedMessage();
         return "Good pace".equals(message) ? "Sweep horizon" : message;
     }
@@ -2123,6 +2264,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 || previewView == null
                 || !hasHeadingReading
                 || !hasPitchRollReading
+                || !isKeyframeStable()
                 || Math.abs(pitchDegrees) > MAX_HORIZON_SWEEP_PITCH_DEGREES) {
             return;
         }
@@ -2159,7 +2301,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     horizonSweepAwaitingClose,
                     isAlignedWithHorizonStart(),
                     currentSweepSpeedMessage(),
-                    currentSweepTiltDeltaDegrees());
+                    currentSweepTiltDeltaDegrees(),
+                    horizonReferenceBins,
+                    horizonReferenceBinForHeading(compassHeadingDegrees));
         }
     }
 
@@ -2843,7 +2987,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 "%s %.0f%% - %s",
                 currentSweepLayerName(),
                 sweepLayerProgress(currentSweepLayerIndex) * 100f,
-                currentSweepSpeedMessage());
+                keyframeStillnessMessage());
     }
 
     /*
@@ -2908,7 +3052,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Function: showHighPitchRingInfoIfNeeded
      * Arguments: none.
      * Calls: AlertDialog.Builder.
-     * Flow: explain the cardinal high-pitch ring once, before the first high row
+     * Flow: explain the eight-shot high-pitch ring once, before the first high row
      * asks the user to pan away from and back to the horizon for each shot.
      */
     private void showHighPitchRingInfoIfNeeded() {
@@ -2918,7 +3062,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         highPitchRingInfoShown = true;
         new AlertDialog.Builder(this)
                 .setTitle("High-pitch ring")
-                .setMessage("For the top and bottom coverage rows, take four steady photographs at 0, 90, 180, and 270 degrees.\n\nFor each one: face the horizon direction first, pan up or down to the pitch line, capture, then pan back to the horizon before rotating to the next direction.\n\nThis keeps ARCore tracking healthier than pointing almost straight up or down.")
+                .setMessage("For the top and bottom coverage rows, take eight steady photographs every 45 degrees around the horizon.\n\nFor each one: face the horizon direction first, pan up or down to the pitch line, capture, then pan back to the horizon before rotating to the next direction.\n\nThis gives the stitcher more high-angle overlap while keeping ARCore tracking healthier than pointing almost straight up or down.")
                 .setPositiveButton("OK", null)
                 .show();
     }
@@ -3348,8 +3492,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Function: maybeAutoCapture
      * Arguments: none.
      * Calls: captureFrame() and System.currentTimeMillis().
-     * Flow: auto-capture a new frame whenever the active sweep layer reaches an
-     * unpainted yaw bin at acceptable motion speed.
+     * Flow: auto-capture a new still keyframe only after the active sweep layer
+     * reaches an unpainted yaw bin and yaw/pitch/roll motion has been quiet for
+     * a short dwell. The preview remains continuous, but moving transition
+     * frames are ignored for stitching.
      */
     private void maybeAutoCapture() {
         long now = System.currentTimeMillis();
@@ -3363,6 +3509,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 && !isCurrentHighPitchRingLayer()
                 && isSweepLayerPitchAligned()
                 && (isCurrentPolarLayer() || !"Move slower".equals(currentSweepSpeedMessage()))
+                && isKeyframeStable()
                 && !sweepCaptureBins[currentSweepLayerIndex][bin]
                 && now - lastAutoCaptureAt > MIN_SWEEP_CAPTURE_INTERVAL_MS) {
             lastAutoCaptureAt = now;
@@ -3409,12 +3556,42 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      */
     private void toggleAutoCapture() {
         autoCaptureEnabled = !autoCaptureEnabled;
-        autoCaptureButton.setText(autoCaptureEnabled ? "Auto Paint" : "Manual Paint");
+        autoCaptureButton.setText(autoCaptureEnabled ? "Auto Keyframes" : "Manual Keyframes");
         Toast.makeText(
                 this,
-                autoCaptureEnabled ? "Auto paint saves each new sweep slice" : "Manual paint only",
+                autoCaptureEnabled ? "Auto saves still keyframes only" : "Manual keyframes only",
                 Toast.LENGTH_SHORT).show();
         maybeAutoCapture();
+    }
+
+    private void chooseCaptureProfile() {
+        String[] labels = {"Hand-held", "Fixed gimbal"};
+        String[] values = {CAPTURE_PROFILE_HANDHELD, CAPTURE_PROFILE_FIXED_GIMBAL};
+        int checked = CAPTURE_PROFILE_FIXED_GIMBAL.equals(captureProfile) ? 1 : 0;
+        new AlertDialog.Builder(this)
+                .setTitle("Capture profile")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    captureProfile = values[which];
+                    capturePrefs.edit().putString(PREF_CAPTURE_PROFILE, captureProfile).apply();
+                    captureProfileButton.setText(captureProfileLabel());
+                    Toast.makeText(this, captureProfileDescription(), Toast.LENGTH_SHORT).show();
+                    dialog.dismiss();
+                })
+                .show();
+    }
+
+    private String captureProfileLabel() {
+        return CAPTURE_PROFILE_FIXED_GIMBAL.equals(captureProfile) ? "Gimbal" : "Hand-held";
+    }
+
+    private String captureProfileDescription() {
+        return CAPTURE_PROFILE_FIXED_GIMBAL.equals(captureProfile)
+                ? "Fixed gimbal: rotation-only stitching assumptions"
+                : "Hand-held: parallax treated as a stitching risk";
+    }
+
+    private static String normalizeCaptureProfile(String value) {
+        return CAPTURE_PROFILE_FIXED_GIMBAL.equals(value) ? CAPTURE_PROFILE_FIXED_GIMBAL : CAPTURE_PROFILE_HANDHELD;
     }
 
     /*
@@ -3693,7 +3870,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private void updateExposureMetadataFromArFrame(Frame frame) {
         try {
             ImageMetadata metadata = frame.getImageMetadata();
-            String exposureJson = captureExposureMetadataJson(metadata);
+            String exposureJson = captureExposureMetadataJson(metadata, frame);
             synchronized (arFrameLock) {
                 latestExposureMetadataJson = exposureJson;
             }
@@ -3719,7 +3896,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Flow: convert the exposure-relevant camera fields into a small structured
      * JSON object that is written beside each draft frame for Phase 5 stitching.
      */
-    private String captureExposureMetadataJson(ImageMetadata metadata) {
+    private String captureExposureMetadataJson(ImageMetadata metadata, Frame frame) {
         try {
             JSONObject json = new JSONObject();
             json.put("available", true);
@@ -3737,6 +3914,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 json.put("sensorPhysicalWidthMm", cameraSensorPhysicalSize.getWidth());
                 json.put("sensorPhysicalHeightMm", cameraSensorPhysicalSize.getHeight());
             }
+            putImageIntrinsicsMetadata(json, frame);
             putIntMetadata(json, "aeState", metadata, ImageMetadata.CONTROL_AE_STATE);
             putIntMetadata(json, "awbState", metadata, ImageMetadata.CONTROL_AWB_STATE);
             putIntMetadata(json, "aeExposureCompensation", metadata, ImageMetadata.CONTROL_AE_EXPOSURE_COMPENSATION);
@@ -3745,6 +3923,28 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return json.toString();
         } catch (JSONException e) {
             return unavailableExposureJson("metadata encode failed");
+        }
+    }
+
+    private static void putImageIntrinsicsMetadata(JSONObject json, Frame frame) throws JSONException {
+        try {
+            CameraIntrinsics intrinsics = frame.getCamera().getImageIntrinsics();
+            float[] focalLength = intrinsics.getFocalLength();
+            float[] principalPoint = intrinsics.getPrincipalPoint();
+            int[] imageDimensions = intrinsics.getImageDimensions();
+            json.put("imageFocalLengthXPixels", focalLength.length > 0 ? focalLength[0] : JSONObject.NULL);
+            json.put("imageFocalLengthYPixels", focalLength.length > 1 ? focalLength[1] : JSONObject.NULL);
+            json.put("imagePrincipalPointXPixels", principalPoint.length > 0 ? principalPoint[0] : JSONObject.NULL);
+            json.put("imagePrincipalPointYPixels", principalPoint.length > 1 ? principalPoint[1] : JSONObject.NULL);
+            json.put("imageIntrinsicsWidth", imageDimensions.length > 0 ? imageDimensions[0] : JSONObject.NULL);
+            json.put("imageIntrinsicsHeight", imageDimensions.length > 1 ? imageDimensions[1] : JSONObject.NULL);
+        } catch (Throwable ignored) {
+            json.put("imageFocalLengthXPixels", JSONObject.NULL);
+            json.put("imageFocalLengthYPixels", JSONObject.NULL);
+            json.put("imagePrincipalPointXPixels", JSONObject.NULL);
+            json.put("imagePrincipalPointYPixels", JSONObject.NULL);
+            json.put("imageIntrinsicsWidth", JSONObject.NULL);
+            json.put("imageIntrinsicsHeight", JSONObject.NULL);
         }
     }
 
@@ -4079,6 +4279,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                         targetYawDegrees,
                         targetPitchDegrees,
                         manualBlockCapture ? "manual-block" : captureMode,
+                        captureProfile,
                         exposureJson);
                 runOnUiThread(() -> {
                     captureInProgress = false;
@@ -4427,8 +4628,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private String sweepLayerPrompt = "";
         private int sweepLayerPitchDegrees;
         private int currentSweepBin;
+        private int currentHorizonBin;
+        private float currentLayerHeadingDegrees;
         private float sweepLayerProgress;
         private boolean[] sweepLayerBins = new boolean[0];
+        private boolean[] horizonBins = new boolean[0];
         private final int[] sweepLayerPitchRows = SWEEP_LAYER_PITCH_DEGREES.clone();
 
         /*
@@ -4491,7 +4695,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 boolean awaitingClose,
                 boolean startAligned,
                 String speedMessage,
-                float tiltDeltaDegrees) {
+                float tiltDeltaDegrees,
+                boolean[] bins,
+                int currentBin) {
             horizonReferencePanorama = panorama;
             horizonSweepStarted = started;
             horizonSweepComplete = completed;
@@ -4500,6 +4706,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             horizonStartAligned = startAligned;
             sweepSpeedMessage = speedMessage == null ? "" : speedMessage;
             sweepTiltDeltaDegrees = tiltDeltaDegrees;
+            horizonBins = bins == null ? new boolean[0] : bins.clone();
+            currentHorizonBin = currentBin;
             invalidate();
         }
 
@@ -4556,6 +4764,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 boolean startAligned,
                 boolean[] layerBins,
                 int currentBin,
+                float layerHeadingDegrees,
                 boolean draggingPreview,
                 boolean polarActive) {
             sweepPaintActive = active;
@@ -4569,6 +4778,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             sweepLayerPaintingActive = paintingActive;
             sweepLayerStartAligned = startAligned;
             currentSweepBin = currentBin;
+            currentLayerHeadingDegrees = normalizeHeading(layerHeadingDegrees);
             previewDragActive = draggingPreview;
             polarLayerActive = polarActive;
             sweepLayerBins = layerBins == null ? new boolean[0] : layerBins.clone();
@@ -4592,9 +4802,65 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             } else {
                 drawSweepPitchLine(canvas);
             }
+            drawSphericalGridDots(canvas);
             drawAlignmentLine(canvas);
             drawReticle(canvas);
             drawProgress(canvas);
+        }
+
+        private void drawSphericalGridDots(Canvas canvas) {
+            if (!horizonSweepStarted) {
+                return;
+            }
+            if (!horizonSweepComplete) {
+                drawCaptureRowDots(canvas, horizonBins, currentHorizonBin, 0, true);
+                return;
+            }
+            if (!sweepPaintActive || polarLayerActive) {
+                return;
+            }
+            drawCaptureRowDots(canvas, sweepLayerBins, currentSweepBin, sweepLayerPitchDegrees, sweepLayerPaintingActive);
+        }
+
+        private void drawCaptureRowDots(
+                Canvas canvas,
+                boolean[] bins,
+                int currentBin,
+                int rowPitchDegrees,
+                boolean showCountdown) {
+            if (bins == null || bins.length == 0) {
+                return;
+            }
+            boolean directionalSlots = bins.length == HIGH_PITCH_RING_SWEEP_BINS.length
+                    && Math.abs(rowPitchDegrees) >= 60;
+            for (int i = 0; i < bins.length; i++) {
+                float binYaw = (directionalSlots ? i : i + 0.5f) / bins.length * 360f;
+                float yawDelta = signedHeadingDelta(binYaw, activeRowHeadingDegrees());
+                float pitchDelta = rowPitchDegrees - pitchDegrees;
+                if (Math.abs(yawDelta) > 76f || Math.abs(pitchDelta) > 28f) {
+                    continue;
+                }
+                float x = angularToX(yawDelta);
+                float y = angularToY(pitchDelta);
+                boolean current = i == currentBin;
+                if (bins[i]) {
+                    canvas.drawCircle(x, y, current ? 12f : 9f, capturedPaint);
+                } else if (current) {
+                    canvas.drawCircle(x, y, sweepLayerPitchAligned || !horizonSweepComplete ? 24f : 18f, activePaint);
+                    if (showCountdown) {
+                        drawLockPie(canvas, x, y, 32f);
+                    }
+                } else {
+                    canvas.drawCircle(x, y, 11f, targetPaint);
+                }
+            }
+        }
+
+        private float activeRowHeadingDegrees() {
+            if (horizonSweepComplete && sweepLayerBins.length > 0) {
+                return currentLayerHeadingDegrees;
+            }
+            return normalizeHeading(headingDegrees);
         }
 
         /*

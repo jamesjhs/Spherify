@@ -53,11 +53,15 @@ package com.spherify.app;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -159,7 +163,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.5.7");
+        version.setText("0.5.9");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -649,13 +653,21 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Flat images open in the flat viewer", Toast.LENGTH_SHORT).show();
             return;
         }
+        boolean canExportFullSphere = currentItem != null && "sphere".equals(currentItem.projection);
+        String[] labels = canExportFullSphere
+                ? new String[]{"Share rendered view", "Save rendered view", "Share full PhotoSphere", "Save full PhotoSphere"}
+                : new String[]{"Share rendered view", "Save rendered view"};
         new AlertDialog.Builder(this)
                 .setTitle("Export")
-                .setItems(new String[]{"Share", "Save"}, (dialog, which) -> {
+                .setItems(labels, (dialog, which) -> {
                     if (which == 0) {
                         shareCurrentExport();
-                    } else {
+                    } else if (which == 1) {
                         saveCurrentExport();
+                    } else if (which == 2) {
+                        shareFullResolutionPhotoSphere();
+                    } else {
+                        saveFullResolutionPhotoSphere();
                     }
                 })
                 .show();
@@ -704,6 +716,12 @@ public class MainActivity extends Activity {
                 Math.round(projectionView.getEyeElevationDegrees()),
                 "deg",
                 value -> projectionView.setEyeElevationDegrees(value));
+
+        if (currentItem != null && "tinyplanet".equals(currentItem.projection)) {
+            Button centerButton = makeButton("Set center");
+            centerButton.setOnClickListener(v -> showTinyPlanetCenterPicker(currentItem));
+            controls.addView(centerButton);
+        }
 
         new AlertDialog.Builder(this)
                 .setTitle("Adjust")
@@ -838,6 +856,32 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    private void saveFullResolutionPhotoSphere() {
+        final LibraryItem sourceItem = currentItem;
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                LibraryItem saved = library.saveFullResolutionPhotoSphereVariant(sourceItem);
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    currentItem = saved;
+                    Toast.makeText(
+                            MainActivity.this,
+                            "Saved full-resolution PhotoSphere",
+                            Toast.LENGTH_LONG).show();
+                    openFlatViewer(currentItem);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Full export failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
     /*
      * Function: shareCurrentExport
      * Arguments: none.
@@ -864,6 +908,27 @@ public class MainActivity extends Activity {
                     if (isFinishing()) return;
                     setExportControlsEnabled(true);
                     Toast.makeText(MainActivity.this, "Share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    private void shareFullResolutionPhotoSphere() {
+        final LibraryItem sourceItem = currentItem;
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                File export = library.createFullResolutionPhotoSphereShareFile(sourceItem);
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    shareFile(export);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Full share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         }).start();
@@ -929,9 +994,57 @@ public class MainActivity extends Activity {
             currentItem = library.importImage(uri, projection);
             openCurrentItem();
             Toast.makeText(this, "Imported to local library", Toast.LENGTH_SHORT).show();
+            if ("tinyplanet".equals(projection)) {
+                showTinyPlanetCenterPicker(currentItem);
+            }
         } catch (IOException e) {
             Toast.makeText(this, "Import failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
+    }
+
+    private void showTinyPlanetCenterPicker(LibraryItem item) {
+        if (item == null || !"tinyplanet".equals(item.projection)) {
+            Toast.makeText(this, "Select an imported Tiny Planet first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Bitmap bitmap = decodePreviewBitmap(item.imageFile());
+        if (bitmap == null) {
+            Toast.makeText(this, "Could not open Tiny Planet image", Toast.LENGTH_LONG).show();
+            return;
+        }
+        CenterPickerView picker = new CenterPickerView(this, bitmap, item.tinyPlanetCenterX, item.tinyPlanetCenterY);
+        new AlertDialog.Builder(this)
+                .setTitle("Tiny Planet center")
+                .setView(picker)
+                .setNegativeButton("Cancel", (dialog, which) -> bitmap.recycle())
+                .setPositiveButton("Save", (dialog, which) -> {
+                    try {
+                        library.updateTinyPlanetCenter(item, picker.getCenterX(), picker.getCenterY());
+                        Toast.makeText(this, "Tiny Planet center saved", Toast.LENGTH_SHORT).show();
+                    } catch (IOException e) {
+                        Toast.makeText(this, "Center save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    } finally {
+                        bitmap.recycle();
+                    }
+                })
+                .show();
+    }
+
+    private static Bitmap decodePreviewBitmap(File imageFile) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return null;
+        }
+        int sample = 1;
+        while ((bounds.outWidth / sample) > 1400 || (bounds.outHeight / sample) > 1400) {
+            sample *= 2;
+        }
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = sample;
+        Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+        return bitmap == null ? null : SpherifyLibrary.applyExifRotation(bitmap, imageFile.getAbsolutePath());
     }
 
     /*
@@ -1215,7 +1328,16 @@ public class MainActivity extends Activity {
         String[] modes = {"normal", "high", "low"};
         new AlertDialog.Builder(this)
                 .setTitle("Movement sensitivity")
-                .setItems(labels, (dialog, which) -> stitchDraftSession(item, modes[which]))
+                .setItems(labels, (dialog, which) -> chooseStitchRenderMode(item, modes[which]))
+                .show();
+    }
+
+    private void chooseStitchRenderMode(LibraryItem item, String movementSensitivity) {
+        String[] labels = {"Sharp geometry", "Contributor map", "Blended master"};
+        String[] modes = {"strongest", "contributors", "blended"};
+        new AlertDialog.Builder(this)
+                .setTitle("Stitch output")
+                .setItems(labels, (dialog, which) -> stitchDraftSession(item, movementSensitivity, modes[which]))
                 .show();
     }
 
@@ -1228,15 +1350,15 @@ public class MainActivity extends Activity {
      * dialog, run the experimental Phase 5 stitch, then make the generated
      * equirectangular master current without deleting the pending capture.
      */
-    private void stitchDraftSession(LibraryItem item, String movementSensitivity) {
+    private void stitchDraftSession(LibraryItem item, String movementSensitivity, String renderMode) {
         if (activeLibraryDialog != null) {
             activeLibraryDialog.dismiss();
             activeLibraryDialog = null;
         }
-        showSpherifyingDialog(item, movementSensitivity);
+        showSpherifyingDialog(item, movementSensitivity, renderMode);
         new Thread(() -> {
             try {
-                StitchMasterResult result = library.createMasterFromDraftSession(item, movementSensitivity);
+                StitchMasterResult result = library.createMasterFromDraftSession(item, movementSensitivity, renderMode);
                 runOnUiThread(() -> {
                     if (isFinishing()) return;
                     dismissSpherifyingDialog();
@@ -1263,7 +1385,7 @@ public class MainActivity extends Activity {
      * Phase 5 job reads frames, estimates lens geometry, correlates overlaps,
      * blends the equirectangular master, and saves the result.
      */
-    private void showSpherifyingDialog(LibraryItem item, String movementSensitivity) {
+    private void showSpherifyingDialog(LibraryItem item, String movementSensitivity, String renderMode) {
         TextView message = new TextView(this);
         message.setTextColor(0xFF0F172A);
         message.setTextSize(14);
@@ -1274,8 +1396,9 @@ public class MainActivity extends Activity {
                 + "\n2. Estimating lens FOV and radial compensation"
                 + "\n3. Rejecting moving or ambiguous overlap features"
                 + "\n4. Nudging stable frame poses"
-                + "\n5. Projecting and blending the equirectangular master"
+                + "\n5. Projecting the equirectangular master"
                 + "\n\nMovement sensitivity: " + movementSensitivity
+                + "\nOutput: " + renderMode
                 + "\n\nKeep Spherify open while this finishes.");
         activeStitchDialog = new AlertDialog.Builder(this)
                 .setTitle("Spherifying...")
@@ -1788,6 +1911,103 @@ public class MainActivity extends Activity {
          * the generic control can update a specific projection property.
          */
         void onValueChanged(int value);
+    }
+
+    private static final class CenterPickerView extends View {
+        private final Bitmap bitmap;
+        private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Paint shadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint crosshairPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF imageRect = new RectF();
+        private float centerX;
+        private float centerY;
+
+        CenterPickerView(Context context, Bitmap bitmap, float centerX, float centerY) {
+            super(context);
+            this.bitmap = bitmap;
+            this.centerX = clamp01(centerX);
+            this.centerY = clamp01(centerY);
+            setMinimumHeight(720);
+            shadePaint.setColor(0x66000000);
+            crosshairPaint.setColor(0xFFFFFFFF);
+            crosshairPaint.setStrokeWidth(3f);
+            crosshairPaint.setStyle(Paint.Style.STROKE);
+            ringPaint.setColor(0xFF38BDF8);
+            ringPaint.setStrokeWidth(4f);
+            ringPaint.setStyle(Paint.Style.STROKE);
+        }
+
+        float getCenterX() {
+            return centerX;
+        }
+
+        float getCenterY() {
+            return centerY;
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int width = MeasureSpec.getSize(widthMeasureSpec);
+            if (width <= 0) {
+                width = 720;
+            }
+            int height = Math.round(width * bitmap.getHeight() / (float) Math.max(1, bitmap.getWidth()));
+            height = Math.max(420, Math.min(900, height));
+            setMeasuredDimension(width, resolveSize(height, heightMeasureSpec));
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            computeImageRect();
+            canvas.drawColor(0xFF0F172A);
+            canvas.drawBitmap(bitmap, null, imageRect, bitmapPaint);
+            float x = imageRect.left + centerX * imageRect.width();
+            float y = imageRect.top + centerY * imageRect.height();
+            canvas.drawRect(0f, 0f, getWidth(), imageRect.top, shadePaint);
+            canvas.drawRect(0f, imageRect.bottom, getWidth(), getHeight(), shadePaint);
+            canvas.drawLine(imageRect.left, y, imageRect.right, y, crosshairPaint);
+            canvas.drawLine(x, imageRect.top, x, imageRect.bottom, crosshairPaint);
+            canvas.drawCircle(x, y, 22f, ringPaint);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN
+                    || event.getActionMasked() == MotionEvent.ACTION_MOVE
+                    || event.getActionMasked() == MotionEvent.ACTION_UP) {
+                computeImageRect();
+                centerX = clamp01((event.getX() - imageRect.left) / Math.max(1f, imageRect.width()));
+                centerY = clamp01((event.getY() - imageRect.top) / Math.max(1f, imageRect.height()));
+                invalidate();
+                return true;
+            }
+            return true;
+        }
+
+        private void computeImageRect() {
+            float viewWidth = Math.max(1f, getWidth());
+            float viewHeight = Math.max(1f, getHeight());
+            float imageAspect = bitmap.getWidth() / (float) Math.max(1, bitmap.getHeight());
+            float viewAspect = viewWidth / viewHeight;
+            float drawWidth;
+            float drawHeight;
+            if (imageAspect > viewAspect) {
+                drawWidth = viewWidth;
+                drawHeight = drawWidth / imageAspect;
+            } else {
+                drawHeight = viewHeight;
+                drawWidth = drawHeight * imageAspect;
+            }
+            float left = (viewWidth - drawWidth) * 0.5f;
+            float top = (viewHeight - drawHeight) * 0.5f;
+            imageRect.set(left, top, left + drawWidth, top + drawHeight);
+        }
+
+        private static float clamp01(float value) {
+            return Math.max(0f, Math.min(1f, value));
+        }
     }
 
     /*

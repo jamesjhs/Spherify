@@ -10,8 +10,8 @@ android {
         applicationId "com.spherify.app"
         minSdk 26
         targetSdk 36
-        versionCode 52
-        versionName "0.5.7"
+        versionCode 55
+        versionName "0.5.10"
     }
 }
 
@@ -22,4 +22,5 @@ dependencies {
     implementation "androidx.camera:camera-lifecycle:1.6.1"
     implementation "androidx.camera:camera-view:1.6.1"
     implementation "com.google.ar:core:1.54.0"
+    implementation "org.opencv:opencv:5.0.0.1"
 }
