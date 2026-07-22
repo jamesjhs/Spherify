@@ -105,6 +105,7 @@ public class MainActivity extends Activity {
     private Button adjustButton;
     private Button exportButton;
     private AlertDialog activeLibraryDialog;
+    private AlertDialog activeStitchDialog;
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
     private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
@@ -158,7 +159,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.5.0");
+        version.setText("0.5.7");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -339,6 +340,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         projectionView.onResume();
+        refreshLibraryAfterCapture();
     }
 
     /*
@@ -974,7 +976,7 @@ public class MainActivity extends Activity {
      * draft frame browsing or LibraryItem browsing.
      */
     private void showBrowseFilters() {
-        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Drafts", "Saved", "Draft Frames"};
+        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Pending", "Saved", "Draft Frames"};
         String[] filters = {
                 LibraryItem.FILTER_ALL,
                 LibraryItem.FILTER_MASTERS,
@@ -1198,28 +1200,46 @@ public class MainActivity extends Activity {
                 .show();
         activeLibraryDialog
                 .getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(v -> stitchDraftSession(item));
+                .setOnClickListener(v -> chooseStitchMovementSensitivity(item));
+    }
+
+    /*
+     * Function: chooseStitchMovementSensitivity
+     * Arguments: item is the selected draft-session LibraryItem.
+     * Calls: AlertDialog.Builder and stitchDraftSession().
+     * Flow: let the user decide how aggressively moving/ambiguous overlap
+     * features should be rejected during Phase 5 correlation.
+     */
+    private void chooseStitchMovementSensitivity(LibraryItem item) {
+        String[] labels = {"Normal", "High movement", "Low movement"};
+        String[] modes = {"normal", "high", "low"};
+        new AlertDialog.Builder(this)
+                .setTitle("Movement sensitivity")
+                .setItems(labels, (dialog, which) -> stitchDraftSession(item, modes[which]))
+                .show();
     }
 
     /*
      * Function: stitchDraftSession
      * Arguments: item is the selected draft-session LibraryItem.
-     * Calls: SpherifyLibrary.createMasterFromDraftSession() on a background
-     * thread, loadCurrentItem(), and showStitchSummary().
-     * Flow: close the draft browser, run the experimental Phase 5 stitch without
-     * blocking UI input, then make the generated equirectangular master current.
+     * Calls: showSpherifyingDialog(), SpherifyLibrary.createMasterFromDraftSession()
+     * on a background thread, loadCurrentItem(), and showStitchSummary().
+     * Flow: close the pending browser, show a verbose non-cancelable processing
+     * dialog, run the experimental Phase 5 stitch, then make the generated
+     * equirectangular master current without deleting the pending capture.
      */
-    private void stitchDraftSession(LibraryItem item) {
+    private void stitchDraftSession(LibraryItem item, String movementSensitivity) {
         if (activeLibraryDialog != null) {
             activeLibraryDialog.dismiss();
             activeLibraryDialog = null;
         }
-        Toast.makeText(this, "Generating Phase 5 master...", Toast.LENGTH_SHORT).show();
+        showSpherifyingDialog(item, movementSensitivity);
         new Thread(() -> {
             try {
-                StitchMasterResult result = library.createMasterFromDraftSession(item);
+                StitchMasterResult result = library.createMasterFromDraftSession(item, movementSensitivity);
                 runOnUiThread(() -> {
                     if (isFinishing()) return;
+                    dismissSpherifyingDialog();
                     currentItem = result.item;
                     loadCurrentItem(null);
                     showStitchSummary(result);
@@ -1227,10 +1247,80 @@ public class MainActivity extends Activity {
             } catch (IOException e) {
                 runOnUiThread(() -> {
                     if (isFinishing()) return;
+                    dismissSpherifyingDialog();
                     Toast.makeText(MainActivity.this, "Spherify failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         }).start();
+    }
+
+    /*
+     * Function: showSpherifyingDialog
+     * Arguments: item names the pending capture; movementSensitivity labels the
+     * selected overlap rejection mode.
+     * Calls: AlertDialog.Builder and TextView setters.
+     * Flow: present a clear long-running status surface while the background
+     * Phase 5 job reads frames, estimates lens geometry, correlates overlaps,
+     * blends the equirectangular master, and saves the result.
+     */
+    private void showSpherifyingDialog(LibraryItem item, String movementSensitivity) {
+        TextView message = new TextView(this);
+        message.setTextColor(0xFF0F172A);
+        message.setTextSize(14);
+        message.setLineSpacing(4, 1.0f);
+        message.setPadding(34, 20, 34, 8);
+        message.setText("Preparing " + item.title
+                + "\n\n1. Reading pending capture frames"
+                + "\n2. Estimating lens FOV and radial compensation"
+                + "\n3. Rejecting moving or ambiguous overlap features"
+                + "\n4. Nudging stable frame poses"
+                + "\n5. Projecting and blending the equirectangular master"
+                + "\n\nMovement sensitivity: " + movementSensitivity
+                + "\n\nKeep Spherify open while this finishes.");
+        activeStitchDialog = new AlertDialog.Builder(this)
+                .setTitle("Spherifying...")
+                .setView(message)
+                .create();
+        activeStitchDialog.setCancelable(false);
+        activeStitchDialog.setCanceledOnTouchOutside(false);
+        activeStitchDialog.setOnCancelListener(null);
+        activeStitchDialog.show();
+    }
+
+    private void dismissSpherifyingDialog() {
+        if (activeStitchDialog != null) {
+            activeStitchDialog.dismiss();
+            activeStitchDialog = null;
+        }
+    }
+
+    /*
+     * Function: refreshLibraryAfterCapture
+     * Arguments: none.
+     * Calls: SpherifyLibrary.refresh() and updateLabels().
+     * Flow: MainActivity may resume after CaptureActivity has saved draft frames
+     * through a separate SpherifyLibrary instance. Reload metadata and reconcile
+     * Pending records so Browse immediately shows the new capture session.
+     */
+    private void refreshLibraryAfterCapture() {
+        if (library == null) {
+            return;
+        }
+        try {
+            String currentId = currentItem == null ? "" : currentItem.id;
+            library.refresh();
+            if (!currentId.isEmpty()) {
+                for (LibraryItem item : library.list(LibraryItem.FILTER_ALL)) {
+                    if (currentId.equals(item.id)) {
+                        currentItem = item;
+                        break;
+                    }
+                }
+            }
+            updateLabels();
+        } catch (IOException e) {
+            Toast.makeText(this, "Library refresh failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     /*

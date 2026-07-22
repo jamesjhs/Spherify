@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.5.0
+Version: 0.5.7
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
-This repository now contains the first Android proof-of-concept application code. The 0.5.0 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, pitch-only one-shot polar capture, polar Capture/Next/Spherify button flow, polar-only guide overlay, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class draft-session library records, structured draft exposure metadata with non-blocking capture fallback, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, and the first experimental Phase 5 draft-session-to-equirectangular-master generator.
+This repository now contains the first Android proof-of-concept application code. The 0.5.7 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere painting with simplified controls, guided four-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata for FOV estimation, safer delete confirmations, rotation-state restore, Android launcher badge assets, default auto-paint capture, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, central-source weighted blending, movement-sensitive overlap rejection, conservative pose nudges, and corrected polar sizing.
 
 ## Developer Build and Run Runbook
 
@@ -30,7 +30,7 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.5.0):
+Current repository compliance snapshot (0.5.7):
 
 - Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata, experimental local draft stitching into app-created masters.
 - Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
@@ -228,6 +228,73 @@ Either approach guarantees a complete fill before the JSON parse and eliminates 
 3. Long-term: introduce a `loadAsync(callback)` pattern on `SpherifyLibrary` that shifts all file reads to a dedicated executor, consistent with the background-thread approach adopted for bitmap decodes.
 
 ---
+
+### Version 0.5.7 Progress
+
+This build refines high vertical capture after the continuous +/-65 degree rings still proved difficult in practice:
+
+- Changes the high upper/lower rows into guided four-shot rings at 0, 90, 180, and 270 degrees.
+- The high-ring button now stays on `Capture` until those four cardinal shots are recorded, then advances with `Next` or `Spherify!`.
+- The high-ring prompt instructs the user to face the horizon direction first, pan up/down to the target pitch, capture, then pan back to the horizon before rotating to the next direction.
+- Auto-capture is disabled for the high-ring rows so Spherify does not grab unstable high-angle frames while the user is recovering AR tracking.
+- Finish summaries now count the real required capture positions rather than treating high rings as full 24-bin sweeps.
+
+### Version 0.5.6 Progress
+
+This build fixes the capture-to-Spherify handoff:
+
+- Renames the session-level Browse filter from `Drafts` to `Pending`; raw `Draft Frames` remains a diagnostic frame browser and is not the Spherify entry point.
+- Refreshes and reconciles the library whenever MainActivity resumes, so pending capture sessions saved by CaptureActivity appear immediately after returning from capture.
+- Rebuilds missing Pending records from `drafts.json` when raw frame metadata exists, preventing a populated Draft Frames list with an empty Pending list.
+- Keeps Pending sessions after Spherify creates a master; they are removed only by explicit user delete or Remove All Drafts.
+- Adds a verbose non-cancelable `Spherifying...` status dialog showing the major Phase 5 steps while the background stitch job runs.
+
+### Version 0.5.5 Progress
+
+This build changes Capture to improve coverage near the polar extremes without relying on near-vertical ARCore tracking:
+
+- Replaces the single +80/-80 degree polar captures with normal high-pitch sweep rings at +65 and -65 degrees.
+- Routes the high upper/lower layers through the same Start/Stop, yaw-binned sweep painting flow as the horizon and +/-30 degree bands.
+- Keeps old +80/-80 draft sessions compatible in Phase 5, while new sessions should produce better overlap around zenith/nadir.
+- Reduces the chance of AR lockout because the device no longer needs to point almost straight up or down for required coverage.
+
+### Version 0.5.4 Progress
+
+This build makes Phase 5 overlap calibration more conservative after real-world testing showed the first correlation pass could worsen seams:
+
+- Adds a Movement Sensitivity choice before running `Spherify`: Normal, High movement, or Low movement.
+- Changes overlap scoring from raw edge luminance to gradient-based matching with outlier rejection, so moving people, vehicles, leaves, and other unstable details can be ignored.
+- Applies stronger central-source weighting during final blending; the middle of each capture contributes most, while lens-corrected edges contribute less.
+- Reduces yaw/pitch correction scale and sharply limits roll correction so weak overlap matches cannot introduce visible boundary jitter.
+- Records the selected movement sensitivity in stitched JPEG description metadata and the post-stitch warning summary.
+
+### Version 0.5.3 Progress
+
+This build adds the first automatic Phase 5 lens and overlap calibration:
+
+- Capture metadata now includes back-camera physical sensor width/height when Android exposes it, allowing new draft sessions to estimate FOV from focal length plus sensor size.
+- The stitcher estimates a lens model per draft session, using real focal/sensor metadata when present and a focal-length heuristic for older captures.
+- Adds grayscale overlap correlation for neighboring sweep frames in the same pitch band, producing small yaw, pitch, and roll corrections before final projection.
+- Writes estimated FOV, radial coefficients, and matched-overlap count into the stitched JPEG description metadata.
+- The post-stitch warning summary now reports whether overlap nudges were applied or whether no reliable correlations were found.
+
+### Version 0.5.2 Progress
+
+This build adds lens-geometry compensation to the experimental Phase 5 stitcher:
+
+- Replaces flat rectangular source sampling with inverse pinhole projection: each equirectangular output pixel is traced through the frame's yaw, pitch, and FOV before sampling the camera image.
+- Adds a small radial compensation hook so early outputs have less flat-poster distortion while leaving room for device/lens calibration later.
+- Keeps feathered accumulation blending from 0.5.1, now using projected source coordinates for edge weighting.
+- The result should read more like a spherical projection and less like overlapping rectangles pasted onto a canvas.
+
+### Version 0.5.1 Progress
+
+This build starts the hard Phase 5 alignment cleanup after the first real generated masters:
+
+- Replaces opaque frame painting with feathered RGB accumulation so overlapping images blend instead of overwriting one another.
+- Uses the Phase 4 capture-bin yaw as the primary placement reference for every sweep slice, including the legitimate `0 deg` bin, instead of falling back to less stable live heading values.
+- Stops stretching one-shot polar captures across the entire panorama; polar frames now use constrained top/bottom placement so they are closer in scale to the sweep frames.
+- Keeps feature matching, drift correction, and exposure balancing explicitly pending; this pass prepares the renderer for those steps by making overlap visible and less destructive.
 
 ### Version 0.5.0 Progress
 
@@ -1896,8 +1963,8 @@ Current implementation:
 
 - The first implementation used a 24-target yaw/pitch guide grid with target locking, reticle alignment, and auto-capture. Real-device experiments showed that discrete target chasing was less useful than broad, continuous overlap coverage, so Phase 4 iterated into an ARCore sweep-painting method rather than treating the original target grid as final.
 - Capture now runs through ARCore with an OpenGL camera preview, ARCore pose-derived yaw/pitch/roll, and ARCore CPU camera frames saved as upright draft JPEGs.
-- The sphere capture pattern is five paint layers: horizon, upper, lower, high upper, and high lower. The high upper/lower pole layers are treated as pitch-only one-shot captures because yaw/roll becomes unreliable near vertical.
-- The UI uses a start/end landmark horizon sweep, pitch target line, always-visible vertical alignment line, sweep-speed feedback, painted preview rows, coverage progress, tap-to-recapture rows, optional pole infill, and simplified polar Capture/Next/Spherify controls.
+- The sphere capture pattern is five paint layers: horizon, upper, lower, high upper, and high lower. The high upper/lower rows are guided four-shot +/-65 degree rings at 0, 90, 180, and 270 degrees; the user is prompted to recover at the horizon between shots to keep ARCore tracking stable.
+- The UI uses a start/end landmark horizon sweep, pitch target line, always-visible vertical alignment line, sweep-speed feedback, painted preview rows, coverage progress, tap-to-recapture rows, and optional pole infill.
 - Auto-capture is now the default for unpainted sweep slices when ARCore is ready, pitch is aligned, and the sweep pace is acceptable; manual capture and manual recovery remain available.
 - Undo, pause/resume, cancel, finish, draft-frame deletion, and confirmed bulk draft removal are implemented.
 - Draft metadata now includes a persistent session id, frame path, approximate orientation, target yaw/pitch or polar slot reference, timestamp, location summary, capture mode, and structured ARCore camera exposure references instead of a placeholder.
@@ -1938,10 +2005,12 @@ Current implementation:
 
 - Draft sessions expose a `Spherify` action from the library.
 - Phase 5 can enumerate typed frame records for one selected draft session, including file path, timestamp, session id, approximate orientation, target pitch/yaw, capture mode, and exposure availability.
-- The first experimental stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates and treating polar captures as full-width top/bottom bands.
+- The first experimental stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates, inverse-projecting source frames through a simple pinhole/radial lens model, blending overlaps through weighted accumulation, and treating polar captures as constrained top/bottom source frames instead of full-width bands.
+- New captures include physical sensor-size metadata when available, so Phase 5 can compute FOV from the actual phone camera instead of relying only on heuristics.
+- A lightweight, movement-sensitive overlap-correlation pass compares neighboring sweep frames and applies bounded yaw, pitch, and roll corrections before rendering.
 - Generated masters are saved as normal `master` library records with the draft session as `parentId`, thumbnails are generated, and the main PhotoSphere viewer opens the result.
 - A post-stitch summary reports frames used, estimated grid coverage, missing exposure references, and warnings for weak/incomplete captures.
-- This is not map-ready yet: feature matching, drift correction, exposure/white-balance balancing, seam blending, gap repair, and formal Google Maps readiness checks are still pending.
+- This is not map-ready yet: robust feature matching, full drift correction, exposure/white-balance balancing, seam blending, gap repair, and formal Google Maps readiness checks are still pending.
 
 Exit criteria:
 

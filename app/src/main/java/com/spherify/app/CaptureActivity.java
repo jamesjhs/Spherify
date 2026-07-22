@@ -61,10 +61,14 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.location.Location;
 import android.location.LocationManager;
 import android.media.Image;
 import android.os.Bundle;
+import android.util.SizeF;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
@@ -134,9 +138,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private static final float HORIZON_REFERENCE_VIEW_DEGREES = 82f;
     private static final int SWEEP_CAPTURE_BIN_COUNT = 24;
     private static final int REQUIRED_SWEEP_CAPTURE_BINS = 22;
-    private static final int[] SWEEP_LAYER_PITCH_DEGREES = {0, 30, -30, 80, -80};
+    private static final int[] SWEEP_LAYER_PITCH_DEGREES = {0, 30, -30, 65, -65};
     private static final int SWEEP_LAYER_HIGH_UPPER_INDEX = 3;
     private static final int SWEEP_LAYER_HIGH_LOWER_INDEX = 4;
+    private static final int[] HIGH_PITCH_RING_YAW_DEGREES = {0, 90, 180, 270};
+    private static final int[] HIGH_PITCH_RING_SWEEP_BINS = {0, 6, 12, 18};
+    private static final float MAX_HIGH_PITCH_RING_YAW_DELTA_DEGREES = 18f;
     private static final float MAX_SWEEP_LAYER_PITCH_DELTA_DEGREES = 12f;
     private static final int[] POLAR_ROLL_SLOT_TARGETS = {0};
     private static final int[] POLAR_ROLL_SLOT_SWEEP_BINS = {12};
@@ -207,6 +214,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private boolean captureInProgress;
     private boolean sweepLayerPaintingActive;
     private boolean polarCaptureInfoShown;
+    private boolean highPitchRingInfoShown;
     private boolean guideRefreshPosted;
     private long calibrationStartedAt;
     private long highAccuracyStartedAt;
@@ -256,6 +264,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private byte[] latestArJpeg;
     private String latestExposureMetadataJson;
     private Bitmap latestArPreviewBitmap;
+    private SizeF cameraSensorPhysicalSize;
     private float minAccelX = Float.MAX_VALUE;
     private float maxAccelX = -Float.MAX_VALUE;
     private float minAccelY = Float.MAX_VALUE;
@@ -293,6 +302,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             sessionId = newSessionId();
             capturePrefs.edit().putString(PREF_ACTIVE_SESSION_ID, sessionId).apply();
         }
+        cameraSensorPhysicalSize = readBackCameraSensorPhysicalSize();
         sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
         if (sensorManager != null) {
             accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
@@ -1007,6 +1017,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         currentSweepLayerIndex = 0;
         sweepLayerPaintingActive = false;
         polarCaptureInfoShown = false;
+        highPitchRingInfoShown = false;
         resetSweepCaptureCoverage();
         resetSweepMotionFeedback();
         statusText.setText("Sweep horizon");
@@ -1192,7 +1203,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * deliberate Start/Stop control for each upper/lower paint layer.
      */
     private void handleSweepLayerButton() {
-        if (isCurrentPolarLayer()) {
+        if (isCurrentHighPitchRingLayer()) {
+            handleHighPitchRingButton();
+        } else if (isCurrentPolarLayer()) {
             handlePolarLayerButton();
         } else if (sweepLayerPaintingActive) {
             stopSweepLayerPainting();
@@ -1204,12 +1217,53 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     /*
+     * Function: handleHighPitchRingButton
+     * Arguments: none.
+     * Calls: captureFrame(), advanceSweepLayer(), finishCaptureSession(), and
+     * updateCompassUi().
+     * Flow: capture the safer near-pole rows as four deliberate cardinal shots
+     * instead of a continuous high-pitch sweep. The user is asked to return to
+     * the horizon between shots to keep ARCore tracking stable.
+     */
+    private void handleHighPitchRingButton() {
+        showHighPitchRingInfoIfNeeded();
+        if (currentSweepLayerComplete()) {
+            if (currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1) {
+                finishCaptureSession();
+            } else {
+                advanceSweepLayer();
+            }
+            return;
+        }
+        if (!isSweepLayerPitchAligned()) {
+            Toast.makeText(
+                    this,
+                    String.format(Locale.US, "From the horizon, pan to %+d deg", currentSweepLayerPitch()),
+                    Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        int bin = currentCaptureBin();
+        if (bin < 0) {
+            Toast.makeText(this, highPitchRingInstruction(), Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        if (sweepCaptureBins[currentSweepLayerIndex][bin]) {
+            Toast.makeText(this, "That high-angle direction is already captured. Return to horizon, rotate, then pan back.", Toast.LENGTH_LONG).show();
+            updateCompassUi();
+            return;
+        }
+        captureFrame("high-ring-manual");
+    }
+
+    /*
      * Function: handlePolarLayerButton
      * Arguments: none.
      * Calls: captureFrame(), advanceSweepLayer(), and finishCaptureSession().
-     * Flow: polar layers are single-shot captures. The shared horizon button
-     * becomes Capture before the pole frame, Next after the upper pole, and
-     * Spherify! after the lower pole.
+     * Flow: retained for older polar-control experiments. Current high-pitch
+     * layers are sweep rings, so handleSweepLayerButton() normally routes around
+     * this method.
      */
     private void handlePolarLayerButton() {
         if (currentSweepLayerComplete()) {
@@ -1253,6 +1307,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 this,
                 isCurrentPolarLayer()
                         ? "Polar capture started. Face the origin point and hold the pitch line."
+                        : isCurrentHighPitchRingLayer()
+                        ? "High ring started. Use four horizon-to-pitch captures."
                         : "Start painting. Rotate slowly through 360 degrees.",
                 Toast.LENGTH_LONG).show();
         updateCompassUi();
@@ -1739,6 +1795,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * one-shot polar layers.
      */
     private String currentSweepButtonText() {
+        if (isCurrentHighPitchRingLayer()) {
+            if (currentSweepLayerComplete()) {
+                return currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1
+                        ? "Spherify!"
+                        : "Next";
+            }
+            return "Capture";
+        }
         if (isCurrentPolarLayer()) {
             if (currentSweepLayerComplete()) {
                 return currentSweepLayerIndex >= SWEEP_LAYER_PITCH_DEGREES.length - 1
@@ -2713,6 +2777,14 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (pitch == 0) {
             return "Paint horizon: rotate slowly through 360 degrees";
         }
+        if (isCurrentHighPitchRingLayer()) {
+            return String.format(
+                    Locale.US,
+                    "High %s: start at horizon, face %s, pan to %+d deg, capture, then pan back down",
+                    currentSweepLayerName(),
+                    nextHighPitchRingYawLabel(),
+                    pitch);
+        }
         if (isCurrentPolarLayer()) {
             return String.format(
                     Locale.US,
@@ -2736,6 +2808,15 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * than waiting at discrete target points.
      */
     private String currentSweepCaptureStatusText() {
+        if (isCurrentHighPitchRingLayer() && !currentSweepLayerComplete()) {
+            if (!isSweepLayerPitchAligned()) {
+                return String.format(Locale.US, "From horizon, pan to %+d deg", currentSweepLayerPitch());
+            }
+            int bin = currentCaptureBin();
+            return bin < 0
+                    ? "Rotate to " + nextHighPitchRingYawLabel()
+                    : "Capture " + highPitchRingYawLabelForBin(bin);
+        }
         if (!isSweepLayerPitchAligned()) {
             return String.format(Locale.US, "Tilt to %+d deg", currentSweepLayerPitch());
         }
@@ -2797,22 +2878,49 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Function: isCurrentPolarLayer
      * Arguments: none.
      * Calls: isPolarLayer().
-     * Flow: identify the high upper/lower layers where yaw is unreliable and
-     * capture should be driven by phone roll instead.
+     * Flow: high upper/lower layers used to be near-vertical special cases.
+     * They are now safer high-pitch sweep rings, so no active layer is polar.
      */
     private boolean isCurrentPolarLayer() {
         return isPolarLayer(currentSweepLayerIndex);
+    }
+
+    private boolean isCurrentHighPitchRingLayer() {
+        return isHighPitchRingLayer(currentSweepLayerIndex);
+    }
+
+    private boolean isHighPitchRingLayer(int layer) {
+        return layer == SWEEP_LAYER_HIGH_UPPER_INDEX || layer == SWEEP_LAYER_HIGH_LOWER_INDEX;
     }
 
     /*
      * Function: isPolarLayer
      * Arguments: layer is a sweep row index.
      * Calls: no external functions.
-     * Flow: treat the uppermost and lowermost rows as polar capture special
-     * cases because yaw breaks down when the phone points vertically.
+     * Flow: return false so the high upper/lower rows use normal yaw sweeps at
+     * +/-65 degrees, avoiding the AR lockout seen near vertical capture.
      */
     private boolean isPolarLayer(int layer) {
-        return layer == SWEEP_LAYER_HIGH_UPPER_INDEX || layer == SWEEP_LAYER_HIGH_LOWER_INDEX;
+        return false;
+    }
+
+    /*
+     * Function: showHighPitchRingInfoIfNeeded
+     * Arguments: none.
+     * Calls: AlertDialog.Builder.
+     * Flow: explain the cardinal high-pitch ring once, before the first high row
+     * asks the user to pan away from and back to the horizon for each shot.
+     */
+    private void showHighPitchRingInfoIfNeeded() {
+        if (highPitchRingInfoShown || !isCurrentHighPitchRingLayer()) {
+            return;
+        }
+        highPitchRingInfoShown = true;
+        new AlertDialog.Builder(this)
+                .setTitle("High-pitch ring")
+                .setMessage("For the top and bottom coverage rows, take four steady photographs at 0, 90, 180, and 270 degrees.\n\nFor each one: face the horizon direction first, pan up or down to the pitch line, capture, then pan back to the horizon before rotating to the next direction.\n\nThis keeps ARCore tracking healthier than pointing almost straight up or down.")
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     /*
@@ -2842,6 +2950,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * polar cap layers.
      */
     private int currentCaptureBin() {
+        if (isCurrentHighPitchRingLayer()) {
+            return highPitchRingBinForHeading(compassHeadingDegrees);
+        }
         if (isCurrentPolarLayer()) {
             return POLAR_ROLL_SLOT_SWEEP_BINS[0];
         }
@@ -2855,6 +2966,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Flow: report a compact three-position progress index for polar overlays.
      */
     private int currentOverlayBin() {
+        if (isCurrentHighPitchRingLayer()) {
+            int bin = highPitchRingBinForHeading(compassHeadingDegrees);
+            return bin < 0 ? nearestHighPitchRingSlotForPendingShot() : highPitchRingSlotIndexForSweepBin(bin);
+        }
         if (isCurrentPolarLayer()) {
             return 0;
         }
@@ -2920,6 +3035,58 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             }
         }
         return 1;
+    }
+
+    private int highPitchRingBinForHeading(float headingDegrees) {
+        float relativeDegrees = relativeSweepYawDegrees(headingDegrees);
+        int bestIndex = 0;
+        float bestDelta = Float.MAX_VALUE;
+        for (int i = 0; i < HIGH_PITCH_RING_YAW_DEGREES.length; i++) {
+            float delta = Math.abs(signedAngleDeltaDegrees(HIGH_PITCH_RING_YAW_DEGREES[i], relativeDegrees));
+            if (delta < bestDelta) {
+                bestDelta = delta;
+                bestIndex = i;
+            }
+        }
+        return bestDelta <= MAX_HIGH_PITCH_RING_YAW_DELTA_DEGREES
+                ? HIGH_PITCH_RING_SWEEP_BINS[bestIndex]
+                : -1;
+    }
+
+    private int highPitchRingSlotIndexForSweepBin(int sweepBin) {
+        for (int i = 0; i < HIGH_PITCH_RING_SWEEP_BINS.length; i++) {
+            if (HIGH_PITCH_RING_SWEEP_BINS[i] == sweepBin) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    private int nearestHighPitchRingSlotForPendingShot() {
+        for (int i = 0; i < HIGH_PITCH_RING_SWEEP_BINS.length; i++) {
+            if (!sweepCaptureBins[currentSweepLayerIndex][HIGH_PITCH_RING_SWEEP_BINS[i]]) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    private String nextHighPitchRingYawLabel() {
+        return highPitchRingYawLabelForSlot(nearestHighPitchRingSlotForPendingShot());
+    }
+
+    private String highPitchRingYawLabelForBin(int sweepBin) {
+        return highPitchRingYawLabelForSlot(highPitchRingSlotIndexForSweepBin(sweepBin));
+    }
+
+    private String highPitchRingYawLabelForSlot(int slot) {
+        int safeSlot = Math.max(0, Math.min(HIGH_PITCH_RING_YAW_DEGREES.length - 1, slot));
+        return HIGH_PITCH_RING_YAW_DEGREES[safeSlot] + " deg";
+    }
+
+    private String highPitchRingInstruction() {
+        return "Return to the horizon, rotate to " + nextHighPitchRingYawLabel()
+                + ", then pan to " + currentSweepLayerPitch() + " deg and capture.";
     }
 
     /*
@@ -3007,6 +3174,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (layerIndex < 0 || layerIndex >= sweepCaptureBins.length) {
             return 0f;
         }
+        if (isHighPitchRingLayer(layerIndex)) {
+            return clamp01(capturedSweepBinCount(layerIndex) / (float) HIGH_PITCH_RING_SWEEP_BINS.length);
+        }
         if (isPolarLayer(layerIndex)) {
             return clamp01(capturedSweepBinCount(layerIndex) / (float) POLAR_ROLL_SLOT_TARGETS.length);
         }
@@ -3020,9 +3190,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
      * Flow: determine when enough of the current horizontal band has been painted.
      */
     private boolean currentSweepLayerComplete() {
-        return capturedSweepBinCount(currentSweepLayerIndex) >= (isCurrentPolarLayer()
+        int required = isCurrentHighPitchRingLayer()
+                ? HIGH_PITCH_RING_SWEEP_BINS.length
+                : isCurrentPolarLayer()
                 ? POLAR_ROLL_SLOT_TARGETS.length
-                : REQUIRED_SWEEP_CAPTURE_BINS);
+                : REQUIRED_SWEEP_CAPTURE_BINS;
+        return capturedSweepBinCount(currentSweepLayerIndex) >= required;
     }
 
     /*
@@ -3034,6 +3207,15 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private int capturedSweepBinCount(int layerIndex) {
         if (layerIndex < 0 || layerIndex >= sweepCaptureBins.length) {
             return 0;
+        }
+        if (isHighPitchRingLayer(layerIndex)) {
+            int captured = 0;
+            for (int bin : HIGH_PITCH_RING_SWEEP_BINS) {
+                if (sweepCaptureBins[layerIndex][bin]) {
+                    captured++;
+                }
+            }
+            return captured;
         }
         if (isPolarLayer(layerIndex)) {
             int captured = 0;
@@ -3063,7 +3245,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         int captured = 0;
         int required = 0;
         for (int layer = 0; layer < sweepCaptureBins.length; layer++) {
-            int layerRequired = isPolarLayer(layer) ? POLAR_ROLL_SLOT_TARGETS.length : REQUIRED_SWEEP_CAPTURE_BINS;
+            int layerRequired = isHighPitchRingLayer(layer)
+                    ? HIGH_PITCH_RING_SWEEP_BINS.length
+                    : isPolarLayer(layer)
+                    ? POLAR_ROLL_SLOT_TARGETS.length
+                    : REQUIRED_SWEEP_CAPTURE_BINS;
             captured += Math.min(layerRequired, capturedSweepBinCount(layer));
             required += layerRequired;
         }
@@ -3084,6 +3270,18 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         return captured;
     }
 
+    private int requiredSweepFrameCount() {
+        int required = 0;
+        for (int layer = 0; layer < sweepCaptureBins.length; layer++) {
+            required += isHighPitchRingLayer(layer)
+                    ? HIGH_PITCH_RING_SWEEP_BINS.length
+                    : isPolarLayer(layer)
+                    ? POLAR_ROLL_SLOT_TARGETS.length
+                    : REQUIRED_SWEEP_CAPTURE_BINS;
+        }
+        return required;
+    }
+
     /*
      * Function: currentSweepLayerBins
      * Arguments: none.
@@ -3094,6 +3292,13 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private boolean[] currentSweepLayerBins() {
         boolean[] bins = new boolean[SWEEP_CAPTURE_BIN_COUNT];
         if (currentSweepLayerIndex < 0 || currentSweepLayerIndex >= sweepCaptureBins.length) {
+            return bins;
+        }
+        if (isCurrentHighPitchRingLayer()) {
+            bins = new boolean[HIGH_PITCH_RING_SWEEP_BINS.length];
+            for (int slot = 0; slot < bins.length; slot++) {
+                bins[slot] = sweepCaptureBins[currentSweepLayerIndex][HIGH_PITCH_RING_SWEEP_BINS[slot]];
+            }
             return bins;
         }
         if (isCurrentPolarLayer()) {
@@ -3155,6 +3360,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (autoCaptureEnabled
                 && isCaptureAllowed()
                 && sweepLayerPaintingActive
+                && !isCurrentHighPitchRingLayer()
                 && isSweepLayerPitchAligned()
                 && (isCurrentPolarLayer() || !"Move slower".equals(currentSweepSpeedMessage()))
                 && !sweepCaptureBins[currentSweepLayerIndex][bin]
@@ -3243,8 +3449,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         new AlertDialog.Builder(this)
                 .setTitle("Finish draft capture?")
                 .setMessage("Painted " + captured + " of "
-                        + (SWEEP_LAYER_PITCH_DEGREES.length * SWEEP_CAPTURE_BIN_COUNT)
-                        + " sweep slices.\n\nDraft frames remain saved for Phase 5 stitching experiments.")
+                        + requiredSweepFrameCount()
+                        + " capture positions.\n\nPending frames remain saved for Phase 5 Spherify experiments.")
                 .setNegativeButton("Keep capturing", null)
                 .setPositiveButton("Finish", (dialog, which) -> {
                     clearActiveSession();
@@ -3524,6 +3730,13 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             putLongMetadata(json, "sensorTimestampNs", metadata, ImageMetadata.SENSOR_TIMESTAMP);
             putFloatMetadata(json, "lensAperture", metadata, ImageMetadata.LENS_APERTURE);
             putFloatMetadata(json, "lensFocalLengthMm", metadata, ImageMetadata.LENS_FOCAL_LENGTH);
+            if (cameraSensorPhysicalSize == null) {
+                json.put("sensorPhysicalWidthMm", JSONObject.NULL);
+                json.put("sensorPhysicalHeightMm", JSONObject.NULL);
+            } else {
+                json.put("sensorPhysicalWidthMm", cameraSensorPhysicalSize.getWidth());
+                json.put("sensorPhysicalHeightMm", cameraSensorPhysicalSize.getHeight());
+            }
             putIntMetadata(json, "aeState", metadata, ImageMetadata.CONTROL_AE_STATE);
             putIntMetadata(json, "awbState", metadata, ImageMetadata.CONTROL_AWB_STATE);
             putIntMetadata(json, "aeExposureCompensation", metadata, ImageMetadata.CONTROL_AE_EXPOSURE_COMPENSATION);
@@ -3560,6 +3773,34 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         } catch (MetadataNotFoundException ignored) {
             json.put(name, JSONObject.NULL);
         }
+    }
+
+    /*
+     * Function: readBackCameraSensorPhysicalSize
+     * Arguments: none.
+     * Calls: CameraManager.getCameraIdList(), CameraCharacteristics getters.
+     * Flow: find the first back-facing camera and return its physical sensor
+     * dimensions so Phase 5 can estimate real FOV from focal length metadata.
+     */
+    private SizeF readBackCameraSensorPhysicalSize() {
+        CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
+        if (manager == null) {
+            return null;
+        }
+        try {
+            for (String cameraId : manager.getCameraIdList()) {
+                CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+                Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    return characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+                }
+            }
+        } catch (CameraAccessException ignored) {
+            return null;
+        } catch (SecurityException ignored) {
+            return null;
+        }
+        return null;
     }
 
     private static String unavailableExposureJson(String reason) {
@@ -3803,6 +4044,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         captureInProgress = true;
         int targetYawDegrees = isPolarLayer(sweepLayerIndex)
                 ? POLAR_ROLL_SLOT_TARGETS[Math.max(0, polarSlotIndexForSweepBin(sweepBin))]
+                : isHighPitchRingLayer(sweepLayerIndex)
+                ? HIGH_PITCH_RING_YAW_DEGREES[highPitchRingSlotIndexForSweepBin(sweepBin)]
                 : sweepCaptureBinCenterDegrees(sweepBin);
         int targetPitchDegrees = SWEEP_LAYER_PITCH_DEGREES[sweepLayerIndex];
         float relativeHeadingDegrees = isPolarLayer(sweepLayerIndex)

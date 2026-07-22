@@ -105,6 +105,9 @@ final class SpherifyLibrary {
         draftMetadataFile = new File(root, "drafts.json");
         ensureDirs();
         load();
+        if (reconcileDraftSessionItems()) {
+            save();
+        }
     }
 
     /*
@@ -250,6 +253,21 @@ final class SpherifyLibrary {
     }
 
     /*
+     * Function: refresh
+     * Arguments: none.
+     * Calls: load(), reconcileDraftSessionItems(), and save().
+     * Flow: reload persisted library metadata after another Activity has written
+     * draft frames, then rebuild any missing first-class pending session records
+     * from drafts.json so Browse stays in sync with the raw frame index.
+     */
+    void refresh() throws IOException {
+        load();
+        if (reconcileDraftSessionItems()) {
+            save();
+        }
+    }
+
+    /*
      * Function: listDraftFrames
      * Arguments: none.
      * Calls: File.listFiles() and Collections.sort().
@@ -324,6 +342,15 @@ final class SpherifyLibrary {
                 continue;
             }
             JSONObject exposure = json.optJSONObject("exposure");
+            float lensFocalLengthMm = exposure == null || exposure.isNull("lensFocalLengthMm")
+                    ? 0f
+                    : (float) exposure.optDouble("lensFocalLengthMm", 0.0);
+            float sensorPhysicalWidthMm = exposure == null || exposure.isNull("sensorPhysicalWidthMm")
+                    ? 0f
+                    : (float) exposure.optDouble("sensorPhysicalWidthMm", 0.0);
+            float sensorPhysicalHeightMm = exposure == null || exposure.isNull("sensorPhysicalHeightMm")
+                    ? 0f
+                    : (float) exposure.optDouble("sensorPhysicalHeightMm", 0.0);
             result.add(new DraftFrameRecord(
                     file,
                     json.optString("sessionId", ""),
@@ -335,7 +362,10 @@ final class SpherifyLibrary {
                     json.optInt("targetYawDegrees", 0),
                     json.optInt("targetPitchDegrees", 0),
                     json.optString("captureMode", "manual"),
-                    exposure != null && exposure.optBoolean("available", false)));
+                    exposure != null && exposure.optBoolean("available", false),
+                    lensFocalLengthMm,
+                    sensorPhysicalWidthMm,
+                    sensorPhysicalHeightMm));
         }
         Collections.sort(result, Comparator.comparingLong(record -> record.createdAt));
         return result;
@@ -351,7 +381,9 @@ final class SpherifyLibrary {
      * draft capture session, add it as a normal master image, and return both the
      * item and quality summary to MainActivity.
      */
-    StitchMasterResult createMasterFromDraftSession(LibraryItem draftSession) throws IOException {
+    StitchMasterResult createMasterFromDraftSession(
+            LibraryItem draftSession,
+            String movementSensitivity) throws IOException {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
             throw new IOException("select a draft session first");
         }
@@ -363,7 +395,7 @@ final class SpherifyLibrary {
         long now = System.currentTimeMillis();
         String id = newId();
         File imageFile = new File(mastersDir, id + ".jpg");
-        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile);
+        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity);
         File thumbnailFile = makeThumbnail(imageFile, id);
         LibraryItem item = new LibraryItem(
                 id,
@@ -602,7 +634,7 @@ final class SpherifyLibrary {
         }
         items.add(new LibraryItem(
                 sessionId,
-                "Draft Capture " + compactSessionLabel(sessionId),
+                "Pending Capture " + compactSessionLabel(sessionId),
                 LibraryItem.TYPE_DRAFT_SESSION,
                 "capture",
                 "draft_session",
@@ -612,6 +644,74 @@ final class SpherifyLibrary {
                 now,
                 now));
         save();
+    }
+
+    /*
+     * Function: reconcileDraftSessionItems
+     * Arguments: none.
+     * Calls: readDraftMetadata(), File.exists(), findDraftSessionItem(), and
+     * LibraryItem constructor.
+     * Flow: ensure every non-empty draft session in drafts.json has a matching
+     * first-class Pending library record, even if MainActivity's in-memory list
+     * was loaded before CaptureActivity saved the frames.
+     */
+    private boolean reconcileDraftSessionItems() {
+        boolean changed = false;
+        JSONArray metadata = readDraftMetadata();
+        for (int i = 0; i < metadata.length(); i++) {
+            JSONObject json = metadata.optJSONObject(i);
+            if (json == null) {
+                continue;
+            }
+            String sessionId = json.optString("sessionId", "");
+            if (sessionId.isEmpty()) {
+                continue;
+            }
+            File file = new File(json.optString("path", ""));
+            if (!file.exists()) {
+                continue;
+            }
+            long createdAt = json.optLong("createdAt", file.lastModified());
+            LibraryItem existing = findDraftSessionItem(sessionId);
+            if (existing == null) {
+                items.add(new LibraryItem(
+                        sessionId,
+                        "Pending Capture " + compactSessionLabel(sessionId),
+                        LibraryItem.TYPE_DRAFT_SESSION,
+                        "capture",
+                        "draft_session",
+                        "",
+                        file.getAbsolutePath(),
+                        file.getAbsolutePath(),
+                        createdAt,
+                        createdAt));
+                changed = true;
+            } else {
+                if (existing.title.startsWith("Draft Capture ")) {
+                    existing.title = "Pending Capture " + compactSessionLabel(sessionId);
+                    changed = true;
+                }
+                if (!existing.imageFile().exists()) {
+                    existing.imagePath = file.getAbsolutePath();
+                    existing.thumbnailPath = file.getAbsolutePath();
+                    changed = true;
+                }
+                if (createdAt > existing.updatedAt) {
+                    existing.updatedAt = createdAt;
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    private LibraryItem findDraftSessionItem(String sessionId) {
+        for (LibraryItem item : items) {
+            if (sessionId.equals(item.id) && LibraryItem.TYPE_DRAFT_SESSION.equals(item.type)) {
+                return item;
+            }
+        }
+        return null;
     }
 
     /*

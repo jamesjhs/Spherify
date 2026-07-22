@@ -22,6 +22,9 @@ final class DraftFrameRecord {
     final int targetPitchDegrees;
     final String captureMode;
     final boolean exposureAvailable;
+    final float lensFocalLengthMm;
+    final float sensorPhysicalWidthMm;
+    final float sensorPhysicalHeightMm;
 
     DraftFrameRecord(
             File imageFile,
@@ -34,7 +37,10 @@ final class DraftFrameRecord {
             int targetYawDegrees,
             int targetPitchDegrees,
             String captureMode,
-            boolean exposureAvailable) {
+            boolean exposureAvailable,
+            float lensFocalLengthMm,
+            float sensorPhysicalWidthMm,
+            float sensorPhysicalHeightMm) {
         this.imageFile = imageFile;
         this.sessionId = sessionId;
         this.createdAt = createdAt;
@@ -46,5 +52,8 @@ final class DraftFrameRecord {
         this.targetPitchDegrees = targetPitchDegrees;
         this.captureMode = captureMode;
         this.exposureAvailable = exposureAvailable;
+        this.lensFocalLengthMm = lensFocalLengthMm;
+        this.sensorPhysicalWidthMm = sensorPhysicalWidthMm;
+        this.sensorPhysicalHeightMm = sensorPhysicalHeightMm;
     }
 }
