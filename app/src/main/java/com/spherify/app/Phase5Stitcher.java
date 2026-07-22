@@ -3,10 +3,9 @@
  *
  * Educational overview:
  * Phase5Stitcher is the experimental stitching pipeline. It does not yet run a
- * full bundle-adjusted feature stitch, but it now uses the Phase 4 capture plan
- * as a pose estimate, scales polar frames like ordinary source images, and
- * projects camera frames through a simple pinhole lens model before blending
- * overlaps through weighted accumulation.
+ * full bundle-adjusted feature stitch, but it now treats the guided capture
+ * plan as a prior, uses OpenCV/RANSAC control points to relax a frame pose
+ * graph, and renders the normal master from sharp source-selected pixels.
  */
 package com.spherify.app;
 
@@ -120,6 +119,7 @@ final class Phase5Stitcher {
                 missingExposure++;
             }
             FrameProjection projection = projectionFor(record, calibration);
+            float exposureGain = calibration.exposureGains.getOrDefault(record.imageFile.getAbsolutePath(), 1f);
             markCoverage(coverage, projection.bounds);
             blendWrapped(
                     frame,
@@ -127,6 +127,7 @@ final class Phase5Stitcher {
                     calibration.lensModel,
                     renderMode,
                     rendered,
+                    exposureGain,
                     red,
                     green,
                     blue,
@@ -248,7 +249,32 @@ final class Phase5Stitcher {
                 openCvMatchedPairs,
                 matchedPairs == 0 ? 0f : confidenceTotal / matchedPairs,
                 captureProfile,
-                sparseDepthHints);
+                sparseDepthHints,
+                estimateExposureGains(frames));
+    }
+
+    private static Map<String, Float> estimateExposureGains(List<CalibrationFrame> frames) {
+        HashMap<String, Float> gains = new HashMap<>();
+        float total = 0f;
+        int count = 0;
+        for (CalibrationFrame frame : frames) {
+            if (frame.meanLuminance > 8f) {
+                total += frame.meanLuminance;
+                count++;
+            }
+        }
+        if (count == 0) {
+            return gains;
+        }
+        float target = total / count;
+        for (CalibrationFrame frame : frames) {
+            if (frame.meanLuminance > 8f) {
+                gains.put(
+                        frame.record.imageFile.getAbsolutePath(),
+                        clamp(target / frame.meanLuminance, 0.72f, 1.38f));
+            }
+        }
+        return gains;
     }
 
     private static LensModel estimateLensModel(List<DraftFrameRecord> records) {
@@ -857,20 +883,21 @@ final class Phase5Stitcher {
             LensModel lensModel,
             RenderMode renderMode,
             int frameIndex,
+            float exposureGain,
             float[] red,
             float[] green,
             float[] blue,
             float[] weights) {
-        blendOne(frame, projection, lensModel, renderMode, frameIndex, projection.bounds, red, green, blue, weights);
+        blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, projection.bounds, red, green, blue, weights);
         if (projection.bounds.left < 0f) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
         }
         if (projection.bounds.right > OUTPUT_WIDTH) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(-OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
         }
     }
 
@@ -880,6 +907,7 @@ final class Phase5Stitcher {
             LensModel lensModel,
             RenderMode renderMode,
             int frameIndex,
+            float exposureGain,
             RectF bounds,
             float[] red,
             float[] green,
@@ -936,6 +964,8 @@ final class Phase5Stitcher {
                 int color = pixels[sourceY * frameWidth + sourceX];
                 if (renderMode == RenderMode.CONTRIBUTOR_MAP) {
                     color = contributorColor(frameIndex, sourceU, sourceV);
+                } else {
+                    color = applyExposureGain(color, exposureGain);
                 }
                 int index = outputRow + x;
                 if (renderMode.selectsBestSource && weight <= weights[index]) {
@@ -954,6 +984,16 @@ final class Phase5Stitcher {
                 }
             }
         }
+    }
+
+    private static int applyExposureGain(int color, float gain) {
+        if (Math.abs(gain - 1f) < 0.01f) {
+            return color;
+        }
+        int r = clamp(Math.round(((color >> 16) & 0xFF) * gain), 0, 255);
+        int g = clamp(Math.round(((color >> 8) & 0xFF) * gain), 0, 255);
+        int b = clamp(Math.round((color & 0xFF) * gain), 0, 255);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
     private static float[] compensateRadial(float x, float y, LensModel lensModel) {
@@ -1271,6 +1311,7 @@ final class Phase5Stitcher {
         final float averageOverlapConfidence;
         final CaptureProfile captureProfile;
         final SparseDepthHints sparseDepthHints;
+        final Map<String, Float> exposureGains;
 
         Calibration(
                 LensModel lensModel,
@@ -1279,7 +1320,8 @@ final class Phase5Stitcher {
                 int openCvMatchedOverlapCount,
                 float averageOverlapConfidence,
                 CaptureProfile captureProfile,
-                SparseDepthHints sparseDepthHints) {
+                SparseDepthHints sparseDepthHints,
+                Map<String, Float> exposureGains) {
             this.lensModel = lensModel;
             this.corrections = corrections;
             this.matchedOverlapCount = matchedOverlapCount;
@@ -1287,6 +1329,7 @@ final class Phase5Stitcher {
             this.averageOverlapConfidence = averageOverlapConfidence;
             this.captureProfile = captureProfile;
             this.sparseDepthHints = sparseDepthHints;
+            this.exposureGains = exposureGains;
         }
     }
 
@@ -1319,6 +1362,16 @@ final class Phase5Stitcher {
             yawDegrees = clamp(yawDegrees, -4f, 4f);
             pitchDegrees = clamp(pitchDegrees, -4f, 4f);
             rollDegrees = clamp(rollDegrees, -1.2f, 1.2f);
+        }
+
+        PoseCorrection copy() {
+            PoseCorrection copy = new PoseCorrection();
+            copy.yawDegrees = yawDegrees;
+            copy.pitchDegrees = pitchDegrees;
+            copy.rollDegrees = rollDegrees;
+            copy.samples = samples;
+            copy.weightTotal = weightTotal;
+            return copy;
         }
     }
 
@@ -1461,34 +1514,70 @@ final class Phase5Stitcher {
             if (!graph.globallyOptimizable || graph.edges.isEmpty()) {
                 return;
             }
-            for (int iteration = 0; iteration < 5; iteration++) {
-                HashMap<String, PoseCorrection> optimized = new HashMap<>();
+            HashMap<String, PoseCorrection> optimized = new HashMap<>();
+            for (FeatureMatchEdge edge : graph.edges) {
+                optimized.putIfAbsent(edge.fromPath, corrections.getOrDefault(edge.fromPath, new PoseCorrection()).copy());
+                optimized.putIfAbsent(edge.toPath, corrections.getOrDefault(edge.toPath, new PoseCorrection()).copy());
+            }
+            for (int iteration = 0; iteration < 36; iteration++) {
+                HashMap<String, PoseDelta> deltas = new HashMap<>();
                 for (FeatureMatchEdge edge : graph.edges) {
-                    if (edge.confidence <= 0f) {
+                    float graphWeight = optimizerWeight(edge);
+                    if (graphWeight <= 0f) {
                         continue;
                     }
-                    float graphWeight = edge.featureBased
-                            ? edge.confidence * Math.max(1f, edge.inlierControlPoints.size() / 12f)
-                            : edge.confidence * 0.45f;
-                    PoseCorrection source = optimized.computeIfAbsent(edge.fromPath, ignored -> new PoseCorrection());
-                    PoseCorrection target = optimized.computeIfAbsent(edge.toPath, ignored -> new PoseCorrection());
-                    source.add(
-                            -edge.relativeYawDegrees * 0.35f,
-                            -edge.relativePitchDegrees * 0.35f,
-                            -edge.relativeRollDegrees * 0.35f,
-                            graphWeight);
-                    target.add(
-                            edge.relativeYawDegrees * 0.65f,
-                            edge.relativePitchDegrees * 0.65f,
-                            edge.relativeRollDegrees * 0.65f,
-                            graphWeight);
+                    PoseCorrection source = optimized.get(edge.fromPath);
+                    PoseCorrection target = optimized.get(edge.toPath);
+                    if (source == null || target == null) {
+                        continue;
+                    }
+                    float yawResidual = edge.relativeYawDegrees - (target.yawDegrees - source.yawDegrees);
+                    float pitchResidual = edge.relativePitchDegrees - (target.pitchDegrees - source.pitchDegrees);
+                    float rollResidual = edge.relativeRollDegrees - (target.rollDegrees - source.rollDegrees);
+                    deltas.computeIfAbsent(edge.fromPath, ignored -> new PoseDelta())
+                            .add(-yawResidual, -pitchResidual, -rollResidual, graphWeight);
+                    deltas.computeIfAbsent(edge.toPath, ignored -> new PoseDelta())
+                            .add(yawResidual, pitchResidual, rollResidual, graphWeight);
                 }
-                for (Map.Entry<String, PoseCorrection> entry : optimized.entrySet()) {
-                    PoseCorrection correction = entry.getValue();
-                    correction.averageAndClamp();
-                    corrections.put(entry.getKey(), correction);
+                for (Map.Entry<String, PoseDelta> entry : deltas.entrySet()) {
+                    PoseCorrection correction = optimized.get(entry.getKey());
+                    if (correction == null) {
+                        continue;
+                    }
+                    PoseDelta delta = entry.getValue();
+                    float step = 0.34f / Math.max(1f, delta.weightTotal);
+                    correction.yawDegrees = clamp((correction.yawDegrees + delta.yawDegrees * step) * 0.992f, -5.5f, 5.5f);
+                    correction.pitchDegrees = clamp((correction.pitchDegrees + delta.pitchDegrees * step) * 0.992f, -4.5f, 4.5f);
+                    correction.rollDegrees = clamp((correction.rollDegrees + delta.rollDegrees * step) * 0.985f, -1.8f, 1.8f);
                 }
             }
+            corrections.clear();
+            corrections.putAll(optimized);
+        }
+
+        private float optimizerWeight(FeatureMatchEdge edge) {
+            if (edge.confidence <= 0f) {
+                return 0f;
+            }
+            float inlierWeight = edge.featureBased
+                    ? Math.max(1f, edge.inlierControlPoints.size() / 10f)
+                    : 0.35f;
+            float residualPenalty = 1f / (1f + Math.max(0f, edge.residualScore) / 18f);
+            return edge.confidence * inlierWeight * residualPenalty;
+        }
+    }
+
+    private static final class PoseDelta {
+        float yawDegrees;
+        float pitchDegrees;
+        float rollDegrees;
+        float weightTotal;
+
+        void add(float yawDegrees, float pitchDegrees, float rollDegrees, float weight) {
+            this.yawDegrees += yawDegrees * weight;
+            this.pitchDegrees += pitchDegrees * weight;
+            this.rollDegrees += rollDegrees * weight;
+            this.weightTotal += weight;
         }
     }
 
@@ -1611,6 +1700,7 @@ final class Phase5Stitcher {
         final int width;
         final int height;
         final int[] grayscale;
+        final float meanLuminance;
         final float baseYawDegrees;
         final int basePitchDegrees;
         final boolean polar;
@@ -1620,6 +1710,7 @@ final class Phase5Stitcher {
                 int width,
                 int height,
                 int[] grayscale,
+                float meanLuminance,
                 float baseYawDegrees,
                 int basePitchDegrees,
                 boolean polar) {
@@ -1627,6 +1718,7 @@ final class Phase5Stitcher {
             this.width = width;
             this.height = height;
             this.grayscale = grayscale;
+            this.meanLuminance = meanLuminance;
             this.baseYawDegrees = baseYawDegrees;
             this.basePitchDegrees = basePitchDegrees;
             this.polar = polar;
@@ -1657,12 +1749,14 @@ final class Phase5Stitcher {
             bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
             bitmap.recycle();
             int[] grayscale = new int[pixels.length];
+            long luminanceTotal = 0L;
             for (int i = 0; i < pixels.length; i++) {
                 int color = pixels[i];
                 grayscale[i] = Math.round(
                         ((color >> 16) & 0xFF) * 0.299f
                                 + ((color >> 8) & 0xFF) * 0.587f
                                 + (color & 0xFF) * 0.114f);
+                luminanceTotal += grayscale[i];
             }
             boolean polar = Math.abs(record.targetPitchDegrees) >= 70;
             return new CalibrationFrame(
@@ -1670,6 +1764,7 @@ final class Phase5Stitcher {
                     width,
                     height,
                     grayscale,
+                    luminanceTotal / (float) Math.max(1, grayscale.length),
                     normalizeDegrees(record.targetYawDegrees),
                     record.targetPitchDegrees,
                     polar);

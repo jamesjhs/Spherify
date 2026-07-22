@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.5.10
+Version: 0.5.15
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
-This repository now contains the first Android proof-of-concept application code. The 0.5.10 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, sweep-first photosphere capture with still-keyframe auto capture, guided eight-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata and ARCore intrinsics for FOV estimation, safer delete confirmations, rotation-state restore, Android launcher badge assets, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, capture profiles for hand-held versus fixed-gimbal sessions, Tiny Planet import center marking, full-resolution PhotoSphere export, sharp-source and contributor-map stitch outputs, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, OpenCV ORB/RANSAC pose-graph matching, inlier control-point storage, graph-relaxed pose correction, movement-sensitive overlap rejection, conservative pose nudges, parallax-risk reporting, and corrected polar sizing.
+This repository now contains the first Android proof-of-concept application code. The 0.5.15 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, dot-by-dot photosphere capture with stricter still-keyframe auto capture, first-dot row anchoring, horizon-arrow guidance for high-pitch rows, guided eight-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata and ARCore intrinsics for FOV estimation, timestamp-matched image/metadata capture packets, ARCore metadata accessor hardening, Camera2 `TotalCaptureResult` metadata-buffer scaffolding, safer Capture startup UI threading, safer delete confirmations, rotation-state restore, Android launcher badge assets, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, capture profiles for hand-held versus fixed-gimbal sessions, Tiny Planet import center marking, full-resolution PhotoSphere export, a single sharp source-selected Spherify output for normal use, a strict draft quality gate with readable preflight failure dialogs, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, OpenCV ORB/RANSAC pose-graph matching, inlier control-point storage, iterative residual pose-graph correction, exposure gain normalization, movement-sensitive overlap rejection, conservative pose nudges, parallax-risk reporting, and corrected polar sizing.
 
 ## Developer Build and Run Runbook
 
@@ -30,7 +30,7 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.5.10):
+Current repository compliance snapshot (0.5.15):
 
 - Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata, experimental local draft stitching into app-created masters.
 - Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
@@ -228,6 +228,98 @@ Either approach guarantees a complete fill before the JSON parse and eliminates 
 3. Long-term: introduce a `loadAsync(callback)` pattern on `SpherifyLibrary` that shifts all file reads to a dedicated executor, consistent with the background-thread approach adopted for bitmap decodes.
 
 ---
+
+## Capture and Stitching Workflow Notes
+
+The capture and stitching work has changed direction several times because the first real equirectangular outputs made one thing obvious: the app was blending too early. Blended output made incorrect placement look like soft ghosting, while the sharp/source-selected output exposed the true failure: several source frames were being projected into nearly the same equirectangular regions with slightly different geometry.
+
+The earliest Phase 5 stitcher placed frames from target yaw/pitch metadata and blended them with feathered accumulation. That proved useful only as a smoke test. It created a complete image file, but it could not correct drift, incorrect FOV, roll, lens distortion, or hand-held parallax. The next attempts added actual captured heading/pitch/roll values, ARCore image intrinsics, simple radial compensation, captured sensor size metadata, and overlap correlation. These improved the model, but real indoor tests still showed that strip correlation and per-frame nudges were not enough.
+
+The project then moved to the architecture used by mature panorama tools: capture still keyframes with strong overlap, detect control points, validate overlaps with RANSAC, solve camera poses globally, select one good source per region, and blend only once placement is reliable. This direction is consistent with Brown and Lowe's invariant-feature panorama pipeline, OpenCV's detailed stitcher stages, and Hugin's control-point optimisation workflow. Google/Street View-style capture succeeds largely because the capture is highly constrained: the user moves dot-to-dot, holds still, captures one keyframe, then moves to the next target. It does not treat every moving preview frame as a useful stitch input.
+
+The current normal workflow therefore avoids offering diagnostic render choices to users. `Spherify` uses the sharp source-selected output by default because it is least likely to hide geometric mistakes as blur. Contributor maps and blended masters remain useful engineering ideas, but public-quality output should not blend until the app has strong camera optimisation and seam selection.
+
+Current implemented capture/stitching safeguards:
+
+- Guided dot-by-dot capture rather than free continuous sweeping.
+- Auto-capture only after the device is close to the target pose and angular velocity has remained low through a hold countdown.
+- First-dot row anchoring, so each row starts from a stable 0-degree vertical reference before normal dot movement begins.
+- High-pitch horizon arrows, so upper/lower rows are still oriented from the horizon before the user tilts up or down.
+- Hand-held and fixed-gimbal capture profiles, with hand-held parallax treated as an expected error mode rather than something a single spherical warp can fully solve.
+- ARCore pose and image intrinsics stored per frame, with target yaw/pitch retained only as fallback.
+- Capture packet publication now requires exact timestamp matching between camera image timestamps and camera metadata timestamps.
+- A Camera2 `TotalCaptureResult` callback path now feeds the same timestamp-indexed metadata buffer, preparing the capture stack for full SharedCamera ownership.
+- OpenCV ORB feature detection, Hamming BF matching, ratio/cross-check filtering, homography RANSAC, and stored inlier control points.
+- Predicted-nearby matching across same-row, adjacent-row, and wraparound overlaps instead of only next-frame neighbors.
+- Strict draft quality gate before Spherify, blocking captures with too few still keyframes, weak row coverage, missing pose/intrinsics, or too many likely manual/transitional frames.
+- Readable preflight and failure dialogs so poor captures are diagnosed instead of silently rendered.
+- Iterative residual pose-graph correction, which is closer to a real camera-graph solve than independent per-frame offsets.
+- Exposure gain normalization before sharp source-selected rendering, reducing brightness jumps while avoiding blur.
+
+Known remaining gap:
+
+Spherify still does not yet have a full bundle-adjustment engine. The next major stitching step is to optimize frame yaw, pitch, roll, FOV, and radial distortion from the stored control points as angular reprojection residuals. After that, the app needs seam selection that prefers frame centers and avoids high-residual/near-object regions, followed by multiband blending only along chosen seams. Until that is complete, indoor hand-held captures with close furniture remain the hardest case and should be quality-gated aggressively.
+
+Capture metadata reliability incident:
+
+After the hard metadata gate was added, captures could stall with "capture waiting for exposure metadata". The immediate cause was that image bytes and metadata had been cached separately, and later that the app still depended on "latest" ARCore metadata rather than proving that an image and its metadata described the same sensor frame. The 0.5.14 workflow introduced capture-ready packets: metadata is stored by `SENSOR_TIMESTAMP`, the ARCore CPU `Image` is checked by `Image.getTimestamp()`, and a capture-ready packet is published only when the image and metadata timestamps can be paired and every required field passes validation. The Camera2 `TotalCaptureResult` callback path now writes into the same metadata buffer, which is the direction needed for the full industrial SharedCamera pipeline.
+
+The 0.5.15 investigation showed that the remaining `buffer=0` failure was not a camera permission issue. Log output confirmed `cameraPermission=true`, ARCore session creation, CPU image delivery, and tracking, but `Frame.getImageMetadata()` processing failed because the app read `ImageMetadata.CONTROL_AE_STATE` with the wrong scalar accessor. ARCore reported `Wrong return type for ImageMetadata key: 65567`, aborting the entire metadata JSON build before any packet could be stored. The app now reads optional ARCore scalar metadata with type-aware fallbacks, records compact metadata key diagnostics, and keeps the downstream strict gate intact.
+
+See `docs/CAPTURE_STITCHING_DEEP_DIVE.md` for the detailed research-backed direction and reference links.
+
+---
+
+### Version 0.5.15 Progress
+
+This bugfix build stabilizes Capture startup and fixes the first confirmed ARCore metadata receive bug:
+
+- Fixes Capture startup/calibration crashes caused by camera/render-thread UI updates mutating `TextView` state outside the main thread.
+- Guards transitional Capture UI labels so null status text cannot crash early sensor callbacks.
+- Adds ARCore pipeline diagnostics for session startup, texture attachment, frame counts, tracking state, CPU image acquisition, metadata success/not-ready/fail counts, metadata timestamps, metadata key count, compact key lists, and field blockers.
+- Identifies the persistent missing metadata issue as an app-side ARCore `ImageMetadata` accessor mismatch, not a permission failure.
+- Makes ARCore metadata reads type-tolerant for scalar fields, so enum/state fields exposed as bytes do not abort the entire metadata packet.
+- Keeps the hard capture rule: incomplete downstream metadata blocks capture rather than being substituted or degraded.
+
+### Version 0.5.14 Progress
+
+This bugfix build makes capture metadata stricter and more inspectable:
+
+- Replaces latest-image/latest-metadata capture readiness with timestamp-matched capture packets.
+- Stores camera metadata by `SENSOR_TIMESTAMP` and only pairs it with an ARCore CPU image whose `Image.getTimestamp()` matches exactly.
+- Adds Camera2 `TotalCaptureResult` metadata-buffer scaffolding so the eventual full SharedCamera capture session can provide the authoritative metadata source without changing the capture packet contract.
+- Keeps hidden metadata retries, but retries still wait for a fully valid packet rather than relaxing requirements.
+- Extends `Show Data` diagnostics with image timestamp, matched metadata timestamp, metadata buffer size, retry attempts, and field-by-field blockers.
+- Documents the metadata reliability incident and the decision that incomplete metadata is a capture blocker, not a stitch-time warning.
+
+### Version 0.5.13 Progress
+
+This bugfix build documents the capture/stitching reset and makes the current Phase 5 workflow more honest:
+
+- Adds a consolidated README discussion of the capture/stitching attempts so far, including why the app moved away from continuous-frame blending and toward guided still keyframes plus control-point optimisation.
+- Documents the current working theory from Google/Street View-style apps, Brown and Lowe, OpenCV, and Hugin: constrained capture first, global camera optimisation second, seam selection third, blending last.
+- Adds the deep-dive reference document at `docs/CAPTURE_STITCHING_DEEP_DIVE.md`.
+- Improves normal Spherify failures by surfacing the draft quality gate as a readable dialog instead of a transient toast.
+- Updates the Phase 5 stitcher description to reflect iterative residual pose-graph correction and exposure normalization.
+
+### Version 0.5.12 Progress
+
+This build refines dot-by-dot capture guidance:
+
+- Anchors the first dot of each capture layer to the center vertical line until that layer's first image is captured.
+- After the first image in a layer, dots resume live movement according to the required yaw spacing.
+- Adds horizon up/down arrows for the high-pitch rows, with countdown dots positioned vertically above or below the horizon target.
+- Keeps high-row capture aligned to horizon orientation before the user pans up or down.
+
+### Version 0.5.11 Progress
+
+This build moves normal Spherify use away from diagnostic blending and toward stricter Street View-style capture:
+
+- Removes the normal Spherify render-choice dialogs; user-facing Spherify now produces the sharp source-selected output.
+- Adds a strict draft quality gate before stitching, blocking sessions with too few still keyframes, weak row coverage, missing pose/intrinsics, or too many likely transitional/manual frames.
+- Saves accepted initial horizon dots as full-resolution draft keyframes, not only low-resolution guide-strip samples.
+- Tightens keyframe stillness thresholds so auto capture waits longer and rejects more yaw/pitch/roll motion.
+- Keeps OpenCV/RANSAC and pose-graph stitching as the shared calibration path behind the single normal output.
 
 ### Version 0.5.10 Progress
 
@@ -2022,34 +2114,248 @@ Prerequisites from Phase 4:
 - The stitched input set should come from one selected draft session, not from the raw all-drafts frame list.
 - Missing exposure values must be stored explicitly as unavailable/null fields, not as prose placeholders, so Phase 5 can decide whether to compensate, warn, or skip a frame.
 
+Workflow:
+
+Phase 5 is intentionally split into small, testable sections. A section is not complete because it produces an image; it is complete only when it has diagnostics, failure handling, and repeatable evidence on real captures. Normal user output must remain sharp/source-selected until the geometry and seam stages below are proven.
+
+#### Phase 5A: Input Session Integrity and Capture Quality Gate
+
+Goal: refuse captures that the stitcher cannot realistically save.
+
 Work:
 
-- Build or integrate a stitching pipeline.
-- Use sensor orientation as an initial pose estimate.
-- Match features across overlapping frames.
-- Estimate alignment and correct drift.
-- Balance exposure and white balance between frames.
-- Blend seams and flag weak areas.
-- Generate a 2:1 equirectangular JPEG master.
-- Add basic PhotoSphere/XMP-style metadata.
-- Validate output against Google Maps readiness requirements.
+- Load frames only from one selected draft session.
+- Verify the expected row counts and yaw distribution before stitching.
+- Verify captured heading/pitch/roll availability and ARCore image intrinsics coverage.
+- Track stillness metadata and reject likely transitional/manual frames from the normal stitch set.
+- Reject capture at source if any downstream-required camera metadata is missing, null, substituted, or unparsable.
+- Retry capture requests briefly while waiting for a metadata-complete frame packet, without downgrading requirements or writing partial frames.
+- Report blockers and warnings in readable UI, not only logs or transient toasts.
 
-Current implementation:
+Exit criteria:
+
+- The app blocks incomplete sessions before rendering.
+- No frame is written to `drafts.json` unless image bytes, pose, exposure metadata, lens metadata, sensor size, and ARCore image intrinsics are all present.
+- A transient ARCore metadata delay results in hidden capture retries and debug output, not a degraded capture record.
+- The app explains exactly which row/metadata/stillness requirement failed.
+- A known-bad moving capture is refused; a complete dot-held capture passes.
+
+Current status:
+
+- Draft sessions are first-class library records.
+- A strict draft quality gate and readable failure dialog are implemented.
+- Capture and draft persistence now reject incomplete downstream metadata before a frame can be recorded.
+- Capture requests now wait through a short metadata retry window and only commit a validated image+metadata packet.
+- Stillness is inferred from capture mode; explicit per-frame angular-velocity storage remains a future improvement.
+
+#### Phase 5B: Camera and Lens Priors
+
+Goal: create a defensible initial camera model before feature optimisation.
+
+Work:
+
+- Use actual captured heading, pitch, and roll as the initial pose when available.
+- Use target yaw/pitch only as fallback.
+- Store and use ARCore image intrinsics to estimate horizontal/vertical FOV.
+- Keep a bounded radial-distortion model per session.
+- Record whether the capture was hand-held or fixed-gimbal and treat this as an optimisation prior.
+
+Exit criteria:
+
+- Existing captures with missing intrinsics still stitch through fallback values.
+- New captures report estimated FOV and radial coefficients in output metadata.
+- Captured pose/intrinsics usage is visible in diagnostics.
+
+Current status:
+
+- Captured pose is used before target pose.
+- ARCore intrinsics and physical sensor metadata are stored and used for FOV estimation.
+- Radial compensation exists but is still heuristic rather than optimized.
+
+#### Phase 5C: Overlap Prediction and Feature Control Points
+
+Goal: build a reliable graph of overlapping frame pairs.
+
+Work:
+
+- Predict nearby frame pairs across same-row, adjacent-row, and 360-degree wraparound overlaps.
+- Use OpenCV ORB or AKAZE with Hamming-distance matching.
+- Apply Lowe-style ratio filtering and reverse/cross-check validation.
+- Validate candidate matches with RANSAC homography.
+- Store accepted inlier control-point pairs, not only average offsets.
+- Record rejected-pair reasons for debugging weak captures.
+
+Exit criteria:
+
+- A contributor/control-point diagnostic can show which frame pairs matched.
+- Accepted pairs include inlier counts, inlier ratio, residual score, and confidence.
+- Weak indoor areas fail cleanly rather than injecting bad pose corrections.
+
+Current status:
+
+- OpenCV ORB, BFMatcher/Hamming, ratio plus reverse check, homography RANSAC, and inlier control-point storage are implemented.
+- Pair rejection diagnostics are still limited.
+
+#### Phase 5D: Real Global Camera Optimisation
+
+Goal: replace pose nudges with a true optimisation over the whole sphere.
+
+Work:
+
+- Convert every inlier control point into an angular reprojection residual.
+- Optimise frame yaw, pitch, roll, FOV, and simple radial distortion.
+- Treat ARCore/sensor pose as a prior, not as absolute truth.
+- Add robust loss or outlier down-weighting so parallax or moving objects do not dominate.
+- Enforce loop closure, especially around the horizon row.
+- Persist optimisation diagnostics: residual mean, residual percentile, closure error, dropped edges, and final parameter changes.
+
+Exit criteria:
+
+- Synthetic test sessions with known pose offsets converge close to the known correction.
+- Real horizon-row captures close around 360 degrees without visible drift.
+- Stitches with poor control-point evidence fail the quality gate instead of producing plausible-looking blur.
+
+Current status:
+
+- An iterative residual pose-graph correction is implemented.
+- Full bundle adjustment over control-point reprojection residuals is not yet implemented and is the main remaining geometry gap.
+
+#### Phase 5E: Parallax and Near-Object Risk Handling
+
+Goal: handle hand-held indoor captures honestly.
+
+Work:
+
+- Use high residual clusters to detect likely near-object/parallax conflict zones.
+- Mark risky regions in stitch metadata and diagnostics.
+- Penalize risky regions during source selection and seam routing.
+- Keep hand-held parallax as a local seam/distortion problem rather than forcing one impossible global alignment.
+
+Exit criteria:
+
+- Indoor captures with close furniture report parallax-risk areas.
+- Seam/source selection avoids high residual zones where alternative coverage exists.
+- The app warns when the scene geometry is unsuitable for public-quality output.
+
+Current status:
+
+- Sparse parallax-risk warnings exist from feature residuals.
+- Region-level parallax maps and seam penalties remain pending.
+
+#### Phase 5F: Sharp Source Selection
+
+Goal: produce the best non-blurred master before blending.
+
+Work:
+
+- Render one strongest/best source per output pixel.
+- Prefer pixels near source-frame centers.
+- Penalize frame edges, weak matches, exposure outliers, and parallax-risk regions.
+- Keep contributor-map/debug output available for engineering even if normal UI exposes only one Spherify action.
+
+Exit criteria:
+
+- Misalignment appears as sharp seam/source jumps, not averaged ghosting.
+- Contributor/debug output proves no region is being unintentionally averaged from many frames.
+- Normal user output is the sharp source-selected master until seam/blending quality is proven.
+
+Current status:
+
+- Normal `Spherify` uses sharp source-selected output.
+- Contributor-map rendering exists internally as a diagnostic mode.
+- Source scoring does not yet include region-level residual/parallax penalties.
+
+#### Phase 5G: Exposure and Colour Compensation
+
+Goal: reduce visible jumps without hiding geometry errors.
+
+Work:
+
+- Estimate per-frame luminance/exposure gain.
+- Add white-balance or colour-channel compensation where metadata/image evidence supports it.
+- Apply compensation before sharp source selection and seam blending.
+- Keep compensation bounded so it cannot create washed-out or clipped regions.
+
+Exit criteria:
+
+- Source-selected seams show reduced brightness discontinuity.
+- Overexposed windows/lights are not used as calibration anchors.
+- Output metadata reports compensation range.
+
+Current status:
+
+- Bounded per-frame exposure gain normalization is implemented.
+- White-balance/channel compensation remains pending.
+
+#### Phase 5H: Seam Finding Before Blending
+
+Goal: choose where source transitions happen before any multiband blend.
+
+Work:
+
+- Build per-source masks in equirectangular space.
+- Prefer frame centers and avoid edges.
+- Penalize high residual, low-confidence, moving-object, and near-object conflict regions.
+- Route seams through low-detail/low-error areas.
+- Keep a seam-debug view for visual QA.
+
+Exit criteria:
+
+- Sharp source-selected output has intentional, stable seams rather than arbitrary per-pixel ownership.
+- Seam paths avoid obvious faces, furniture edges, text, windows, and high residual zones when alternatives exist.
+- Blended output is not enabled for normal use until seam masks are stable.
+
+Current status:
+
+- Seam finding remains pending.
+- The current strongest-source renderer is the prerequisite diagnostic stage.
+
+#### Phase 5I: Multiband Blending and Final Photosphere Export
+
+Goal: polish already-correct geometry rather than conceal bad placement.
+
+Work:
+
+- Add multiband blending along selected seams only.
+- Preserve high-frequency detail where one source clearly owns the region.
+- Add 2:1 equirectangular output validation.
+- Add PhotoSphere/XMP-style metadata sufficient for compatible viewers.
+- Add final readiness checks for missing coverage, excessive residuals, weak closure, and unsupported capture quality.
+
+Exit criteria:
+
+- Blended output improves seams without reintroducing ghosting.
+- The same capture passes a side-by-side QA check: sharp source-selected output is geometrically correct, blended output is only cosmetically smoother.
+- Public/export readiness is reported as pass/warn/fail.
+
+Current status:
+
+- Full-resolution PhotoSphere export exists for generated masters.
+- Multiband blending, final seam-aware blending, and formal PhotoSphere readiness validation remain pending.
+
+Current integrated implementation snapshot:
 
 - Draft sessions expose a `Spherify` action from the library.
 - Phase 5 can enumerate typed frame records for one selected draft session, including file path, timestamp, session id, approximate orientation, target pitch/yaw, capture mode, and exposure availability.
 - The first experimental stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates, inverse-projecting source frames through a simple pinhole/radial lens model, blending overlaps through weighted accumulation, and treating polar captures as constrained top/bottom source frames instead of full-width bands.
 - New captures include physical sensor-size metadata when available, so Phase 5 can compute FOV from the actual phone camera instead of relying only on heuristics.
-- A lightweight, movement-sensitive overlap-correlation pass compares neighboring sweep frames and applies bounded yaw, pitch, and roll corrections before rendering.
+- A lightweight, movement-sensitive overlap-correlation fallback remains available, but OpenCV ORB/RANSAC matching is now the primary accepted-overlap path.
+- Accepted OpenCV matches store inlier control points and feed an iterative residual pose-graph correction before rendering.
+- Normal `Spherify` creates a sharp source-selected master instead of offering blended output as a public choice.
+- Exposure gain normalization is applied before rendering to reduce brightness jumps without averaging misaligned geometry.
+- A strict preflight quality gate blocks obviously weak draft sessions and explains capture blockers to the user.
 - Generated masters are saved as normal `master` library records with the draft session as `parentId`, thumbnails are generated, and the main PhotoSphere viewer opens the result.
 - A post-stitch summary reports frames used, estimated grid coverage, missing exposure references, and warnings for weak/incomplete captures.
-- This is not map-ready yet: robust feature matching, full drift correction, exposure/white-balance balancing, seam blending, gap repair, and formal Google Maps readiness checks are still pending.
+- This is not map-ready yet: full bundle adjustment, control-point reprojection residuals, seam finding, white-balance compensation, seam-aware multiband blending, gap repair, and formal PhotoSphere readiness checks are still pending.
 
 Exit criteria:
 
-- At least one real phone capture produces a usable equirectangular master.
+- A strict, dot-held real phone capture produces a sharp, mostly aligned equirectangular master before blending.
+- The optimisation diagnostics show sufficient OpenCV inliers, low residuals, and acceptable row closure.
+- Seam selection is stable and avoids high-error/parallax regions.
+- Multiband blending improves seams without adding visible ghosting.
 - The master can be viewed, reprojected, saved, and exported.
-- The app identifies non-map-ready captures instead of silently treating them as publishable.
+- The app identifies non-public-ready captures instead of silently treating them as publishable.
 
 ### Phase 6: Review, Repair, and Creative Editing
 

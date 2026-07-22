@@ -479,6 +479,10 @@ final class SpherifyLibrary {
         if (records.isEmpty()) {
             throw new IOException("draft session has no readable frames");
         }
+        DraftQualityReport qualityReport = validateDraftStitchQuality(records);
+        if (!qualityReport.pass) {
+            throw new IOException(qualityReport.failureMessage());
+        }
 
         long now = System.currentTimeMillis();
         String id = newId();
@@ -499,6 +503,191 @@ final class SpherifyLibrary {
         items.add(item);
         save();
         return new StitchMasterResult(item, stitch);
+    }
+
+    DraftQualityReport assessDraftStitchQuality(LibraryItem draftSession) throws IOException {
+        if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
+            throw new IOException("select a draft session first");
+        }
+        return validateDraftStitchQuality(listDraftFrameRecords(draftSession.id));
+    }
+
+    private static DraftQualityReport validateDraftStitchQuality(List<DraftFrameRecord> records) {
+        int readableFrames = 0;
+        int poseFrames = 0;
+        int intrinsicsFrames = 0;
+        int movingOrManualFrames = 0;
+        int horizon = 0;
+        int upper30 = 0;
+        int lower30 = 0;
+        int upperHigh = 0;
+        int lowerHigh = 0;
+        boolean handheld = false;
+        for (DraftFrameRecord record : records) {
+            if (!record.imageFile.exists()) {
+                continue;
+            }
+            readableFrames++;
+            if (record.capturedPoseAvailable) {
+                poseFrames++;
+            }
+            if (record.imageFocalLengthXPixels > 0f
+                    && record.imageFocalLengthYPixels > 0f
+                    && record.imageIntrinsicsWidth > 0
+                    && record.imageIntrinsicsHeight > 0) {
+                intrinsicsFrames++;
+            }
+            if (!record.captureMode.contains("auto")
+                    && !record.captureMode.contains("high-ring")
+                    && !record.captureMode.contains("keyframe")) {
+                movingOrManualFrames++;
+            }
+            if ("handheld".equals(record.captureProfile)) {
+                handheld = true;
+            }
+            int pitch = record.targetPitchDegrees;
+            if (Math.abs(pitch) <= 10) {
+                horizon++;
+            } else if (pitch >= 20 && pitch <= 45) {
+                upper30++;
+            } else if (pitch <= -20 && pitch >= -45) {
+                lower30++;
+            } else if (pitch >= 55) {
+                upperHigh++;
+            } else if (pitch <= -55) {
+                lowerHigh++;
+            }
+        }
+        ArrayList<String> blockers = new ArrayList<>();
+        ArrayList<String> warnings = new ArrayList<>();
+        if (readableFrames < 50) {
+            blockers.add("need about 50+ still keyframes; found " + readableFrames);
+        }
+        if (horizon < 12) {
+            blockers.add("horizon row needs at least 12 held dots; found " + horizon);
+        }
+        if (upper30 < 10) {
+            blockers.add("+30 row needs at least 10 held dots; found " + upper30);
+        }
+        if (lower30 < 10) {
+            blockers.add("-30 row needs at least 10 held dots; found " + lower30);
+        }
+        if (upperHigh < 6) {
+            blockers.add("+65 row needs at least 6 held dots; found " + upperHigh);
+        }
+        if (lowerHigh < 6) {
+            blockers.add("-65 row needs at least 6 held dots; found " + lowerHigh);
+        }
+        if (poseFrames < Math.round(readableFrames * 0.8f)) {
+            blockers.add("captured ARCore pose is missing on too many frames");
+        }
+        if (intrinsicsFrames < Math.round(readableFrames * 0.5f)) {
+            blockers.add("camera intrinsics are missing on too many frames");
+        }
+        if (movingOrManualFrames > Math.max(3, readableFrames / 5)) {
+            blockers.add("too many frames look like manual/transitional captures; recapture with dot hold");
+        }
+        if (handheld && readableFrames > 0) {
+            warnings.add("hand-held indoor captures need extra care around furniture and other close objects");
+        }
+        if (readableFrames >= 50 && readableFrames < 58) {
+            warnings.add("capture passed, but extra overlap would make OpenCV matching more reliable");
+        }
+        return new DraftQualityReport(
+                blockers.isEmpty(),
+                readableFrames,
+                poseFrames,
+                intrinsicsFrames,
+                movingOrManualFrames,
+                horizon,
+                upper30,
+                lower30,
+                upperHigh,
+                lowerHigh,
+                handheld,
+                blockers,
+                warnings);
+    }
+
+    static final class DraftQualityReport {
+        final boolean pass;
+        final int readableFrames;
+        final int poseFrames;
+        final int intrinsicsFrames;
+        final int movingOrManualFrames;
+        final int horizonFrames;
+        final int upper30Frames;
+        final int lower30Frames;
+        final int upperHighFrames;
+        final int lowerHighFrames;
+        final boolean handheld;
+        final List<String> blockers;
+        final List<String> warnings;
+
+        DraftQualityReport(
+                boolean pass,
+                int readableFrames,
+                int poseFrames,
+                int intrinsicsFrames,
+                int movingOrManualFrames,
+                int horizonFrames,
+                int upper30Frames,
+                int lower30Frames,
+                int upperHighFrames,
+                int lowerHighFrames,
+                boolean handheld,
+                List<String> blockers,
+                List<String> warnings) {
+            this.pass = pass;
+            this.readableFrames = readableFrames;
+            this.poseFrames = poseFrames;
+            this.intrinsicsFrames = intrinsicsFrames;
+            this.movingOrManualFrames = movingOrManualFrames;
+            this.horizonFrames = horizonFrames;
+            this.upper30Frames = upper30Frames;
+            this.lower30Frames = lower30Frames;
+            this.upperHighFrames = upperHighFrames;
+            this.lowerHighFrames = lowerHighFrames;
+            this.handheld = handheld;
+            this.blockers = blockers;
+            this.warnings = warnings;
+        }
+
+        String failureMessage() {
+            StringBuilder message = new StringBuilder("capture quality gate failed");
+            if (handheld) {
+                message.append(" (hand-held indoor captures need extra care)");
+            }
+            for (String blocker : blockers) {
+                message.append("; ").append(blocker);
+            }
+            return message.toString();
+        }
+
+        String summary() {
+            StringBuilder message = new StringBuilder();
+            message.append("Frames: ").append(readableFrames)
+                    .append("\nPose metadata: ").append(poseFrames).append("/").append(readableFrames)
+                    .append("\nCamera intrinsics: ").append(intrinsicsFrames).append("/").append(readableFrames)
+                    .append("\nRows: horizon ").append(horizonFrames)
+                    .append(", +30 ").append(upper30Frames)
+                    .append(", -30 ").append(lower30Frames)
+                    .append(", +65 ").append(upperHighFrames)
+                    .append(", -65 ").append(lowerHighFrames);
+            if (!blockers.isEmpty()) {
+                message.append("\n\nBlockers:");
+                for (String blocker : blockers) {
+                    message.append("\n- ").append(blocker);
+                }
+            }
+            if (!warnings.isEmpty()) {
+                message.append("\n\nWarnings:");
+                for (String warning : warnings) {
+                    message.append("\n- ").append(warning);
+                }
+            }
+            return message.toString();
+        }
     }
 
     /*
@@ -667,7 +856,12 @@ final class SpherifyLibrary {
             json.put("targetPitchDegrees", targetPitchDegrees);
             json.put("captureMode", captureMode == null ? "manual" : captureMode);
             json.put("captureProfile", normalizeCaptureProfile(captureProfile));
-            json.put("exposure", parseExposureJson(exposureJson));
+            JSONObject exposure = parseExposureJson(exposureJson);
+            String metadataBlocker = requiredCaptureMetadataBlocker(exposure);
+            if (metadataBlocker != null) {
+                throw new IOException(metadataBlocker);
+            }
+            json.put("exposure", exposure);
             array.put(json);
             writeDraftMetadata(array);
             upsertDraftSessionItem(imageFile, sessionId, now);
@@ -865,6 +1059,46 @@ final class SpherifyLibrary {
             return json;
         }
         return new JSONObject(exposureJson);
+    }
+
+    private static String requiredCaptureMetadataBlocker(JSONObject json) {
+        if (!json.optBoolean("available", false)) {
+            return "draft frame rejected: exposure metadata unavailable";
+        }
+        String[] positiveFields = {
+                "sensorExposureTimeNs",
+                "sensorSensitivityIso",
+                "sensorFrameDurationNs",
+                "sensorTimestampNs",
+                "lensAperture",
+                "lensFocalLengthMm",
+                "sensorPhysicalWidthMm",
+                "sensorPhysicalHeightMm",
+                "imageFocalLengthXPixels",
+                "imageFocalLengthYPixels",
+                "imagePrincipalPointXPixels",
+                "imagePrincipalPointYPixels",
+                "imageIntrinsicsWidth",
+                "imageIntrinsicsHeight"
+        };
+        for (String field : positiveFields) {
+            if (json.isNull(field) || json.optDouble(field, 0.0) <= 0.0) {
+                return "draft frame rejected: missing " + field;
+            }
+        }
+        String[] requiredStateFields = {
+                "aeState",
+                "awbState",
+                "aeExposureCompensation",
+                "aeMode",
+                "awbMode"
+        };
+        for (String field : requiredStateFields) {
+            if (json.isNull(field)) {
+                return "draft frame rejected: missing " + field;
+            }
+        }
+        return null;
     }
 
     /*

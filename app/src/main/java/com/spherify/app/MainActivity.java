@@ -1313,32 +1313,24 @@ public class MainActivity extends Activity {
                 .show();
         activeLibraryDialog
                 .getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(v -> chooseStitchMovementSensitivity(item));
+                .setOnClickListener(v -> preflightDraftSession(item));
     }
 
-    /*
-     * Function: chooseStitchMovementSensitivity
-     * Arguments: item is the selected draft-session LibraryItem.
-     * Calls: AlertDialog.Builder and stitchDraftSession().
-     * Flow: let the user decide how aggressively moving/ambiguous overlap
-     * features should be rejected during Phase 5 correlation.
-     */
-    private void chooseStitchMovementSensitivity(LibraryItem item) {
-        String[] labels = {"Normal", "High movement", "Low movement"};
-        String[] modes = {"normal", "high", "low"};
-        new AlertDialog.Builder(this)
-                .setTitle("Movement sensitivity")
-                .setItems(labels, (dialog, which) -> chooseStitchRenderMode(item, modes[which]))
-                .show();
-    }
-
-    private void chooseStitchRenderMode(LibraryItem item, String movementSensitivity) {
-        String[] labels = {"Sharp geometry", "Contributor map", "Blended master"};
-        String[] modes = {"strongest", "contributors", "blended"};
-        new AlertDialog.Builder(this)
-                .setTitle("Stitch output")
-                .setItems(labels, (dialog, which) -> stitchDraftSession(item, movementSensitivity, modes[which]))
-                .show();
+    private void preflightDraftSession(LibraryItem item) {
+        try {
+            SpherifyLibrary.DraftQualityReport report = library.assessDraftStitchQuality(item);
+            if (!report.pass) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Capture quality gate")
+                        .setMessage(report.summary())
+                        .setPositiveButton("OK", null)
+                        .show();
+                return;
+            }
+            stitchDraftSession(item, "normal", "strongest");
+        } catch (IOException e) {
+            showSpherifyFailure(e.getMessage());
+        }
     }
 
     /*
@@ -1370,7 +1362,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (isFinishing()) return;
                     dismissSpherifyingDialog();
-                    Toast.makeText(MainActivity.this, "Spherify failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    showSpherifyFailure(e.getMessage());
                 });
             }
         }).start();
@@ -1394,11 +1386,11 @@ public class MainActivity extends Activity {
         message.setText("Preparing " + item.title
                 + "\n\n1. Reading pending capture frames"
                 + "\n2. Estimating lens FOV and radial compensation"
-                + "\n3. Rejecting moving or ambiguous overlap features"
-                + "\n4. Nudging stable frame poses"
-                + "\n5. Projecting the equirectangular master"
-                + "\n\nMovement sensitivity: " + movementSensitivity
-                + "\nOutput: " + renderMode
+                + "\n3. Matching OpenCV control points across the pose graph"
+                + "\n4. Optimising frame yaw, pitch, and roll"
+                + "\n5. Projecting a sharp source-selected master"
+                + "\n\nCapture quality gate: strict"
+                + "\nOutput: sharp source-selected master"
                 + "\n\nKeep Spherify open while this finishes.");
         activeStitchDialog = new AlertDialog.Builder(this)
                 .setTitle("Spherifying...")
@@ -1415,6 +1407,16 @@ public class MainActivity extends Activity {
             activeStitchDialog.dismiss();
             activeStitchDialog = null;
         }
+    }
+
+    private void showSpherifyFailure(String message) {
+        new AlertDialog.Builder(this)
+                .setTitle("Spherify needs a better capture")
+                .setMessage(message == null || message.isEmpty()
+                        ? "The capture could not pass the stitch quality gate."
+                        : message)
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     /*
