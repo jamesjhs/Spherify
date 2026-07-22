@@ -1384,13 +1384,18 @@ public class MainActivity extends Activity {
         message.setLineSpacing(4, 1.0f);
         message.setPadding(34, 20, 34, 8);
         message.setText("Preparing " + item.title
-                + "\n\n1. Reading pending capture frames"
-                + "\n2. Estimating lens FOV and radial compensation"
-                + "\n3. Matching OpenCV control points across the pose graph"
-                + "\n4. Optimising frame yaw, pitch, and roll"
-                + "\n5. Projecting a sharp source-selected master"
+                + "\n\n1. Reading and validating capture frames"
+                + "\n2. Estimating lens FOV and radial model"
+                + "\n3. Matching OpenCV ORB/RANSAC control points"
+                + "\n4. Iterative pose-graph relaxation"
+                + "\n5. Reprojection bundle adjustment (Phase 5D)"
+                + "\n6. Building parallax risk grid (Phase 5E)"
+                + "\n7. Estimating per-channel white balance (Phase 5G)"
+                + "\n8. Projecting sharp source-selected master (Phase 5F)"
+                + "\n9. Gaussian seam blend (Phase 5H/5I)"
+                + "\n10. Writing photosphere XMP metadata (Phase 5I)"
                 + "\n\nCapture quality gate: strict"
-                + "\nOutput: sharp source-selected master"
+                + "\nOutput: sharp source-selected master with seam blend"
                 + "\n\nKeep Spherify open while this finishes.");
         activeStitchDialog = new AlertDialog.Builder(this)
                 .setTitle("Spherifying...")
@@ -1461,6 +1466,17 @@ public class MainActivity extends Activity {
                 .append("\nFrames used: ").append(result.stitch.renderedFrames)
                 .append("\nEstimated coverage: ").append(result.stitch.coveragePercent).append("%")
                 .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames);
+        // Phase 5I: show stitch readiness verdict.
+        if (result.stitch.readiness != null) {
+            String level = result.stitch.readiness.overallLevel;
+            String label = Phase5Stitcher.StitchReadiness.PASS.equals(level) ? "✓ Pass"
+                    : Phase5Stitcher.StitchReadiness.FAIL.equals(level) ? "✗ Fail"
+                    : "⚠ Warn";
+            message.append("\nReadiness: ").append(label)
+                    .append(" (geometry: ").append(result.stitch.readiness.geometryLevel)
+                    .append(", coverage: ").append(result.stitch.readiness.coverageLevel)
+                    .append(")");
+        }
         if (!result.stitch.warnings.isEmpty()) {
             message.append("\n\nWarnings:");
             for (String warning : result.stitch.warnings) {

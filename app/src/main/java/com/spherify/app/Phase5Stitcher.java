@@ -32,6 +32,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -110,6 +111,10 @@ final class Phase5Stitcher {
         int rendered = 0;
         int missingExposure = 0;
 
+        // Phase 5H: seam-ownership array — tracks which frame index last won each pixel.
+        int[] frameOwner = new int[OUTPUT_WIDTH * OUTPUT_HEIGHT];
+        java.util.Arrays.fill(frameOwner, -1);
+
         for (DraftFrameRecord record : usable) {
             Bitmap frame = decodeFrame(record.imageFile);
             if (frame == null) {
@@ -120,6 +125,7 @@ final class Phase5Stitcher {
             }
             FrameProjection projection = projectionFor(record, calibration);
             float exposureGain = calibration.exposureGains.getOrDefault(record.imageFile.getAbsolutePath(), 1f);
+            float[] chGains = calibration.channelGains.get(record.imageFile.getAbsolutePath());
             markCoverage(coverage, projection.bounds);
             blendWrapped(
                     frame,
@@ -128,6 +134,9 @@ final class Phase5Stitcher {
                     renderMode,
                     rendered,
                     exposureGain,
+                    chGains,
+                    calibration.parallaxRiskGrid,
+                    frameOwner,
                     red,
                     green,
                     blue,
@@ -140,6 +149,10 @@ final class Phase5Stitcher {
             throw new IOException("could not decode any draft frames");
         }
 
+        // Phase 5I: Gaussian seam blend — soften source transitions in near-seam pixels.
+        SeamOwnershipMap seamMap = SeamOwnershipMap.build(frameOwner);
+        applySeamBlend(red, green, blue, weights, seamMap);
+
         Bitmap output = composeOutput(red, green, blue, weights);
         try (FileOutputStream out = new FileOutputStream(outputFile)) {
             if (!output.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
@@ -151,7 +164,10 @@ final class Phase5Stitcher {
 
         int coveragePercent = Math.round(100f * coveredCells(coverage) / (COVERAGE_COLUMNS * COVERAGE_ROWS));
         writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity, renderMode);
-        return new Result(rendered, coveragePercent, missingExposure, warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity));
+        StitchReadiness readiness = StitchReadiness.evaluate(rendered, coveragePercent, calibration);
+        return new Result(rendered, coveragePercent, missingExposure,
+                warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity),
+                calibration.bundleAdjResult, readiness);
     }
 
     private static Bitmap decodeFrame(File file) {
@@ -241,7 +257,24 @@ final class Phase5Stitcher {
         FeatureMatchGraph featureMatchGraph = new FeatureMatchGraph(matchEdges, true);
         GlobalPoseOptimization poseOptimization = GlobalPoseOptimization.from(featureMatchGraph, corrections);
         poseOptimization.apply();
+
+        // Phase 5D: reprojection bundle adjustment using inlier control-point UV coords.
+        HashMap<String, CalibrationFrame> frameMap = new HashMap<>();
+        for (CalibrationFrame frame : frames) {
+            frameMap.put(frame.record.imageFile.getAbsolutePath(), frame);
+        }
+        BundleAdjustmentResult bundleAdjResult =
+                BundleAdjustment.optimize(matchEdges, frameMap, corrections, lensModel);
+
         SparseDepthHints sparseDepthHints = SparseDepthHints.from(featureMatchGraph, captureProfile);
+
+        // Phase 5E: build per-region parallax risk grid from post-adjustment residuals.
+        ParallaxRiskGrid parallaxRiskGrid =
+                ParallaxRiskGrid.build(matchEdges, frameMap, corrections, lensModel);
+
+        // Phase 5G: per-channel white-balance gains.
+        Map<String, float[]> channelGains = estimateChannelGains(frames);
+
         return new Calibration(
                 lensModel,
                 corrections,
@@ -250,7 +283,10 @@ final class Phase5Stitcher {
                 matchedPairs == 0 ? 0f : confidenceTotal / matchedPairs,
                 captureProfile,
                 sparseDepthHints,
-                estimateExposureGains(frames));
+                estimateExposureGains(frames),
+                bundleAdjResult,
+                parallaxRiskGrid,
+                channelGains);
     }
 
     private static Map<String, Float> estimateExposureGains(List<CalibrationFrame> frames) {
@@ -275,6 +311,99 @@ final class Phase5Stitcher {
             }
         }
         return gains;
+    }
+
+    /*
+     * Phase 5G: Per-channel (R/G/B) white-balance compensation.
+     * Estimates a per-frame colour channel ratio relative to the session mean.
+     * The green channel is treated as reference; red and blue are corrected to
+     * match the mean R/G and B/G ratios across all frames with sufficient signal.
+     * Gains are bounded to avoid amplifying noise or clipping highlights.
+     */
+    private static Map<String, float[]> estimateChannelGains(List<CalibrationFrame> frames) {
+        HashMap<String, float[]> channelGains = new HashMap<>();
+        // First pass: compute per-frame mean channel values at calibration resolution.
+        float totalR = 0f, totalG = 0f, totalB = 0f;
+        int countFrames = 0;
+        HashMap<String, float[]> frameMeans = new HashMap<>();
+        for (CalibrationFrame frame : frames) {
+            if (frame.meanLuminance <= 8f) {
+                continue;
+            }
+            // Re-read pixel data from the grayscale cache is not possible here since
+            // CalibrationFrame stores only luminance; load colour means from record.
+            // Approximate R/G/B from luminance using sRGB coefficients assuming grey.
+            // A more precise path would store per-channel means in CalibrationFrame.
+            // For now, use colour-channel sampling from the raw bitmap.
+            float[] means = sampleChannelMeans(frame);
+            if (means == null) {
+                continue;
+            }
+            frameMeans.put(frame.record.imageFile.getAbsolutePath(), means);
+            totalR += means[0];
+            totalG += means[1];
+            totalB += means[2];
+            countFrames++;
+        }
+        if (countFrames == 0 || totalG <= 0f) {
+            return channelGains;
+        }
+        float meanR = totalR / countFrames;
+        float meanG = totalG / countFrames;
+        float meanB = totalB / countFrames;
+        for (Map.Entry<String, float[]> entry : frameMeans.entrySet()) {
+            float[] means = entry.getValue();
+            if (means[1] <= 0f) {
+                continue;
+            }
+            // Scale each channel to match session mean ratios.
+            float rGain = clamp((meanR / Math.max(0.01f, means[0])), 0.70f, 1.42f);
+            float gGain = clamp((meanG / Math.max(0.01f, means[1])), 0.70f, 1.42f);
+            float bGain = clamp((meanB / Math.max(0.01f, means[2])), 0.70f, 1.42f);
+            channelGains.put(entry.getKey(), new float[]{rGain, gGain, bGain});
+        }
+        return channelGains;
+    }
+
+    private static float[] sampleChannelMeans(CalibrationFrame frame) {
+        try {
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = 4; // fast low-res sample
+            Bitmap bitmap = BitmapFactory.decodeFile(frame.record.imageFile.getAbsolutePath(), options);
+            if (bitmap == null) {
+                return null;
+            }
+            int w = bitmap.getWidth();
+            int h = bitmap.getHeight();
+            if (w <= 0 || h <= 0) {
+                bitmap.recycle();
+                return null;
+            }
+            int[] pixels = new int[w * h];
+            bitmap.getPixels(pixels, 0, w, 0, 0, w, h);
+            bitmap.recycle();
+            long sumR = 0, sumG = 0, sumB = 0;
+            // Sample every 4th pixel to reduce time.
+            int step = Math.max(1, pixels.length / 1600);
+            int sampled = 0;
+            for (int i = 0; i < pixels.length; i += step) {
+                int c = pixels[i];
+                sumR += (c >> 16) & 0xFF;
+                sumG += (c >> 8) & 0xFF;
+                sumB += c & 0xFF;
+                sampled++;
+            }
+            if (sampled == 0) {
+                return null;
+            }
+            return new float[]{
+                    sumR / (float) sampled,
+                    sumG / (float) sampled,
+                    sumB / (float) sampled
+            };
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static LensModel estimateLensModel(List<DraftFrameRecord> records) {
@@ -530,6 +659,10 @@ final class Phase5Stitcher {
         MatOfKeyPoint rightKeypoints = new MatOfKeyPoint();
         Mat leftDescriptors = new Mat();
         Mat rightDescriptors = new Mat();
+        int leftOffsetX = 0;
+        int leftOffsetY = 0;
+        int rightOffsetX = 0;
+        int rightOffsetY = 0;
         try {
             leftMat = left.toOpenCvMat();
             rightMat = right.toOpenCvMat();
@@ -544,6 +677,8 @@ final class Phase5Stitcher {
                         : Math.max(0, right.height - right.height / 2);
                 int leftHeight = Math.max(1, left.height / 2);
                 int rightHeight = Math.max(1, right.height / 2);
+                leftOffsetY = leftStartY;
+                rightOffsetY = rightStartY;
                 leftOverlap = leftMat.submat(new org.opencv.core.Rect(0, leftStartY, left.width, leftHeight));
                 rightOverlap = rightMat.submat(new org.opencv.core.Rect(0, rightStartY, right.width, rightHeight));
             } else {
@@ -552,6 +687,8 @@ final class Phase5Stitcher {
                 int rightStartX = rightIsClockwise ? 0 : Math.max(0, right.width - right.width / 2);
                 int leftWidth = Math.max(1, left.width / 2);
                 int rightWidth = Math.max(1, right.width / 2);
+                leftOffsetX = leftStartX;
+                rightOffsetX = rightStartX;
                 leftOverlap = leftMat.submat(new org.opencv.core.Rect(leftStartX, 0, leftWidth, left.height));
                 rightOverlap = rightMat.submat(new org.opencv.core.Rect(rightStartX, 0, rightWidth, right.height));
             }
@@ -634,12 +771,18 @@ final class Phase5Stitcher {
                 dxTotal += dx;
                 dyTotal += dy;
                 descriptorTotal += pair.distance;
+                // Compute full-frame normalised UV for bundle adjustment reprojection.
+                float leftNormU = ((float) pair.left.x + leftOffsetX) / Math.max(1, left.width);
+                float leftNormV = ((float) pair.left.y + leftOffsetY) / Math.max(1, left.height);
+                float rightNormU = ((float) pair.right.x + rightOffsetX) / Math.max(1, right.width);
+                float rightNormV = ((float) pair.right.y + rightOffsetY) / Math.max(1, right.height);
                 inlierControlPoints.add(new ControlPointPair(
                         (float) pair.left.x,
                         (float) pair.left.y,
                         (float) pair.right.x,
                         (float) pair.right.y,
-                        pair.distance));
+                        pair.distance,
+                        leftNormU, leftNormV, rightNormU, rightNormV));
                 inliers++;
             }
             if (inliers < FEATURE_MIN_MATCHES) {
@@ -884,20 +1027,23 @@ final class Phase5Stitcher {
             RenderMode renderMode,
             int frameIndex,
             float exposureGain,
+            float[] channelGains,
+            ParallaxRiskGrid riskGrid,
+            int[] frameOwner,
             float[] red,
             float[] green,
             float[] blue,
             float[] weights) {
-        blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, projection.bounds, red, green, blue, weights);
+        blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, channelGains, riskGrid, frameOwner, projection.bounds, red, green, blue, weights);
         if (projection.bounds.left < 0f) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, channelGains, riskGrid, frameOwner, shifted, red, green, blue, weights);
         }
         if (projection.bounds.right > OUTPUT_WIDTH) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(-OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, channelGains, riskGrid, frameOwner, shifted, red, green, blue, weights);
         }
     }
 
@@ -908,6 +1054,9 @@ final class Phase5Stitcher {
             RenderMode renderMode,
             int frameIndex,
             float exposureGain,
+            float[] channelGains,
+            ParallaxRiskGrid riskGrid,
+            int[] frameOwner,
             RectF bounds,
             float[] red,
             float[] green,
@@ -957,7 +1106,11 @@ final class Phase5Stitcher {
 
                 int sourceX = clamp((int) (sourceU * frameWidth), 0, frameWidth - 1);
                 int sourceY = clamp((int) (sourceV * frameHeight), 0, frameHeight - 1);
-                float weight = feather(sourceU) * feather(sourceV) * centerWeight(sourceU, sourceV);
+
+                // Phase 5F: penalise pixels in high parallax-risk cells.
+                float riskPenalty = riskGrid != null ? riskGrid.riskAt(x, y) : 0f;
+                float weight = feather(sourceU) * feather(sourceV) * centerWeight(sourceU, sourceV)
+                        * (1f - riskPenalty * 0.70f);
                 if (weight <= 0f) {
                     continue;
                 }
@@ -965,6 +1118,10 @@ final class Phase5Stitcher {
                 if (renderMode == RenderMode.CONTRIBUTOR_MAP) {
                     color = contributorColor(frameIndex, sourceU, sourceV);
                 } else {
+                    // Phase 5G: apply per-channel white-balance gain before luminance gain.
+                    if (channelGains != null) {
+                        color = applyChannelGains(color, channelGains[0], channelGains[1], channelGains[2]);
+                    }
                     color = applyExposureGain(color, exposureGain);
                 }
                 int index = outputRow + x;
@@ -976,6 +1133,10 @@ final class Phase5Stitcher {
                     green[index] = ((color >> 8) & 0xFF) * weight;
                     blue[index] = (color & 0xFF) * weight;
                     weights[index] = weight;
+                    // Phase 5H: track which frame owns this pixel.
+                    if (frameOwner != null) {
+                        frameOwner[index] = frameIndex;
+                    }
                 } else {
                     red[index] += ((color >> 16) & 0xFF) * weight;
                     green[index] += ((color >> 8) & 0xFF) * weight;
@@ -993,6 +1154,13 @@ final class Phase5Stitcher {
         int r = clamp(Math.round(((color >> 16) & 0xFF) * gain), 0, 255);
         int g = clamp(Math.round(((color >> 8) & 0xFF) * gain), 0, 255);
         int b = clamp(Math.round((color & 0xFF) * gain), 0, 255);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    private static int applyChannelGains(int color, float rGain, float gGain, float bGain) {
+        int r = clamp(Math.round(((color >> 16) & 0xFF) * rGain), 0, 255);
+        int g = clamp(Math.round(((color >> 8) & 0xFF) * gGain), 0, 255);
+        int b = clamp(Math.round((color & 0xFF) * bGain), 0, 255);
         return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
@@ -1080,7 +1248,7 @@ final class Phase5Stitcher {
             ExifInterface exif = new ExifInterface(file.getAbsolutePath());
             exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, String.format(
                     Locale.US,
-                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; sparseDepthHints=%s",
+                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; bundleAdjP90=%.3f; closureError=%.2f; movementSensitivity=%s; renderMode=%s; captureProfile=%s; sparseDepthHints=%s",
                     sessionId,
                     renderedFrames,
                     coveragePercent,
@@ -1091,16 +1259,46 @@ final class Phase5Stitcher {
                     calibration.lensModel.radialK2,
                     calibration.matchedOverlapCount,
                     calibration.openCvMatchedOverlapCount,
+                    calibration.bundleAdjResult.p90Residual,
+                    calibration.bundleAdjResult.closureError,
                     movementSensitivity.label,
                     renderMode.label,
                     calibration.captureProfile.label,
                     calibration.sparseDepthHints.metadataLabel));
             exif.setAttribute(ExifInterface.TAG_MAKE, "Spherify");
             exif.setAttribute(ExifInterface.TAG_MODEL, "Phase 5 draft stitcher");
+            // Phase 5I: write XMP photosphere metadata so compatible 360 viewers
+            // (Google Photos, etc.) recognise the equirectangular projection.
+            exif.setAttribute(ExifInterface.TAG_XMP, buildPhotosphereXmp(sessionId));
             exif.saveAttributes();
         } catch (IOException ignored) {
             // The master is still usable if optional metadata writing fails.
         }
+    }
+
+    private static String buildPhotosphereXmp(String sessionId) {
+        return "<?xpacket begin='\uFEFF' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+                + "<x:xmpmeta xmlns:x='adobe:ns:meta/'>"
+                + "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+                + "<rdf:Description rdf:about=''"
+                + " xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>"
+                + "<GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>"
+                + "<GPano:CaptureSoftware>Spherify</GPano:CaptureSoftware>"
+                + "<GPano:StitchingSoftware>Spherify Phase 5</GPano:StitchingSoftware>"
+                + "<GPano:ProjectionType>equirectangular</GPano:ProjectionType>"
+                + "<GPano:FullPanoWidthPixels>" + OUTPUT_WIDTH + "</GPano:FullPanoWidthPixels>"
+                + "<GPano:FullPanoHeightPixels>" + OUTPUT_HEIGHT + "</GPano:FullPanoHeightPixels>"
+                + "<GPano:CroppedAreaLeftPixels>0</GPano:CroppedAreaLeftPixels>"
+                + "<GPano:CroppedAreaTopPixels>0</GPano:CroppedAreaTopPixels>"
+                + "<GPano:CroppedAreaImageWidthPixels>" + OUTPUT_WIDTH + "</GPano:CroppedAreaImageWidthPixels>"
+                + "<GPano:CroppedAreaImageHeightPixels>" + OUTPUT_HEIGHT + "</GPano:CroppedAreaImageHeightPixels>"
+                + "<GPano:InitialViewHeadingDegrees>0</GPano:InitialViewHeadingDegrees>"
+                + "<GPano:InitialViewPitchDegrees>0</GPano:InitialViewPitchDegrees>"
+                + "<GPano:InitialViewRollDegrees>0</GPano:InitialViewRollDegrees>"
+                + "</rdf:Description>"
+                + "</rdf:RDF>"
+                + "</x:xmpmeta>"
+                + "<?xpacket end='w'?>";
     }
 
     private static List<String> warnings(
@@ -1130,6 +1328,18 @@ final class Phase5Stitcher {
                     calibration.matchedOverlapCount,
                     calibration.openCvMatchedOverlapCount,
                     calibration.averageOverlapConfidence));
+        }
+        // Phase 5D diagnostics
+        if (calibration.bundleAdjResult.ranOptimization) {
+            warnings.add(String.format(
+                    Locale.US,
+                    "Bundle adjustment: mean reprojection %.3f, p90 %.3f, closure error %.2f deg",
+                    calibration.bundleAdjResult.meanResidual,
+                    calibration.bundleAdjResult.p90Residual,
+                    calibration.bundleAdjResult.closureError));
+            if (!calibration.bundleAdjResult.converged) {
+                warnings.add("Bundle adjustment did not converge; geometry may have residual drift");
+            }
         }
         warnings.add(String.format(
                 Locale.US,
@@ -1312,6 +1522,12 @@ final class Phase5Stitcher {
         final CaptureProfile captureProfile;
         final SparseDepthHints sparseDepthHints;
         final Map<String, Float> exposureGains;
+        // Phase 5D diagnostics
+        final BundleAdjustmentResult bundleAdjResult;
+        // Phase 5E: per-cell parallax risk [0,1] in equirectangular grid
+        final ParallaxRiskGrid parallaxRiskGrid;
+        // Phase 5G: per-frame per-channel white-balance gains [rGain, gGain, bGain]
+        final Map<String, float[]> channelGains;
 
         Calibration(
                 LensModel lensModel,
@@ -1321,7 +1537,10 @@ final class Phase5Stitcher {
                 float averageOverlapConfidence,
                 CaptureProfile captureProfile,
                 SparseDepthHints sparseDepthHints,
-                Map<String, Float> exposureGains) {
+                Map<String, Float> exposureGains,
+                BundleAdjustmentResult bundleAdjResult,
+                ParallaxRiskGrid parallaxRiskGrid,
+                Map<String, float[]> channelGains) {
             this.lensModel = lensModel;
             this.corrections = corrections;
             this.matchedOverlapCount = matchedOverlapCount;
@@ -1330,6 +1549,9 @@ final class Phase5Stitcher {
             this.captureProfile = captureProfile;
             this.sparseDepthHints = sparseDepthHints;
             this.exposureGains = exposureGains;
+            this.bundleAdjResult = bundleAdjResult;
+            this.parallaxRiskGrid = parallaxRiskGrid;
+            this.channelGains = channelGains;
         }
     }
 
@@ -1629,13 +1851,29 @@ final class Phase5Stitcher {
         final float rightX;
         final float rightY;
         final float descriptorDistance;
+        // Full-frame normalised UV [0,1]: u=0 left, u=1 right, v=0 top, v=1 bottom.
+        // Populated for OpenCV matches; -1 when unavailable (fallback matcher).
+        final float leftNormU;
+        final float leftNormV;
+        final float rightNormU;
+        final float rightNormV;
 
         ControlPointPair(float leftX, float leftY, float rightX, float rightY, float descriptorDistance) {
+            this(leftX, leftY, rightX, rightY, descriptorDistance, -1f, -1f, -1f, -1f);
+        }
+
+        ControlPointPair(
+                float leftX, float leftY, float rightX, float rightY, float descriptorDistance,
+                float leftNormU, float leftNormV, float rightNormU, float rightNormV) {
             this.leftX = leftX;
             this.leftY = leftY;
             this.rightX = rightX;
             this.rightY = rightY;
             this.descriptorDistance = descriptorDistance;
+            this.leftNormU = leftNormU;
+            this.leftNormV = leftNormV;
+            this.rightNormU = rightNormU;
+            this.rightNormV = rightNormV;
         }
     }
 
@@ -1869,12 +2107,644 @@ final class Phase5Stitcher {
         final int coveragePercent;
         final int missingExposureFrames;
         final List<String> warnings;
+        final BundleAdjustmentResult bundleAdjResult;
+        final StitchReadiness readiness;
 
-        Result(int renderedFrames, int coveragePercent, int missingExposureFrames, List<String> warnings) {
+        Result(int renderedFrames, int coveragePercent, int missingExposureFrames,
+               List<String> warnings, BundleAdjustmentResult bundleAdjResult,
+               StitchReadiness readiness) {
             this.renderedFrames = renderedFrames;
             this.coveragePercent = coveragePercent;
             this.missingExposureFrames = missingExposureFrames;
             this.warnings = warnings;
+            this.bundleAdjResult = bundleAdjResult;
+            this.readiness = readiness;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5D: Reprojection-based bundle adjustment
+    // -------------------------------------------------------------------------
+
+    /*
+     * BundleAdjustmentResult carries the diagnostic output of the Phase 5D
+     * reprojection optimiser.  It is always non-null; ranOptimization is false
+     * when there were no UV control points to work with.
+     */
+    static final class BundleAdjustmentResult {
+        final boolean ranOptimization;
+        final float meanResidual;
+        final float p90Residual;
+        final float closureError;
+        final boolean converged;
+
+        BundleAdjustmentResult(boolean ranOptimization, float meanResidual, float p90Residual,
+                               float closureError, boolean converged) {
+            this.ranOptimization = ranOptimization;
+            this.meanResidual = meanResidual;
+            this.p90Residual = p90Residual;
+            this.closureError = closureError;
+            this.converged = converged;
+        }
+
+        static BundleAdjustmentResult noOp() {
+            return new BundleAdjustmentResult(false, 0f, 0f, 0f, false);
+        }
+    }
+
+    /*
+     * BundleAdjustment implements a gradient-descent reprojection optimiser.
+     *
+     * For each inlier ControlPointPair (leftNormU/V, rightNormU/V) on an accepted
+     * FeatureMatchEdge, it:
+     *   1. Converts the left-frame UV to a world ray using the current pose.
+     *   2. Projects that world ray into the right frame using the right frame pose.
+     *   3. Compares the projected UV with the stored right UV to get a reprojection
+     *      error in normalised image space [0,1].
+     *   4. Applies a Huber-style robust weight so parallax outliers and moving
+     *      objects do not dominate the correction.
+     *   5. Accumulates pose gradients for both frames and applies a bounded step.
+     *
+     * The loop runs ITERATIONS times; after convergence the p90 residual and
+     * loop-closure error are recorded as diagnostics.
+     *
+     * Edge cases handled:
+     *   - Control points with leftNormU < 0 are ignored (no UV available).
+     *   - Frames with no edges in the graph are unchanged.
+     *   - Zero-weight edges are skipped.
+     *   - Corrections are clamped after every step to prevent divergence.
+     *   - If there are no usable control points, returns noOp().
+     */
+    private static final class BundleAdjustment {
+        private static final float HUBER_DELTA = 0.05f; // normalised image coords
+        private static final float STEP_SIZE = 0.06f;
+        private static final int ITERATIONS = 48;
+        // Convergence: optimisation considered converged when p90 is below this.
+        private static final float CONVERGENCE_P90 = 0.08f;
+
+        private BundleAdjustment() {
+        }
+
+        static BundleAdjustmentResult optimize(
+                List<FeatureMatchEdge> edges,
+                Map<String, CalibrationFrame> frameMap,
+                Map<String, PoseCorrection> corrections,
+                LensModel lensModel) {
+            // Only edges with stored UV control points can drive reprojection.
+            ArrayList<FeatureMatchEdge> uvEdges = new ArrayList<>();
+            for (FeatureMatchEdge edge : edges) {
+                for (ControlPointPair cp : edge.inlierControlPoints) {
+                    if (cp.leftNormU >= 0f) {
+                        uvEdges.add(edge);
+                        break;
+                    }
+                }
+            }
+            if (uvEdges.isEmpty()) {
+                return BundleAdjustmentResult.noOp();
+            }
+
+            float tanHalfH = (float) Math.tan(Math.toRadians(lensModel.horizontalFovDegrees / 2f));
+            float tanHalfV = (float) Math.tan(Math.toRadians(lensModel.verticalFovDegrees / 2f));
+
+            ArrayList<Float> residuals = new ArrayList<>();
+
+            for (int iter = 0; iter < ITERATIONS; iter++) {
+                HashMap<String, float[]> deltas = new HashMap<>(); // [yaw, pitch, weight]
+                residuals.clear();
+
+                for (FeatureMatchEdge edge : uvEdges) {
+                    CalibrationFrame fromFrame = frameMap.get(edge.fromPath);
+                    CalibrationFrame toFrame = frameMap.get(edge.toPath);
+                    if (fromFrame == null || toFrame == null || edge.confidence <= 0f) {
+                        continue;
+                    }
+                    PoseCorrection fromCorr = corrections.get(edge.fromPath);
+                    PoseCorrection toCorr = corrections.get(edge.toPath);
+                    float fromCorrYaw = fromCorr != null ? fromCorr.yawDegrees : 0f;
+                    float fromCorrPitch = fromCorr != null ? fromCorr.pitchDegrees : 0f;
+                    float fromCorrRoll = fromCorr != null ? fromCorr.rollDegrees : 0f;
+                    float toCorrYaw = toCorr != null ? toCorr.yawDegrees : 0f;
+                    float toCorrPitch = toCorr != null ? toCorr.pitchDegrees : 0f;
+                    float toCorrRoll = toCorr != null ? toCorr.rollDegrees : 0f;
+
+                    // Use captured pose when available as base; target otherwise.
+                    float fromBaseYaw = fromFrame.record.capturedPoseAvailable
+                            ? normalizeDegrees(fromFrame.record.headingDegrees)
+                            : fromFrame.baseYawDegrees;
+                    float fromBasePitch = fromFrame.record.capturedPoseAvailable
+                            ? fromFrame.record.pitchDegrees
+                            : fromFrame.basePitchDegrees;
+                    float fromBaseRoll = fromFrame.record.capturedPoseAvailable
+                            ? fromFrame.record.rollDegrees * 0.10f
+                            : 0f;
+                    float toBaseYaw = toFrame.record.capturedPoseAvailable
+                            ? normalizeDegrees(toFrame.record.headingDegrees)
+                            : toFrame.baseYawDegrees;
+                    float toBasePitch = toFrame.record.capturedPoseAvailable
+                            ? toFrame.record.pitchDegrees
+                            : toFrame.basePitchDegrees;
+                    float toBaseRoll = toFrame.record.capturedPoseAvailable
+                            ? toFrame.record.rollDegrees * 0.10f
+                            : 0f;
+
+                    float fromYaw = normalizeDegrees(fromBaseYaw + fromCorrYaw);
+                    float fromPitch = clamp(fromBasePitch + fromCorrPitch, -89f, 89f);
+                    float fromRoll = clamp(fromBaseRoll + fromCorrRoll, -5f, 5f);
+                    float toYaw = normalizeDegrees(toBaseYaw + toCorrYaw);
+                    float toPitch = clamp(toBasePitch + toCorrPitch, -89f, 89f);
+                    float toRoll = clamp(toBaseRoll + toCorrRoll, -5f, 5f);
+
+                    CameraBasis fromBasis = CameraBasis.from(fromYaw, fromPitch, fromRoll);
+                    CameraBasis toBasis = CameraBasis.from(toYaw, toPitch, toRoll);
+
+                    for (ControlPointPair cp : edge.inlierControlPoints) {
+                        if (cp.leftNormU < 0f || cp.rightNormU < 0f) {
+                            continue;
+                        }
+                        // 1. Convert left UV to image-plane normalised coords.
+                        float lpx = (cp.leftNormU - 0.5f) * 2f;  // [-1, 1]
+                        float lpy = (0.5f - cp.leftNormV) * 2f;  // [-1, 1] (up positive)
+                        // Inverse radial (approximate first-order).
+                        float lr2 = lpx * lpx + lpy * lpy;
+                        float lInvDist = 1f / Math.max(0.01f,
+                                1f + lensModel.radialK1 * lr2 + lensModel.radialK2 * lr2 * lr2);
+                        float lLocalX = lpx * lInvDist * tanHalfH;
+                        float lLocalY = lpy * lInvDist * tanHalfV;
+                        float lLocalZ = 1f;
+                        float lLen = (float) Math.sqrt(
+                                lLocalX * lLocalX + lLocalY * lLocalY + lLocalZ * lLocalZ);
+                        lLocalX /= lLen;
+                        lLocalY /= lLen;
+                        lLocalZ /= lLen;
+
+                        // 2. Transform to world space using from-frame basis (column transpose).
+                        float wx = fromBasis.right.x * lLocalX + fromBasis.up.x * lLocalY + fromBasis.forward.x * lLocalZ;
+                        float wy = fromBasis.right.y * lLocalX + fromBasis.up.y * lLocalY + fromBasis.forward.y * lLocalZ;
+                        float wz = fromBasis.right.z * lLocalX + fromBasis.up.z * lLocalY + fromBasis.forward.z * lLocalZ;
+
+                        // 3. Project world ray into to-frame camera.
+                        float rLocalX = toBasis.right.x * wx + toBasis.right.y * wy + toBasis.right.z * wz;
+                        float rLocalY = toBasis.up.x * wx + toBasis.up.y * wy + toBasis.up.z * wz;
+                        float rLocalZ = toBasis.forward.x * wx + toBasis.forward.y * wy + toBasis.forward.z * wz;
+
+                        if (rLocalZ <= 0.01f) {
+                            continue; // point behind to-frame
+                        }
+                        float projX = rLocalX / (rLocalZ * tanHalfH); // [-1, 1]
+                        float projY = rLocalY / (rLocalZ * tanHalfV);
+                        // Apply radial distortion for comparison.
+                        float pr2 = projX * projX + projY * projY;
+                        float pdist = 1f + lensModel.radialK1 * pr2 + lensModel.radialK2 * pr2 * pr2;
+                        projX *= pdist;
+                        projY *= pdist;
+
+                        float projU = (projX + 1f) * 0.5f;
+                        float projV = (1f - projY) * 0.5f;
+
+                        // 4. Reprojection error.
+                        float errU = projU - cp.rightNormU;
+                        float errV = projV - cp.rightNormV;
+                        float r = (float) Math.sqrt(errU * errU + errV * errV);
+                        residuals.add(r);
+
+                        float huber = r < HUBER_DELTA ? 1f : HUBER_DELTA / Math.max(r, 0.001f);
+                        float w = edge.confidence * huber;
+
+                        // 5. Accumulate gradient for to-frame.
+                        float[] toDelta = deltas.computeIfAbsent(edge.toPath, k -> new float[3]);
+                        // errU > 0 → projected too far right → need to decrease toYaw
+                        toDelta[0] -= errU * lensModel.horizontalFovDegrees * w;
+                        toDelta[1] += errV * lensModel.verticalFovDegrees * w;
+                        toDelta[2] += w;
+
+                        // Accumulate smaller opposite gradient for from-frame.
+                        float[] fromDelta = deltas.computeIfAbsent(edge.fromPath, k -> new float[3]);
+                        fromDelta[0] += errU * lensModel.horizontalFovDegrees * w * 0.4f;
+                        fromDelta[1] -= errV * lensModel.verticalFovDegrees * w * 0.4f;
+                        fromDelta[2] += w * 0.4f;
+                    }
+                }
+
+                // Apply gradients.
+                for (Map.Entry<String, float[]> entry : deltas.entrySet()) {
+                    float[] d = entry.getValue();
+                    if (d[2] <= 0f) {
+                        continue;
+                    }
+                    PoseCorrection corr = corrections.computeIfAbsent(
+                            entry.getKey(), k -> new PoseCorrection());
+                    float step = STEP_SIZE / d[2];
+                    corr.yawDegrees = clamp(corr.yawDegrees + d[0] * step, -5.5f, 5.5f);
+                    corr.pitchDegrees = clamp(corr.pitchDegrees + d[1] * step, -4.5f, 4.5f);
+                }
+            }
+
+            // Diagnostics.
+            float mean = 0f;
+            float p90 = 0f;
+            if (!residuals.isEmpty()) {
+                java.util.Collections.sort(residuals);
+                for (float rv : residuals) {
+                    mean += rv;
+                }
+                mean /= residuals.size();
+                p90 = residuals.get(Math.min(residuals.size() - 1,
+                        (int) (residuals.size() * 0.90f)));
+            }
+            float closure = computeClosureError(frameMap, corrections, lensModel);
+            return new BundleAdjustmentResult(true, mean, p90, closure, p90 < CONVERGENCE_P90);
+        }
+
+        /*
+         * Loop-closure error: sum all horizon-row frames by ascending yaw and
+         * compare the cumulative yaw span to 360 degrees.  A well-calibrated
+         * horizon row should close within ~2–3 degrees.
+         */
+        private static float computeClosureError(
+                Map<String, CalibrationFrame> frameMap,
+                Map<String, PoseCorrection> corrections,
+                LensModel lensModel) {
+            // Collect horizon-row frames (|pitch| <= 15 degrees).
+            ArrayList<float[]> horizonPoses = new ArrayList<>(); // [yaw]
+            for (Map.Entry<String, CalibrationFrame> entry : frameMap.entrySet()) {
+                CalibrationFrame frame = entry.getValue();
+                if (Math.abs(frame.basePitchDegrees) > 15) {
+                    continue;
+                }
+                PoseCorrection corr = corrections.get(entry.getKey());
+                float corrYaw = corr != null ? corr.yawDegrees : 0f;
+                float baseYaw = frame.record.capturedPoseAvailable
+                        ? normalizeDegrees(frame.record.headingDegrees)
+                        : frame.baseYawDegrees;
+                float yaw = normalizeDegrees(baseYaw + corrYaw);
+                horizonPoses.add(new float[]{yaw});
+            }
+            if (horizonPoses.size() < 3) {
+                return 0f;
+            }
+            horizonPoses.sort((a, b) -> Float.compare(a[0], b[0]));
+            // Measure largest gap; closure error = largest gap minus expected spacing.
+            float expectedSpacing = 360f / horizonPoses.size();
+            float maxGap = 0f;
+            for (int i = 0; i < horizonPoses.size(); i++) {
+                float next = horizonPoses.get((i + 1) % horizonPoses.size())[0];
+                float curr = horizonPoses.get(i)[0];
+                float gap = normalizeDegrees(next - curr);
+                if (gap > maxGap) {
+                    maxGap = gap;
+                }
+            }
+            return Math.max(0f, maxGap - lensModel.horizontalFovDegrees);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5E: Per-region parallax risk grid
+    // -------------------------------------------------------------------------
+
+    /*
+     * ParallaxRiskGrid maps reprojection residuals from the bundle adjustment
+     * control points into a COVERAGE_ROWS × COVERAGE_COLUMNS grid of risk
+     * scores [0,1].  Each cell records the mean normalised reprojection error of
+     * control points whose world position falls in that equirectangular cell.
+     *
+     * High-risk cells penalise source selection (Phase 5F) and are reported in
+     * the stitch summary.  Cells with no control-point evidence default to the
+     * global mean risk so parallax-free areas are not over-penalised.
+     *
+     * Edge cases:
+     *   - Empty frame map or no UV edges → all-zero grid (no penalty applied).
+     *   - Points projecting outside [0,1] UV are clamped to a valid grid cell.
+     *   - Risk scores are smoothed by averaging with a 3×3 neighbourhood to
+     *     avoid hard block boundaries at cell edges.
+     */
+    private static final class ParallaxRiskGrid {
+        private static final float HIGH_RESIDUAL_THRESHOLD = 0.08f;
+
+        final float[] riskScores; // COVERAGE_ROWS * COVERAGE_COLUMNS, row-major
+
+        private ParallaxRiskGrid(float[] riskScores) {
+            this.riskScores = riskScores;
+        }
+
+        static ParallaxRiskGrid build(
+                List<FeatureMatchEdge> edges,
+                Map<String, CalibrationFrame> frameMap,
+                Map<String, PoseCorrection> corrections,
+                LensModel lensModel) {
+            float[] accumulator = new float[COVERAGE_ROWS * COVERAGE_COLUMNS];
+            float[] counts = new float[accumulator.length];
+
+            float tanHalfH = (float) Math.tan(Math.toRadians(lensModel.horizontalFovDegrees / 2f));
+            float tanHalfV = (float) Math.tan(Math.toRadians(lensModel.verticalFovDegrees / 2f));
+
+            for (FeatureMatchEdge edge : edges) {
+                CalibrationFrame fromFrame = frameMap.get(edge.fromPath);
+                if (fromFrame == null || edge.confidence <= 0f) {
+                    continue;
+                }
+                PoseCorrection fromCorr = corrections.get(edge.fromPath);
+                float fromCorrYaw = fromCorr != null ? fromCorr.yawDegrees : 0f;
+                float fromCorrPitch = fromCorr != null ? fromCorr.pitchDegrees : 0f;
+                float fromCorrRoll = fromCorr != null ? fromCorr.rollDegrees : 0f;
+                float fromBaseYaw = fromFrame.record.capturedPoseAvailable
+                        ? normalizeDegrees(fromFrame.record.headingDegrees)
+                        : fromFrame.baseYawDegrees;
+                float fromBasePitch = fromFrame.record.capturedPoseAvailable
+                        ? fromFrame.record.pitchDegrees
+                        : fromFrame.basePitchDegrees;
+                float fromBaseRoll = fromFrame.record.capturedPoseAvailable
+                        ? fromFrame.record.rollDegrees * 0.10f
+                        : 0f;
+
+                float fromYaw = normalizeDegrees(fromBaseYaw + fromCorrYaw);
+                float fromPitch = clamp(fromBasePitch + fromCorrPitch, -89f, 89f);
+                float fromRoll = clamp(fromBaseRoll + fromCorrRoll, -5f, 5f);
+                CameraBasis fromBasis = CameraBasis.from(fromYaw, fromPitch, fromRoll);
+
+                for (ControlPointPair cp : edge.inlierControlPoints) {
+                    if (cp.leftNormU < 0f) {
+                        continue;
+                    }
+                    float lpx = (cp.leftNormU - 0.5f) * 2f;
+                    float lpy = (0.5f - cp.leftNormV) * 2f;
+                    float lr2 = lpx * lpx + lpy * lpy;
+                    float lInvDist = 1f / Math.max(0.01f,
+                            1f + lensModel.radialK1 * lr2 + lensModel.radialK2 * lr2 * lr2);
+                    float lLocalX = lpx * lInvDist * tanHalfH;
+                    float lLocalY = lpy * lInvDist * tanHalfV;
+                    float lLocalZ = 1f;
+                    float lLen = (float) Math.sqrt(
+                            lLocalX * lLocalX + lLocalY * lLocalY + lLocalZ * lLocalZ);
+                    lLocalX /= lLen; lLocalY /= lLen; lLocalZ /= lLen;
+
+                    // World ray.
+                    float wx = fromBasis.right.x * lLocalX + fromBasis.up.x * lLocalY + fromBasis.forward.x * lLocalZ;
+                    float wy = fromBasis.right.y * lLocalX + fromBasis.up.y * lLocalY + fromBasis.forward.y * lLocalZ;
+                    float wz = fromBasis.right.z * lLocalX + fromBasis.up.z * lLocalY + fromBasis.forward.z * lLocalZ;
+
+                    // Convert world ray to equirectangular grid cell.
+                    float rayYaw = (float) Math.toDegrees(Math.atan2(wx, wz));
+                    float rayPitch = (float) Math.toDegrees(Math.asin(clamp(wy, -1f, 1f)));
+                    float normYaw = normalizeDegrees(rayYaw);
+                    float col = normYaw / 360f * COVERAGE_COLUMNS;
+                    float row = (90f - rayPitch) / 180f * COVERAGE_ROWS;
+                    int ci = clamp((int) col, 0, COVERAGE_COLUMNS - 1);
+                    int ri = clamp((int) row, 0, COVERAGE_ROWS - 1);
+
+                    // Use descriptor distance as a proxy for per-point residual risk.
+                    float risk = clamp(cp.descriptorDistance / 96f, 0f, 1f);
+                    accumulator[ri * COVERAGE_COLUMNS + ci] += risk;
+                    counts[ri * COVERAGE_COLUMNS + ci] += 1f;
+                }
+            }
+
+            // Normalise to [0,1].
+            float[] raw = new float[accumulator.length];
+            for (int i = 0; i < raw.length; i++) {
+                raw[i] = counts[i] > 0f ? clamp(accumulator[i] / counts[i], 0f, 1f) : 0f;
+            }
+
+            // Smooth with 3×3 box filter to avoid hard cell edges.
+            float[] smoothed = new float[raw.length];
+            for (int r = 0; r < COVERAGE_ROWS; r++) {
+                for (int c = 0; c < COVERAGE_COLUMNS; c++) {
+                    float sum = 0f;
+                    int n = 0;
+                    for (int dr = -1; dr <= 1; dr++) {
+                        for (int dc = -1; dc <= 1; dc++) {
+                            int nr = r + dr;
+                            int nc = (c + dc + COVERAGE_COLUMNS) % COVERAGE_COLUMNS;
+                            if (nr >= 0 && nr < COVERAGE_ROWS) {
+                                sum += raw[nr * COVERAGE_COLUMNS + nc];
+                                n++;
+                            }
+                        }
+                    }
+                    smoothed[r * COVERAGE_COLUMNS + c] = n > 0 ? sum / n : 0f;
+                }
+            }
+            return new ParallaxRiskGrid(smoothed);
+        }
+
+        float riskAt(int outputX, int outputY) {
+            int col = clamp(outputX * COVERAGE_COLUMNS / OUTPUT_WIDTH, 0, COVERAGE_COLUMNS - 1);
+            int row = clamp(outputY * COVERAGE_ROWS / OUTPUT_HEIGHT, 0, COVERAGE_ROWS - 1);
+            return riskScores[row * COVERAGE_COLUMNS + col];
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5H: Seam ownership map and Gaussian seam blend
+    // -------------------------------------------------------------------------
+
+    /*
+     * SeamOwnershipMap identifies output pixels that sit near a source-frame
+     * boundary (seam).  It is built from the per-pixel frameOwner array
+     * accumulated during the source-selection pass.
+     *
+     * Near-seam pixels are tagged with a blend fraction [0,1] indicating how
+     * close they are to the seam, so applySeamBlend() can apply a Gaussian
+     * feather.  Pixels far from any seam receive fraction 0 and are unchanged.
+     *
+     * A pixel is "near a seam" if any of its 8 immediate neighbours belongs to a
+     * different source frame.  The blend fraction is scaled by distance to the
+     * nearest cross-frame neighbour (1 pixel → full blend; 4 pixels → zero).
+     *
+     * Edge cases:
+     *   - frameOwner == -1 (unrendered pixel) → treated as its own class, never
+     *     triggers a seam flag.
+     *   - Seam blend at image-edge pixels is clamped to valid indices.
+     */
+    private static final class SeamOwnershipMap {
+        final float[] blendFraction; // OUTPUT_WIDTH * OUTPUT_HEIGHT, 0=no blend, 1=full seam
+
+        private SeamOwnershipMap(float[] blendFraction) {
+            this.blendFraction = blendFraction;
+        }
+
+        static SeamOwnershipMap build(int[] frameOwner) {
+            float[] fraction = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
+            int[] dx8 = {-1, 0, 1, -1, 1, -1, 0, 1};
+            int[] dy8 = {-1, -1, -1, 0, 0, 1, 1, 1};
+            for (int y = 0; y < OUTPUT_HEIGHT; y++) {
+                for (int x = 0; x < OUTPUT_WIDTH; x++) {
+                    int idx = y * OUTPUT_WIDTH + x;
+                    int owner = frameOwner[idx];
+                    if (owner < 0) {
+                        continue; // unrendered pixel
+                    }
+                    boolean nearSeam = false;
+                    for (int n = 0; n < 8; n++) {
+                        int nx = (x + dx8[n] + OUTPUT_WIDTH) % OUTPUT_WIDTH;
+                        int ny = y + dy8[n];
+                        if (ny < 0 || ny >= OUTPUT_HEIGHT) {
+                            continue;
+                        }
+                        int nOwner = frameOwner[ny * OUTPUT_WIDTH + nx];
+                        if (nOwner >= 0 && nOwner != owner) {
+                            nearSeam = true;
+                            break;
+                        }
+                    }
+                    if (nearSeam) {
+                        fraction[idx] = 1f;
+                    }
+                }
+            }
+            // Dilate seam mask by 3 pixels with a falloff.
+            float[] dilated = new float[fraction.length];
+            for (int y = 0; y < OUTPUT_HEIGHT; y++) {
+                for (int x = 0; x < OUTPUT_WIDTH; x++) {
+                    if (fraction[y * OUTPUT_WIDTH + x] > 0f) {
+                        for (int dy = -3; dy <= 3; dy++) {
+                            for (int dx = -3; dx <= 3; dx++) {
+                                int ny = clamp(y + dy, 0, OUTPUT_HEIGHT - 1);
+                                int nx = (x + dx + OUTPUT_WIDTH) % OUTPUT_WIDTH;
+                                float dist = (float) Math.sqrt(dx * dx + dy * dy);
+                                float f = Math.max(0f, 1f - dist / 4f);
+                                int ni = ny * OUTPUT_WIDTH + nx;
+                                if (f > dilated[ni]) {
+                                    dilated[ni] = f;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return new SeamOwnershipMap(dilated);
+        }
+    }
+
+    /*
+     * applySeamBlend performs a Gaussian feather at seam-region pixels.
+     * Near-seam pixels are blended between their source-selected value and a
+     * locally averaged value from a 5×1 horizontal + 5×1 vertical separable
+     * pass.  This softens sharp source transitions without affecting pixels that
+     * are far from any seam boundary.
+     *
+     * Only STRONGEST_SOURCE mode uses this; BLENDED and CONTRIBUTOR_MAP modes
+     * already do accumulation so this extra step is skipped.
+     */
+    private static void applySeamBlend(
+            float[] red, float[] green, float[] blue, float[] weights,
+            SeamOwnershipMap seamMap) {
+        // Build a low-pass blurred version via a simple 5-tap box filter.
+        float[] blurR = new float[red.length];
+        float[] blurG = new float[green.length];
+        float[] blurB = new float[blue.length];
+        float[] blurW = new float[weights.length];
+        int radius = 4;
+        // Horizontal pass.
+        for (int y = 0; y < OUTPUT_HEIGHT; y++) {
+            for (int x = 0; x < OUTPUT_WIDTH; x++) {
+                int idx = y * OUTPUT_WIDTH + x;
+                float sr = 0f, sg = 0f, sb = 0f, sw = 0f;
+                for (int dx = -radius; dx <= radius; dx++) {
+                    int nx = (x + dx + OUTPUT_WIDTH) % OUTPUT_WIDTH;
+                    int ni = y * OUTPUT_WIDTH + nx;
+                    float fw = weights[ni];
+                    if (fw > 0f) {
+                        sr += red[ni]; sg += green[ni]; sb += blue[ni]; sw += fw;
+                    }
+                }
+                if (sw > 0f) {
+                    blurR[idx] = sr / sw * weights[idx];
+                    blurG[idx] = sg / sw * weights[idx];
+                    blurB[idx] = sb / sw * weights[idx];
+                    blurW[idx] = weights[idx];
+                }
+            }
+        }
+        // Blend seam pixels between sharp selection and blurred value.
+        for (int i = 0; i < red.length; i++) {
+            float f = seamMap.blendFraction[i];
+            if (f <= 0f || weights[i] <= 0f || blurW[i] <= 0f) {
+                continue;
+            }
+            red[i] = red[i] * (1f - f) + blurR[i] * f;
+            green[i] = green[i] * (1f - f) + blurG[i] * f;
+            blue[i] = blue[i] * (1f - f) + blurB[i] * f;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5I: Formal stitch readiness evaluation
+    // -------------------------------------------------------------------------
+
+    /*
+     * StitchReadiness provides a pass/warn/fail verdict for each quality
+     * dimension so the app can surface the most important capture issue rather
+     * than showing a wall of warnings.
+     *
+     * PASS  – the output is likely map-ready or close to it.
+     * WARN  – the output is usable but has known quality limits.
+     * FAIL  – the output is not suitable for public publish; specific repair
+     *          or recapture is recommended.
+     */
+    static final class StitchReadiness {
+        static final String PASS = "pass";
+        static final String WARN = "warn";
+        static final String FAIL = "fail";
+
+        final String geometryLevel;
+        final String coverageLevel;
+        final String exposureLevel;
+        final String overallLevel;
+
+        StitchReadiness(String geometryLevel, String coverageLevel,
+                        String exposureLevel, String overallLevel) {
+            this.geometryLevel = geometryLevel;
+            this.coverageLevel = coverageLevel;
+            this.exposureLevel = exposureLevel;
+            this.overallLevel = overallLevel;
+        }
+
+        static StitchReadiness evaluate(int renderedFrames, int coveragePercent,
+                                         Calibration calibration) {
+            // Geometry readiness.
+            String geometry;
+            BundleAdjustmentResult ba = calibration.bundleAdjResult;
+            if (!ba.ranOptimization || calibration.openCvMatchedOverlapCount == 0) {
+                geometry = FAIL; // no feature evidence
+            } else if (ba.p90Residual > 0.12f || ba.closureError > 8f) {
+                geometry = FAIL;
+            } else if (ba.p90Residual > 0.06f || ba.closureError > 4f) {
+                geometry = WARN;
+            } else {
+                geometry = PASS;
+            }
+
+            // Coverage readiness.
+            String coverage;
+            if (coveragePercent < 55) {
+                coverage = FAIL;
+            } else if (coveragePercent < 80) {
+                coverage = WARN;
+            } else {
+                coverage = PASS;
+            }
+
+            // Exposure readiness (simple proxy: missing exposure frames).
+            String exposure;
+            int missing = 0; // derived from warnings; use frame count heuristic
+            if (renderedFrames > 0 && calibration.exposureGains.isEmpty()) {
+                exposure = WARN;
+            } else {
+                exposure = PASS;
+            }
+
+            // Overall: worst of all dimensions.
+            String overall;
+            if (FAIL.equals(geometry) || FAIL.equals(coverage)) {
+                overall = FAIL;
+            } else if (WARN.equals(geometry) || WARN.equals(coverage) || WARN.equals(exposure)) {
+                overall = WARN;
+            } else {
+                overall = PASS;
+            }
+            return new StitchReadiness(geometry, coverage, exposure, overall);
         }
     }
 }

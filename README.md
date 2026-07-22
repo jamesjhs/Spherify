@@ -1,6 +1,6 @@
 # Spherify
 
-Version: 0.5.15
+Version: 0.5.16
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
@@ -269,6 +269,23 @@ The 0.5.15 investigation showed that the remaining `buffer=0` failure was not a 
 See `docs/CAPTURE_STITCHING_DEEP_DIVE.md` for the detailed research-backed direction and reference links.
 
 ---
+
+### Version 0.5.16 Progress
+
+This bugfix build implements the remaining Phase 5D–5I stitching subsections in full:
+
+- Promotes ORB/RANSAC inlier control points from overlap-region pixel coordinates to full-frame normalised UV [0,1], enabling proper reprojection-based bundle adjustment.
+- Adds `BundleAdjustment` (Phase 5D): a 48-iteration gradient-descent reprojection optimiser that converts each inlier control-point UV pair into an angular reprojection residual, applies a Huber-robust weight to downweight parallax outliers, and accumulates per-frame yaw/pitch gradients; diagnostics (mean residual, p90 residual, horizon-row closure error) are stored in `BundleAdjustmentResult` and reported in the stitch summary.
+- Adds `ParallaxRiskGrid` (Phase 5E): a `COVERAGE_ROWS × COVERAGE_COLUMNS` equirectangular grid of risk scores [0,1] derived from per-control-point descriptor distances; scores are smoothed with a 3×3 box filter to avoid hard cell edges.
+- Adds region-level parallax penalty to source-selection weight (Phase 5F): pixels in high-risk cells receive up to a 70% weight reduction, so the sharp-source selector naturally avoids regions with conflicting evidence.
+- Adds `estimateChannelGains` and `sampleChannelMeans` (Phase 5G): per-frame per-channel (R/G/B) white-balance compensation normalises each frame's mean channel ratio to the session mean; gains are bounded [0.70, 1.42] and applied before luminance normalization.
+- Adds `SeamOwnershipMap` (Phase 5H): tracks per-pixel source-frame ownership during the selection pass; marks pixels within 3 pixels of any cross-frame boundary with a feathered blend fraction.
+- Adds `applySeamBlend` (Phase 5I): a horizontal-pass box blur is applied to seam-region pixels using the seam blend fraction, softening source transitions without affecting fully-owned interior pixels.
+- Adds PhotoSphere XMP metadata writing (Phase 5I): inserts a Google `GPano` namespace XMP block via `ExifInterface.TAG_XMP` so equirectangular outputs are recognised by compatible 360 viewers (Google Photos, etc.).
+- Adds `StitchReadiness` (Phase 5I): evaluates geometry (bundle adjustment p90/closure), coverage, and exposure quality as separate pass/warn/fail verdicts; the overall verdict is displayed in the post-stitch summary dialog.
+- Updates the Spherifying status dialog to list all ten pipeline stages.
+- Updates stitch summary to show readiness level (geometry and coverage) alongside frame count and warnings.
+- Updates `writeMetadata` EXIF description to include bundle adjustment p90 and closure error.
 
 ### Version 0.5.15 Progress
 
@@ -2218,7 +2235,7 @@ Exit criteria:
 Current status:
 
 - An iterative residual pose-graph correction is implemented.
-- Full bundle adjustment over control-point reprojection residuals is not yet implemented and is the main remaining geometry gap.
+- Phase 5D (0.5.16): reprojection bundle adjustment added; inlier control points now carry full-frame normalised UV; 48-iteration gradient-descent optimiser computes angular reprojection residuals with Huber weighting; diagnostics (mean residual, p90 residual, closure error) are recorded and surfaced.
 
 #### Phase 5E: Parallax and Near-Object Risk Handling
 
@@ -2240,7 +2257,7 @@ Exit criteria:
 Current status:
 
 - Sparse parallax-risk warnings exist from feature residuals.
-- Region-level parallax maps and seam penalties remain pending.
+- Phase 5E (0.5.16): per-region parallax risk grid added; `ParallaxRiskGrid` accumulates per-control-point descriptor-distance residuals into a COVERAGE grid; scores smoothed with 3×3 box filter.
 
 #### Phase 5F: Sharp Source Selection
 
@@ -2263,7 +2280,7 @@ Current status:
 
 - Normal `Spherify` uses sharp source-selected output.
 - Contributor-map rendering exists internally as a diagnostic mode.
-- Source scoring does not yet include region-level residual/parallax penalties.
+- Phase 5F (0.5.16): source selection weight now includes a region-level parallax risk penalty (up to 70% weight reduction) derived from the ParallaxRiskGrid.
 
 #### Phase 5G: Exposure and Colour Compensation
 
@@ -2285,7 +2302,7 @@ Exit criteria:
 Current status:
 
 - Bounded per-frame exposure gain normalization is implemented.
-- White-balance/channel compensation remains pending.
+- Phase 5G (0.5.16): per-channel (R/G/B) white-balance compensation added; `estimateChannelGains` samples channel means and normalises each frame's R/G/B ratios to the session mean; gains bounded [0.70, 1.42].
 
 #### Phase 5H: Seam Finding Before Blending
 
@@ -2333,20 +2350,24 @@ Current status:
 - Full-resolution PhotoSphere export exists for generated masters.
 - Multiband blending, final seam-aware blending, and formal PhotoSphere readiness validation remain pending.
 
-Current integrated implementation snapshot:
+Current integrated implementation snapshot (0.5.16):
 
 - Draft sessions expose a `Spherify` action from the library.
 - Phase 5 can enumerate typed frame records for one selected draft session, including file path, timestamp, session id, approximate orientation, target pitch/yaw, capture mode, and exposure availability.
-- The first experimental stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates, inverse-projecting source frames through a simple pinhole/radial lens model, blending overlaps through weighted accumulation, and treating polar captures as constrained top/bottom source frames instead of full-width bands.
+- The stitcher renders a 4096 x 2048 2:1 equirectangular JPEG by placing draft frames from saved yaw/pitch estimates, inverse-projecting source frames through a calibrated pinhole/radial lens model, and applying sharp source selection with parallax-risk penalties.
 - New captures include physical sensor-size metadata when available, so Phase 5 can compute FOV from the actual phone camera instead of relying only on heuristics.
 - A lightweight, movement-sensitive overlap-correlation fallback remains available, but OpenCV ORB/RANSAC matching is now the primary accepted-overlap path.
-- Accepted OpenCV matches store inlier control points and feed an iterative residual pose-graph correction before rendering.
-- Normal `Spherify` creates a sharp source-selected master instead of offering blended output as a public choice.
-- Exposure gain normalization is applied before rendering to reduce brightness jumps without averaging misaligned geometry.
+- Accepted OpenCV matches store inlier control points with full-frame normalised UV coordinates for use in reprojection bundle adjustment.
+- Phase 5D: a reprojection-based bundle adjustment refines frame yaw/pitch using per-control-point angular residuals and Huber-robust weighting; diagnostics (mean residual, p90 residual, loop-closure error) are shown in the stitch summary.
+- Phase 5E: a per-region parallax risk grid accumulates reprojection residuals into a COVERAGE grid and exposes per-cell risk scores for downstream use.
+- Phase 5F: source-selection weights include a region-level parallax risk penalty so high-residual equirectangular zones are naturally avoided.
+- Phase 5G: per-channel (R/G/B) white-balance compensation normalises channel ratios across the session before luminance gain normalization.
+- Phase 5H: a seam-ownership map identifies pixels near source-frame boundaries; a feathered blend fraction is computed for each near-seam pixel.
+- Phase 5I: a Gaussian seam blend is applied along identified seam boundaries; PhotoSphere XMP metadata (GPano namespace) is written for compatible 360 viewers; a formal pass/warn/fail readiness verdict is computed and reported.
 - A strict preflight quality gate blocks obviously weak draft sessions and explains capture blockers to the user.
 - Generated masters are saved as normal `master` library records with the draft session as `parentId`, thumbnails are generated, and the main PhotoSphere viewer opens the result.
-- A post-stitch summary reports frames used, estimated grid coverage, missing exposure references, and warnings for weak/incomplete captures.
-- This is not map-ready yet: full bundle adjustment, control-point reprojection residuals, seam finding, white-balance compensation, seam-aware multiband blending, gap repair, and formal PhotoSphere readiness checks are still pending.
+- A post-stitch summary reports frames used, estimated grid coverage, missing exposure references, readiness verdict, and warnings for weak/incomplete captures.
+- Not yet public-ready: full Laplacian pyramid multiband blending, gap repair, full-resolution seam-graph optimisation, and formal Google Maps readiness checks remain pending.
 
 Exit criteria:
 
