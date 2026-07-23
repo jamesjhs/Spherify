@@ -18,6 +18,8 @@ mono_crash.*
 
 # Build results
 [Dd]ebug/
+!app/src/debug/
+!app/src/debug/**
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/
@@ -36,7 +38,9 @@ bld/
 .gradle/
 build/
 app/build/
+app/.cxx/
 local.properties
+third_party/opencv-android/
 
 # Visual Studio 2015/2017 cache/options directory
 .vs/

@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.4.1
+Version: 0.4.2
 
-Spherify is an Android app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and optional location services, then saving them locally. Google Maps publishing is not implemented in version 0.4.1.
+Spherify is an Android app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and optional location services, then saving them locally. Google Maps publishing is not implemented in version 0.4.2.
 
-This repository contains the Android application code for the 0.4.1 reset. The capture workflow has moved to validated guided still capture: frames are scored, paired with real Camera2 metadata, overlap-checked with OpenCV feature matching, accepted or rejected into a capture graph, and preserved for a future industrial stitcher. The old custom stitch renderer has been removed from the production path. Until a real OpenCV-detail or Ceres-backed optimizer/compositor is linked, Spherify fails closed instead of generating a non-compliant sphere. The existing local library, flat-image import, GPU-backed PhotoSphere/Tiny Planet viewers, adjustment controls, saved variants, thumbnails, metadata display, export, share, delete, and basic library management remain operational.
+This repository contains the Android application code for the 0.4.2 reset. The old sweep/force-capture workflow, custom Java stitch renderer, and CameraX-only guided capture path are removed from the production route because they cannot provide the ARCore visual-inertial pose, tracking, feature-confidence, anchor, and Camera2 metadata contract required for a reliable seamless PhotoSphere. Production capture now routes through ARCore `SharedCamera` with Camera2 and fails closed when ARCore tracking, CPU image resolution, feature confidence, timestamp-paired metadata, or parallax constraints are not met. The existing local library, flat-image import, GPU-backed PhotoSphere/Tiny Planet viewers, adjustment controls, saved variants, thumbnails, metadata display, export, share, delete, debug capture diagnostics, and basic library management remain operational.
 
 ## Developer Build and Run Runbook
 
@@ -15,7 +15,7 @@ Current status:
 - The repository has a Gradle wrapper, Android app module, launcher activity, bundled test panorama, and debug build.
 - The current application ID is `com.spherify.app`.
 - The current debug build command is `.\gradlew.bat :app:assembleDebug` on Windows or `./gradlew :app:assembleDebug` on macOS/Linux.
-- The current build is local-first, does not require broad photo-library permission for normal use, and includes the Phase 4 guided capture replacement: CameraX still capture, Camera2 `TotalCaptureResult` metadata pairing, rotation-vector/gyro reticle guidance, adaptive dot targets, auto-capture on alignment and stillness, first-class capture-session records, OpenCV overlap validation, graph-backed candidate acceptance/rejection, and draft-frame recovery. Production Spherify master export is disabled until the solver uses a real OpenCV-detail or Ceres-backed stitching/compositing dependency.
+- The current build is local-first, does not require broad photo-library permission for normal use, keeps the library/viewer/import/export surfaces operational, and exposes production capture through the ARCore `SharedCamera`/Camera2 backend. Production Spherify master export consumes only validated capture graphs and remains blocked for sessions that lack ARCore pose/tracking/feature-confidence provenance.
 
 ## Play Store Compliance Gate (Mandatory)
 
@@ -30,10 +30,10 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.4.1):
+Current repository compliance snapshot (0.4.2):
 
-- Implemented now: local-first storage, in-app import/export/share, optional location tagging for capture metadata, GPU-backed viewers, Tiny Planet/PhotoSphere reprojection, guided CameraX capture, Camera2 metadata pairing, and OpenCV feature/RANSAC overlap validation.
-- Removed now: the old sweep/force-capture production workflow and the custom Java stitch/blend renderer.
+- Implemented now: local-first storage, in-app import/export/share, optional location tagging for capture metadata, GPU-backed viewers, Tiny Planet/PhotoSphere reprojection, debug-only CameraX capture diagnostics, Camera2 metadata pairing, OpenCV feature/RANSAC overlap validation, and the native OpenCV detail stitcher when a full Android OpenCV build is configured.
+- Removed now: the old sweep/force-capture production workflow, the custom Java stitch/blend renderer, and the CameraX-only capture path as a production entry point.
 - Not implemented now: production Spherify master export, direct Google Maps publish flow, production release pipeline documentation.
 - Code-level sensitive permissions present: CAMERA, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION.
 - Background location permission is not declared.
@@ -232,9 +232,25 @@ Either approach guarantees a complete fill before the JSON parse and eliminates 
 
 ## Capture and Stitching Workflow Notes
 
-Version 0.4.1 resets the Capture and Spherify design from first principles. The old pipeline proved several useful facts, but it also showed that iterating on bug fixes inside the previous flow risked optimizing the wrong product. The stable viewer, flat-image, Tiny Planet, PhotoSphere browsing, export, and share paths remain intact. Capture has been rebuilt around guided stills and validated graph data; Spherify master export is intentionally blocked until the optimizer/compositor is real.
+Version 0.4.2 continues the Capture and Spherify reset from first principles. The old pipeline proved several useful facts, but it also showed that iterating on bug fixes inside the previous flow risked optimizing the wrong product. The stable viewer, flat-image, Tiny Planet, PhotoSphere browsing, export, and share paths remain intact. Capture has been rebuilt as the front end of the spherification process: guided source acquisition, graph validation, native OpenCV solving/compositing, GPano writing, and library master creation now belong to one product workflow.
 
 The product goal is now narrower and stricter: an Android phone user should be able to create a high-quality, accurate, well-aligned, non-artefactual 360 x 180 spherical panorama suitable for local viewing and eventual Google Maps-style export. A beautiful Tiny Planet can tolerate flaws; a map-ready PhotoSphere cannot. The app should therefore stop treating capture as passive image collection and start treating it as the first stage of stitching.
+
+### Why The Initial Design Had To Change
+
+The first Spherify premise treated the phone camera as a generous image collector and treated spherification as a rendering problem that could be improved after capture. That was a useful exploratory premise because it proved the local library, projection viewer, Tiny Planet workflow, image import, draft-frame storage, and basic export surfaces. It also exposed the central flaw: a visually pleasing spherical viewer can hide that the source data was never measured in a way that a reliable PhotoSphere solver can trust.
+
+The literature review changed the design standard. Google Photo Sphere, Brown and Lowe-style panorama stitching, OpenCV's detailed stitching pipeline, Hugin/PTGui-style control-point workflows, and the broader stitching literature all point to the same conclusion: the capture UI is part of the measurement system. The app cannot ask the user to sweep, paint, force-capture, or loosely aim, then expect a later blender to manufacture geometric truth. The UI must deliberately gather still frames with known approximate viewing directions, enough overlap, low motion, stable camera state, and immediate recapture feedback when the data is weak.
+
+That forced the first major rework: capture moved from an image-acquisition feature to a graph-building instrument. A frame is no longer trusted because the user pressed a button or because it fills a visual gap. It is trusted only when it has image bytes, timestamp-paired Camera2 metadata, calibrated intrinsics, ARCore visual-inertial pose, feature-confidence evidence, parallax checks, and validated neighbour relationships. Accepted frames become graph nodes; visual overlaps become graph edges; weak or rejected candidates stay diagnostic rather than quietly becoming part of the public output.
+
+The second rework was architectural. CameraX was suitable for broad preview and still capture, but the research-backed production path needs a single camera stream that can feed ARCore tracking and Camera2 metadata at the same time. Version 0.4.2 therefore routes production capture through ARCore `SharedCamera` with Camera2. The retired CameraX capture screen is isolated to debug builds because it cannot provide the full production contract: visual-inertial pose, tracking state, projection/view matrices, feature-confidence signals, timestamp-paired metadata, and graph-anchor records from the same capture backend.
+
+The third rework was the stitcher. The original direction risked confusing spherification with custom reprojection and blending. The industry-standard path is registration first, then optimization, then warping, then exposure compensation, then seam finding, then multiband blending, then honest metadata. The current native OpenCV-detail pipeline was introduced to align with that sequence and to avoid reinventing established solver, seam, exposure, and blending machinery. If the native OpenCV stitching/detail symbols are unavailable or the capture graph is not valid, production master export fails closed.
+
+The fourth rework was the product promise. Spherify should not label a partial, weak, or cosmetically blended result as a map-ready PhotoSphere. The app must distinguish an interrupted diagnostic capture session, a creative Tiny Planet source, a local master, a needs-review result, and a map-ready candidate. GPano metadata is not decoration; it is a certification record that must truthfully describe the pixels, crop, source count, dates, pose, and projection. A final output is therefore allowed only when the solved equirectangular image, metadata readback, coverage, poles, wrap seam, horizon, residuals, and file constraints support the claim.
+
+The practical result is that Spherify's development direction moved from "make the current capture look better" to "make the capture produce solver-grade evidence." Every new edit should therefore be judged against the literature loop: guided acquisition, calibrated metadata, graph validation, global optimization, seam-aware compositing, multiband blending, GPano certification, and real-device proof.
 
 Lessons from the retired prototype:
 
@@ -242,38 +258,30 @@ Lessons from the retired prototype:
 - Target yaw/pitch alone is not enough to place frames accurately.
 - ARCore pose and camera intrinsics are valuable priors, but they are not final truth.
 - Hand-held capture produces parallax; no single spherical warp can fully fix close-object movement.
-- Post-capture quality gates are too late. Users need recapture feedback while they are still standing in the same position.
+- Post-fact quality gates are too late. Users need recapture feedback while they are still standing in the same position, and a successful capture session should proceed directly into solving/export rather than becoming a separate task.
 - A sharp source-selected render is useful for diagnostics, but it is not the final public-quality rendering strategy.
-- The app needs a capture graph with validated visual relationships, not just a folder of draft JPEGs.
+- The app needs a capture graph with validated visual relationships, not a folder of draft JPEGs or a later manual "Spherify" button.
 
-The 0.4.1 target Capture workflow:
+The 0.4.2 integrated PhotoSphere workflow:
 
 1. The user chooses a capture mode: `Hand-held`, `Tripod / phone mount`, or later `External 360 camera import`.
 2. The app performs a readiness check for ARCore tracking, gyro/rotation-vector quality, storage, camera intrinsics, focus, exposure, white balance, optional location, and scene risk.
 3. The app locks or stabilizes exposure, white balance, and focus for the session unless an explicit HDR/bracketed mode is active.
 4. The UI guides the user dot-by-dot or tile-by-tile around a sphere coverage map. Free sweeping is not the quality path.
 5. Each candidate frame is captured only after alignment, stillness, tracking, focus, and metadata readiness pass.
-6. The candidate frame then enters immediate analysis before it becomes an accepted draft frame.
+6. The candidate frame then enters immediate analysis before it becomes accepted solver input.
 7. The analysis layer checks blur, exposure clipping, low texture, noise, pose/intrinsics sanity, expected overlap, and whether the frame is likely to be useful for stitching.
 8. OpenCV feature matching compares the candidate only with predicted neighboring accepted frames. ORB is the fast baseline; AKAZE/SIFT-like options can be considered for high-quality mode if licensing, binary size, and device performance are acceptable.
 9. RANSAC validates the predicted overlaps. A frame is accepted only when it produces enough inlier control points with acceptable residuals, or when a documented special case applies, such as a pole frame with alternate support.
 10. Failed candidates reopen the same target immediately with a short reason such as `Blurred`, `Could not align`, `Too dark`, `Moved too fast`, or `Weak overlap`.
 11. Accepted frames become nodes in a persistent capture graph. Validated overlaps become graph edges with inlier count, residual, confidence, control points, and parallax-risk hints.
-12. Finishing capture is allowed only when required coverage, row closure, cross-row links, pole support, residual thresholds, and graph connectivity are strong enough for the selected quality target.
-
-The 0.4.1 target Spherify workflow:
-
-1. Load one validated capture graph, not an unverified draft folder.
-2. Remove weak, contradictory, or parallax-damaged graph edges.
-3. Estimate camera/lens parameters from device intrinsics, EXIF/camera metadata, and visual control points.
-4. Run real global camera optimization. Sensor pose should be a prior; optimized yaw, pitch, roll, focal/FOV, and radial distortion should determine final placement.
-5. Compute horizon leveling from gravity, visual alignment, and graph closure.
-6. Perform exposure and color compensation, ideally per image and eventually per block.
-7. Warp accepted frames to spherical/equirectangular space.
-8. Choose seams before blending. Seams should prefer frame centers and avoid high-residual areas, close-object parallax, moving people/vehicles, and low-confidence overlaps.
-9. Use multiband blending only after geometry and seams are credible.
-10. Export a full 2:1 equirectangular master with Google Photo Sphere XMP metadata, optional GPS/heading metadata, and local library thumbnails/variants.
-11. Run a final map-readiness review: resolution, aspect ratio, XMP, coverage, poles, horizon, wrap seam, residual warnings, location status, and file size.
+12. Completing capture immediately runs the spherification pipeline on that validated graph. There is no user-facing draft image set and no later manual Spherify action.
+13. The pipeline removes weak, contradictory, or parallax-damaged graph edges.
+14. It estimates camera/lens parameters from device intrinsics, EXIF/camera metadata, ARCore pose priors, gravity, and visual control points.
+15. It runs global camera optimization. Sensor pose is a prior; optimized yaw, pitch, roll, focal/FOV, and radial distortion determine final placement.
+16. It computes horizon leveling from gravity, visual alignment, and graph closure.
+17. It performs exposure and color compensation, warps accepted frames to spherical/equirectangular space, chooses seams before blending, and applies multiband blending only after geometry and seams are credible.
+18. It exports a full 2:1 equirectangular master with Google Photo Sphere XMP metadata, optional GPS/heading metadata, local library thumbnails/variants, and a final map-readiness review covering resolution, aspect ratio, XMP, coverage, poles, horizon, wrap seam, residual warnings, location status, and file size.
 
 The industrial comparison remains the benchmark:
 
@@ -285,14 +293,14 @@ The industrial comparison remains the benchmark:
 
 Implementation mandate for the rework:
 
-- Do not add more public polish to the retired Capture/Spherify path unless it directly supports the new graph-based architecture.
-- Preserve the local library/viewer/share/export behavior while Capture and Spherify are rebuilt.
+- Do not add more public polish to the retired split Capture/Spherify path unless it directly supports the integrated graph-based architecture.
+- Preserve the local library/viewer/share/export behavior while capture-time spherification is rebuilt.
 - Prefer small, testable subsystems: readiness scoring, candidate quality scoring, OpenCV overlap validation, capture graph persistence, final graph optimizer, seam finder, blender, and Google-ready export validator.
 - Keep diagnostic tools, but do not confuse diagnostic renders with user-facing map-ready output.
 
 ### Version 0.7.x Capture/Spherify Rework Sub-Phases
 
-These sub-phases preserve the research-backed working sequence for revising the entire Capture and Spherify functionality. Version labels in this section describe design milestones; the active app version remains 0.4.1.
+These sub-phases preserve the research-backed working sequence for revising the entire Capture and Spherify functionality. Version labels in this section describe design milestones; the active app version remains 0.4.2.
 
 #### Version 0.7.1: Capture Foundation and Session Graph
 
@@ -365,7 +373,7 @@ Migration notes:
 
 - Existing `drafts.json` records are not rewritten. On library load, Spherify still reconciles them into visible `draft_session` records so pending captures remain browseable and recoverable.
 - New 0.7.1 sessions can exist before the first frame is captured. The Pending library filter includes these recoverable sessions even when no representative JPEG exists yet.
-- Existing legacy draft sessions do not bypass the 0.4.1 guided graph gate. Production master creation remains blocked unless the session is validated and the real optimizer/compositor dependency is available.
+- Existing legacy draft sessions do not bypass the 0.4.2 guided graph gate. Production master creation remains blocked unless the session is validated and the real optimizer/compositor dependency is available.
 
 #### Version 0.7.2: Candidate Capture, Quality Gate, and OpenCV Acceptance
 
@@ -1133,6 +1141,42 @@ Example only:
 
 ```bash
 adb shell monkey -p com.spherify.app 1
+```
+
+#### Capture Metadata Debug Export
+
+Debug builds automatically write a capture-session CSV after each analyzed candidate and again when integrated spherification succeeds or fails. The dump does not transform, upload, or export image pixels; it writes one CSV timeline containing the exact persisted metadata for each captured frame row, high-precision Camera2 sensor timestamps, flattened camera/image/analysis fields, and the next capture target computed by the live capture planner after each accepted frame.
+
+The CLI endpoint remains available for manually replaying the latest or a specific saved session:
+
+Export the latest capture session:
+
+```bash
+adb shell am start -n com.spherify.app/.CaptureDebugExportActivity
+```
+
+Export a specific session:
+
+```bash
+adb shell am start -n com.spherify.app/.CaptureDebugExportActivity --es sessionId SESSION_ID
+```
+
+Old `capture-debug-*.csv` files are deleted before each export by default. Preserve previous CSV exports for comparison with:
+
+```bash
+adb shell am start -n com.spherify.app/.CaptureDebugExportActivity --ez keepExisting true
+```
+
+The app logs and toasts the output path, normally under:
+
+```text
+/sdcard/Android/data/com.spherify.app/files/debug/capture-debug-*.csv
+```
+
+Pull the file with:
+
+```bash
+adb pull /sdcard/Android/data/com.spherify.app/files/debug/capture-debug-YYYYMMDD-HHMMSS-SSS.csv .
 ```
 
 7. Read device logs while testing.
@@ -2030,7 +2074,7 @@ Exit criteria:
 - A user can import an image, create a Tiny Planet variant, save it, close the app, reopen, and continue working.
 - App-created images are visible in the device gallery when exported.
 - The app does not require broad photo-library permission for normal use.
-- Draft capture sessions are represented as first-class local library records, not only as loose frame files.
+- Interrupted capture sessions are recoverable as diagnostic local library records, not loose frame files or a separate production processing queue.
 
 ### Phase 3: Capture Shell and Sensor Readiness
 
@@ -2043,54 +2087,58 @@ Work:
 - Build camera preview with simple still capture.
 - Read accelerometer, gyroscope, compass/magnetometer, and rotation vector where available.
 - Show sensor readiness and compass calibration status.
-- Save captured frames into a draft capture session.
+- Save captured source evidence into a recoverable capture session.
 - Save foreground location metadata when enabled.
 
 Exit criteria:
 
-- A user can grant camera/location, capture frames, and see the draft session in the library.
+- A user can grant camera/location, begin capture, and recover an interrupted capture session without corrupting the library.
 - Sensor status is visible and does not block unsupported devices unnecessarily.
 - Location remains optional.
 
 ### Phase 4: Guided PhotoSphere, Stitching and Equirectangular Master Generation
 
-Goal: replace the current capture and Spherify implementation with a new end-to-end PhotoSphere pipeline based on guided still capture, validated overlap graphs, global camera optimization, seam-aware compositing, and honest spherical metadata. This phase must not patch the existing sweep/force-capture/rendering path into production shape. Version 0.4.1 removes that path from production and keeps the UI as the data-collection instrument for the stitcher.
+Goal: replace the current capture and Spherify implementation with one end-to-end PhotoSphere pipeline based on guided still capture, validated overlap graphs, global camera optimization, seam-aware compositing, and honest spherical metadata. This phase must not patch the existing sweep/force-capture/rendering path into production shape. Version 0.4.2 removes that path from production and makes the capture UI the measurement and control surface for the stitcher.
 
 Product direction:
 
 - Capture should feel like aligning a reticle with targets on a virtual sphere, not like operating a technical stitching console.
 - The user should not need to understand yaw, pitch, roll, overlap, graph edges, intrinsics, or residuals.
-- The app should show one next target, one hold/steady state, one compact coverage map, and short actionable warnings such as `Move slower`, `Hold steady`, `Too close`, `Recapture this area`, or `Complete`.
+- The app should show a small connected frontier of nearby targets rather than forcing a single brittle direction when more than one graph-valid neighbour is available. The user still sees one active target, one hold/steady state, one compact coverage map, and short actionable warnings such as `Move slower`, `Hold steady`, `Too close`, `Recapture this area`, or `Complete`, but adjacent above/below/left/right choices remain available when they preserve overlap with accepted frames. The first accepted frame should be user-anchored: capture begins wherever the user chooses to point the camera, then the remaining target lattice expands around that first view.
 - Free sweeping should not be the quality path for a map-ready sphere. It may remain later as a fast creative Tiny Planet mode, clearly labelled as lower confidence.
 - `Force Capture` should be removed from the normal workflow. A weak frame should trigger recapture, partial capture, or diagnostic-only acceptance, not become trusted source data.
 - `Skip Poles` should become an explicit partial-panorama choice with correct metadata and user-facing state, not a workaround inside a full-sphere promise.
-- ARCore, gyroscope, accelerometer, rotation vector, compass, and camera metadata should guide capture and initialize the solve. Final alignment must come from visual registration and global optimization.
+- ARCore visual-inertial tracking, gyroscope, accelerometer, rotation vector, compass, and camera metadata should guide capture and initialize the solve. Final alignment must come from visual registration and global optimization. A CameraX-only sensor path is diagnostic only and must not be treated as production capture because it cannot feed ARCore pose, tracking state, feature/depth confidence, or anchors into the capture graph.
 
 Architecture replacement:
 
-- Use the guided CameraX capture module as the primary capture path.
-- Treat any ARCore CPU-frame JPEG capture path as retired diagnostic history. Production capture uses deliberate CameraX stills with Camera2 metadata callbacks and timestamp pairing.
+- Use ARCore `SharedCamera` with Camera2 as the only production capture path. This backend must own preview/capture/control, ARCore visual-inertial tracking, camera pose, tracking state, projection/view matrices, depth or feature-confidence signals, timestamp-paired image metadata, and graph-anchor records.
+- Select the ARCore `CameraConfig` before session configuration. Prefer rear-facing 30 fps configs and choose the largest supported CPU image stream, with GPU texture size as a tie-breaker. If the best supported CPU stream is still too small for production PhotoSphere capture, fail closed and show the full ARCore CPU/GPU/FPS config list for device diagnosis.
+- Treat the guided CameraX capture module and any old non-shared ARCore CPU-frame JPEG path as retired diagnostic history. They may exist only in debug builds for metadata and target-planner investigation, never as the route to production PhotoSphere source data.
 - Prefer moderate, reliable source images over maximum-resolution frames that stall capture or break metadata timing. A consistent 2-4 MP source set may produce a better sphere than unstable full-resolution JPEGs.
 - Store every accepted source frame with timestamped raw facts: file path, capture timestamp, target yaw/pitch, measured pose, gravity/heading state, intrinsics, focal metadata, exposure, ISO, AE/AWB/focus state where Camera2 provides it, location summary, capture mode, device, camera id, and image dimensions.
 - Keep raw facts immutable. Store analysis results separately so later algorithms can be rerun without falsifying what was captured.
 - Use a durable capture graph as the central object. Frames are graph nodes. Validated overlaps are graph edges with neighbor ids, inlier count, inlier distribution, reprojection residuals, confidence, control points, parallax/motion hints, and rejection reasons.
-- Preserve interrupted sessions. Reopening a session must show accepted, missing, weak, and rejected targets with enough context for recapture.
+- Preserve interrupted sessions as diagnostics/recovery records. They must show accepted, missing, weak, and rejected targets with enough context for recapture, but they must not become a separate public "capture now, spherify later" workflow.
 
 Guided capture work:
 
-- Generate an adaptive spherical target lattice from the selected camera field of view and desired overlap. The target spacing must be smaller than the usable horizontal and vertical field of view, with extra care near the zenith and nadir.
+- Generate an adaptive spherical target lattice from the selected camera field of view, desired overlap, and the first accepted view. The target spacing must be smaller than the usable horizontal and vertical field of view, with local neighbours first, horizon completion next, and extra care near the zenith and nadir.
 - Support at least two capture quality profiles: `Hand-held` and `Tripod / phone mount`. Hand-held mode should warn more aggressively about translation and nearby objects. Tripod mode can use stricter map-ready assumptions.
-- Start capture with a readiness check for camera capability, motion sensors, ARCore availability, depth support where available, storage, location preference, exposure/focus stability, and low-light risk.
-- Drive the live overlay from fused orientation. Use ARCore pose when available and the Android rotation vector/gravity path as the broad compatibility fallback.
+- Start capture with a readiness check for camera capability, motion sensors, ARCore availability, ARCore shared-camera backend availability, depth or feature-confidence availability, storage, location preference, exposure/focus stability, and low-light risk.
+- Drive the production live overlay from ARCore visual-inertial camera pose, tracking state, feature/depth confidence, and calibrated projection. Targets outside the current camera view must remain discoverable through edge cues inspired by off-screen visualisation research rather than disappearing beyond the display.
+- Keep the capture UI as a closed feedback loop. The active target must remain visible or discoverable until accepted/rejected; nearby connected frontier targets should be visible as secondary choices; accepted frames must produce immediate visual/haptic confirmation plus persistent world-registered and mini-map coverage marks; rejected frames must reopen the same target with a plain reason; and the compact mini-sphere/target map must show current, accepted, weak, rejected, and remaining coverage.
+- In debug builds, automatically write a capture-metadata CSV for the active session after candidate analysis and final solve/failure. The optional CLI command must replay the same persisted metadata timeline, camera/image properties, and next-target coordinates without triggering stitching, library export, or any image transformation.
 - Auto-capture only when the target is aligned, angular velocity is low, focus/exposure/white balance are stable enough, and a capture-ready still frame can be paired with complete metadata.
-- Immediately analyze each candidate against expected neighbors before advancing permanently. If the candidate is the first frame in a region, accept it only as a provisional graph node until a later neighbor validates it.
+- Immediately analyze each candidate against expected neighbors before advancing permanently. The first anchor frame is exempt from overlap because no overlap exists yet, but it must still pass tracking, texture, blur, exposure, focus, pose, and metadata gates. After the anchor is accepted, missing predicted overlap or failed visual registration is a true weak-overlap failure.
 - After each ring or major region, run a lightweight graph health check. If loop closure, cross-row links, or pole support are weak, ask for recapture while the user is still physically in position.
-- Detect parallax risk during capture from ARCore translation where available, from residual clusters in matched features, and from optional depth/depth-edge cues. Severe parallax should produce immediate user feedback rather than being hidden by blending.
+- Detect parallax risk during capture from ARCore translation, feature-map confidence, depth/depth-edge cues where supported, and residual clusters in matched features. Severe parallax should produce immediate user feedback before capture rather than being hidden by blending.
 
 Vision and stitching work:
 
 - Use OpenCV as the first production stitching dependency. Kotlin or Java should own UI, permissions, camera lifecycle, and persistence; native/OpenCV code should own feature extraction, matching, camera optimization, warping, seam finding, and blending.
 - Build on the OpenCV detail-style pipeline or a Ceres-backed native solver rather than a custom weighted-pixel renderer: ORB/SIFT/AKAZE feature detection as available, robust matching, camera estimation, bundle adjustment, spherical warping, exposure compensation, graph-cut seam finding, and multi-band blending. The currently packaged OpenCV Android AAR does not expose/link these stitching/detail symbols, so production export remains blocked until that dependency gap is closed.
+- Version 0.4.2 includes an optional native OpenCV detail pipeline in `app/src/main/cpp`. It is enabled through `local.properties` when `spherify.opencvNativeDir` points to a full Android OpenCV build whose `OpenCVConfig.cmake` exports stitching symbols. The pipeline uses ORB features, BestOf2Nearest matching, homography estimation, ray bundle adjustment, wave correction, spherical warping, block gain exposure compensation, graph-cut seams, and multiband blending.
 - Treat sensor and ARCore pose as priors, not final placement. The optimizer should solve camera rotations, shared or per-frame focal parameters where justified, radial distortion terms, and gravity/horizon correction.
 - Use robust loss or outlier rejection so moving people, cars, trees, water, reflections, and repeated textures do not dominate the solve.
 - Estimate photometric correction from overlapping pixels, suppressing saturated regions, deep shadows, moving objects, and poorly aligned areas.
@@ -2098,20 +2146,20 @@ Vision and stitching work:
 - Use real Laplacian pyramid or OpenCV multi-band blending. A local blur pass is not sufficient for production PhotoSphere output.
 - Compose the final equirectangular master in memory-aware tiles where possible. Avoid holding every full-resolution source image and every full output buffer in memory at once on mid-range devices.
 
-Output and review work:
+Integrated output and review work:
 
-- Export a 2:1 equirectangular JPEG only when the solved panorama genuinely supports that claim.
+- When guided capture is completed, immediately consume the validated graph and export a 2:1 equirectangular JPEG only when the solved panorama genuinely supports that claim.
 - Write GPano/XMP metadata for projection type, full panorama dimensions, cropped dimensions, crop offsets, pose heading/pitch/roll where available, create date, source count, and stitching software.
 - For partial captures, write honest cropped-area metadata and display the result as partial/local rather than map-ready.
 - Validate the output before adding a confident master to the library: coverage, hole count, wrap seam, pole support, horizon consistency, reprojection residuals, exposure residuals, and metadata readback.
-- Assign a clear review state: `Draft`, `Partial`, `Creative export`, `Local master`, `Needs review`, or `Map-ready candidate`.
+- Assign a clear review state: `Interrupted capture`, `Partial`, `Creative export`, `Local master`, `Needs review`, or `Map-ready candidate`.
 - Keep source frames and the graph at least until the user deletes the session or chooses a storage-saving cleanup. Reprocessing should not require another physical capture when the captured data is still valid.
 
 Migration work:
 
 - Preserve the existing library, import, viewer, Tiny Planet, flat-image, export, share, thumbnail, rename, delete, and metadata screens unless they directly depend on the retired capture path.
 - Keep the legacy sweep/paint/force-capture code out of user-facing production capture.
-- Do not carry forward the custom Phase 5 renderer as the production stitching engine. Version 0.4.1 removes it from the production source path.
+- Do not carry forward the custom Phase 5 renderer as the production stitching engine. Version 0.4.2 removes it from the production source path.
 - Update the storage schema deliberately. Legacy `drafts.json` sessions may remain readable, but new sessions should use the capture graph as the authoritative source.
 - Add regression fixtures from real devices before declaring the new path complete: outdoor distant scene, indoor room, tripod/mount capture, low light, low texture, moving people/vehicles, close-object parallax, and incomplete/partial capture.
 
@@ -2120,21 +2168,21 @@ Exit criteria:
 - A user can complete a guided dot-based full-sphere capture without seeing developer diagnostics.
 - Every accepted production source frame has complete image bytes, timestamped pose/intrinsics/exposure metadata, and at least the expected graph validation state.
 - The capture graph is connected, loop closure is checked, cross-row overlap is verified, and weak regions produce recapture prompts before final processing.
-- The production Spherify action consumes only a validated capture graph, not an unverified folder of JPEGs.
+- Completing capture consumes only the validated capture graph. There is no public production action that spherifies an unverified folder of JPEGs or a later draft session.
 - The stitcher uses a proven OpenCV-detail or Ceres-backed global alignment, spherical warp, seam, exposure, and multi-band blend pipeline.
 - The exported master is a valid 2:1 equirectangular JPEG with GPano metadata, or no master is created.
 - A real-device test corpus demonstrates that the new pipeline handles at least one outdoor full sphere and one indoor full sphere better than the retired prototype.
-- The old capture/spherify path is either removed from user-facing builds or clearly isolated as diagnostics so the product has one primary truth.
+- The old split capture/spherify path is removed from user-facing builds or isolated as diagnostics so the product has one primary truth.
 
 
 
 ### Phase 5: Solver, Export, and GPano Certification
 
-Goal: add the missing industrial optimizer/compositor and certify local PhotoSphere output before any Google Maps handoff is considered.
+Goal: tune and certify the industrial optimizer/compositor that runs at guided-capture completion before any Google Maps handoff is considered.
 
 Work:
 
-- Add a native OpenCV-detail pipeline or Ceres-backed solver that is actually linked into Android: feature extraction, robust pairwise matching, camera estimation, bundle adjustment, spherical warping, exposure compensation, graph-cut seam selection, and multiband blending.
+- Maintain and tune the native OpenCV-detail pipeline that is now linked into Android: feature extraction, robust pairwise matching, camera estimation, bundle adjustment, spherical warping, exposure compensation, graph-cut seam selection, and multiband blending.
 - Validate 2:1 aspect ratio, minimum 3840 x 1920 resolution, file size under 75 MB, complete coverage, poles, wrap seam, horizon, residuals, and GPano XMP readback.
 - Write GPano metadata only when the output is a truthful equirectangular PhotoSphere: projection type, full/cropped dimensions, crop offsets, source count, photo dates, creator tool, and pose heading/pitch/roll where available.
 - Add a metadata editor for optional location and heading review, keeping missing location separate from stitch quality.
@@ -2142,7 +2190,7 @@ Work:
 
 Exit criteria:
 
-- A validated capture graph can produce a local 2:1 equirectangular JPEG through a real optimizer/compositor.
+- Completing a validated capture graph produces a local 2:1 equirectangular JPEG through a real optimizer/compositor without a separate post-capture Spherify step.
 - GPano metadata readback passes and common 360 viewers recognize the file as a PhotoSphere.
 - The app refuses to label any output map-ready if coverage, residuals, poles, wrap seam, aspect ratio, resolution, file size, or metadata validation fail.
 

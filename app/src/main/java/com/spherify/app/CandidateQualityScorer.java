@@ -9,7 +9,7 @@ final class CandidateQualityScorer {
     private static final int MAX_SAMPLE_SIZE = 640;
     private static final double MIN_BLUR_SCORE = 55.0;
     private static final double MIN_EXPOSURE_SCORE = 0.32;
-    private static final double MIN_TEXTURE_SCORE = 9.0;
+    private static final double MIN_TEXTURE_SCORE = 5.5;
 
     CandidateQualityReport score(File imageFile, double yawRate, double pitchRate, double rollRate) {
         Bitmap bitmap = decodeSample(imageFile);
@@ -67,7 +67,7 @@ final class CandidateQualityScorer {
         } else if (exposureScore < MIN_EXPOSURE_SCORE) {
             rejection = "Too dark";
         } else if (textureScore < MIN_TEXTURE_SCORE) {
-            rejection = "Weak overlap";
+            rejection = "Need more visual detail";
         }
         return new CandidateQualityReport(
                 rejection.isEmpty(),

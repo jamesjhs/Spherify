@@ -6,7 +6,7 @@
  * import images, create bundled demo content, save exported variants, list
  * gallery items, rename/delete entries, create/delete draft capture files, and
  * record draft metadata. The class deliberately keeps storage details out of
- * MainActivity and CaptureActivity so those screens can focus on UI flow.
+ * MainActivity and the capture screens so those UI classes can focus on flow.
  *
  * Data flow:
  * External/bundled image input -> copied into app-private library folders ->
@@ -14,7 +14,7 @@
  * written to metadata.json. For exports, GLProjectionView creates temporary
  * files and MainActivity passes a ProjectionExport here; this class copies the
  * files into the library and optionally publishes the image to Android
- * MediaStore. For capture drafts, CaptureActivity asks for a destination JPEG
+ * MediaStore. For capture drafts, the active capture backend asks for a destination JPEG
  * File, writes the latest ARCore CPU camera frame, and recordDraftFrame()
  * appends path/location/
  * orientation/exposure/session data to drafts.json while upserting a
@@ -428,17 +428,27 @@ final class SpherifyLibrary {
         return null;
     }
 
+    CaptureSessionRecord latestCaptureSession() {
+        CaptureSessionRecord latest = null;
+        for (CaptureSessionRecord session : readCaptureSessions()) {
+            if (latest == null || session.updatedAt > latest.updatedAt) {
+                latest = session;
+            }
+        }
+        return latest;
+    }
+
     String describeCaptureSessionDiagnostics(String sessionId) {
         CaptureSessionRecord session = findCaptureSession(sessionId);
         if (session == null) {
-            return "No 0.4.1 guided capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
+            return "No 0.4.2 guided capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
         }
         StringBuilder message = new StringBuilder();
-        message.append("Format: 0.4.1 guided capture session")
+        message.append("Format: 0.4.2 guided capture session")
                 .append("\nSession: ").append(session.id)
                 .append("\nMode: ").append(session.captureMode.label)
                 .append("\nStatus: ").append(session.status.storageValue)
-                .append("\nDiagnostic Spherify: ").append(session.diagnosticSpherifyAllowed ? "allowed" : "off")
+                .append("\nDiagnostic export: ").append(session.diagnosticSpherifyAllowed ? "allowed" : "off")
                 .append("\nFrames: source ").append(session.countFrames(CaptureFrameRole.SOURCE))
                 .append(", candidates ").append(session.countFrames(CaptureFrameRole.CANDIDATE))
                 .append(", accepted ").append(session.countFrames(CaptureFrameRole.ACCEPTED))
@@ -482,7 +492,7 @@ final class SpherifyLibrary {
      * Function: listDraftFrames
      * Arguments: none.
      * Calls: File.listFiles() and Collections.sort().
-     * Flow: scan the drafts directory for JPEG files written by CameraX and
+     * Flow: scan the drafts directory for JPEG files written by capture and
      * return them newest first for the Draft Frames browser.
      */
     List<File> listDraftFrames() {
@@ -609,14 +619,44 @@ final class SpherifyLibrary {
     }
 
     /*
-     * Function: createMasterFromDraftSession
-     * Arguments: draftSession is the first-class library record selected by the
-     * user.
+     * Function: createMasterFromCaptureSession
+     * Arguments: sessionId identifies the active guided capture graph.
      * Calls: listDraftFrameRecords(), Phase5Stitcher.stitch(), makeThumbnail(),
      * LibraryItem constructor, and save().
-     * Flow: render the first Phase 5 equirectangular JPEG from one coherent
-     * draft capture session, add it as a normal master image, and return both the
-     * item and quality summary to MainActivity.
+     * Flow: finish the single capture-and-spherification workflow by consuming
+     * the validated capture graph, rendering an equirectangular PhotoSphere,
+     * adding the master image to the local library, and returning the result to
+     * the capture activity.
+     */
+    StitchMasterResult createMasterFromCaptureSession(
+            String sessionId,
+            String movementSensitivity,
+            String renderMode,
+            ProgressReporter progress) throws IOException {
+        LibraryItem captureSessionItem = findDraftSessionItem(sessionId);
+        if (captureSessionItem == null) {
+            CaptureSessionRecord session = findCaptureSession(sessionId);
+            if (session == null) {
+                throw new IOException("Spherify 0.4.2 requires a validated guided capture graph; no capture-session record was found.");
+            }
+            upsertCaptureSessionItem(session, firstExistingFrame(session));
+            captureSessionItem = findDraftSessionItem(sessionId);
+        }
+        if (captureSessionItem == null) {
+            throw new IOException("could not resolve capture session for PhotoSphere export");
+        }
+        return createMasterFromDraftSession(captureSessionItem, movementSensitivity, renderMode, progress);
+    }
+
+    /*
+     * Function: createMasterFromDraftSession
+     * Arguments: draftSession is the compatibility LibraryItem that backs one
+     * guided capture session.
+     * Calls: listDraftFrameRecords(), Phase5Stitcher.stitch(), makeThumbnail(),
+     * LibraryItem constructor, and save().
+     * Flow: shared implementation for the integrated capture workflow; the
+     * persisted type name remains for older metadata, but this is no longer a
+     * separate user-facing "draft then spherify" product path.
      */
     StitchMasterResult createMasterFromDraftSession(
             LibraryItem draftSession,
@@ -631,11 +671,11 @@ final class SpherifyLibrary {
             String renderMode,
             ProgressReporter progress) throws IOException {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
-            throw new IOException("select a draft session first");
+            throw new IOException("select a capture session first");
         }
         CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
         if (captureSession == null) {
-            throw new IOException("Spherify 0.4.1 requires a validated guided capture graph; this older draft session has no graph record.");
+            throw new IOException("Spherify 0.4.2 requires a validated guided capture graph; this older draft session has no graph record.");
         }
         GraphReadinessReport graphReadiness = validateCaptureGraphReadiness(captureSession);
         if (!graphReadiness.pass) {
@@ -644,7 +684,7 @@ final class SpherifyLibrary {
         report(progress, "quality", false, "Running Stage 5A input session integrity checks");
         List<DraftFrameRecord> records = listDraftFrameRecords(draftSession.id);
         if (records.isEmpty()) {
-            throw new IOException("draft session has no readable frames");
+            throw new IOException("capture session has no readable source frames");
         }
         DraftQualityReport qualityReport = validateDraftStitchQuality(records);
         if (!qualityReport.pass) {
@@ -691,7 +731,7 @@ final class SpherifyLibrary {
 
     DraftQualityReport assessDraftStitchQuality(LibraryItem draftSession) throws IOException {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
-            throw new IOException("select a draft session first");
+            throw new IOException("select a capture session first");
         }
         DraftQualityReport draftQuality = validateDraftStitchQuality(listDraftFrameRecords(draftSession.id));
         CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
@@ -787,10 +827,16 @@ final class SpherifyLibrary {
         int lower30 = 0;
         int upperHigh = 0;
         int lowerHigh = 0;
+        int anchorPitch = 0;
+        boolean anchorPitchSet = false;
         boolean handheld = false;
         for (DraftFrameRecord record : records) {
             if (!record.imageFile.exists()) {
                 continue;
+            }
+            if (!anchorPitchSet) {
+                anchorPitch = record.targetPitchDegrees;
+                anchorPitchSet = true;
             }
             readableFrames++;
             if (record.capturedPoseAvailable) {
@@ -809,15 +855,16 @@ final class SpherifyLibrary {
                 handheld = true;
             }
             int pitch = record.targetPitchDegrees;
-            if (Math.abs(pitch) <= 10) {
+            int relativePitch = pitch - anchorPitch;
+            if (Math.abs(relativePitch) <= 10) {
                 horizon++;
-            } else if (pitch >= 20 && pitch <= 45) {
+            } else if (relativePitch >= 20 && relativePitch <= 45) {
                 upper30++;
-            } else if (pitch <= -20 && pitch >= -45) {
+            } else if (relativePitch <= -20 && relativePitch >= -45) {
                 lower30++;
-            } else if (pitch >= 55) {
+            } else if (relativePitch >= 55 || pitch >= 80) {
                 upperHigh++;
-            } else if (pitch <= -55) {
+            } else if (relativePitch <= -55 || pitch <= -80) {
                 lowerHigh++;
             }
         }
@@ -1045,7 +1092,7 @@ final class SpherifyLibrary {
 
         static GraphReadinessReport missingSession() {
             ArrayList<String> blockers = new ArrayList<>();
-            blockers.add("Spherify 0.4.1 requires a validated guided capture graph; no capture-session record was found");
+            blockers.add("Spherify 0.4.2 requires a validated guided capture graph; no capture-session record was found");
             return new GraphReadinessReport(false, 0, 0, 0, 0, blockers);
         }
 
@@ -1060,7 +1107,7 @@ final class SpherifyLibrary {
 
     /*
      * Function: deleteDraftFrame
-     * Arguments: imageFile is a CameraX draft JPEG selected from the Draft Frames
+     * Arguments: imageFile is a captured draft JPEG selected from the Draft Frames
      * browser.
      * Calls: deleteFile(), JSONArray/JSONObject parsing, and FileOutputStream.
      * Flow: remove the JPEG from local storage, remove any matching metadata
@@ -1180,7 +1227,7 @@ final class SpherifyLibrary {
      * Arguments: none.
      * Calls: mkdir() and File constructor.
      * Flow: ensure the drafts folder exists and return a timestamped JPEG path
-     * where CaptureActivity/CameraX can write the next frame.
+     * where the active capture backend can write the next frame.
      */
     File createDraftFrameFile() throws IOException {
         mkdir(draftsDir);
@@ -1189,9 +1236,9 @@ final class SpherifyLibrary {
 
     /*
      * Function: recordDraftFrame
-     * Arguments: imageFile is the CameraX-written draft JPEG; sessionId groups
-     * frames into one guided capture attempt; locationSummary is an optional
-     * lat/long string; heading/pitch/roll approximate the phone orientation;
+     * Arguments: imageFile is the captured draft JPEG; sessionId groups frames
+     * into one guided capture attempt; locationSummary is an optional lat/long
+     * string; heading/pitch/roll record the measured capture orientation;
      * targetYaw/targetPitch identify the guide target being covered; captureMode
      * records whether the frame came from manual or auto capture.
      * Calls: JSONArray/JSONObject parsing and FileOutputStream.
@@ -1759,9 +1806,11 @@ final class SpherifyLibrary {
     private static boolean readinessPasses(JSONObject readiness) {
         return readiness != null
                 && readiness.optBoolean("cameraPermission", false)
-                && (readiness.optBoolean("arCoreTracking", false)
-                || readiness.optBoolean("rotationVectorAvailable", false))
-                && readiness.optBoolean("gyroRotationVectorStable", false)
+                && readiness.optBoolean("arCoreTracking", false)
+                && readiness.optBoolean("arCoreSharedCameraBackend", false)
+                && readiness.optBoolean("arCoreDepthOrFeatureConfidence", false)
+                && readiness.optBoolean("arCorePoseFeedsCaptureGraph", false)
+                && readiness.optBoolean("parallaxWarningBeforeCapture", false)
                 && readiness.optBoolean("cameraIntrinsicsAvailable", false)
                 && readiness.optBoolean("storageAvailable", false);
     }
@@ -1918,7 +1967,7 @@ final class SpherifyLibrary {
      * LibraryItem constructor.
      * Flow: ensure every non-empty draft session in drafts.json has a matching
      * first-class Pending library record, even if MainActivity's in-memory list
-     * was loaded before CaptureActivity saved the frames.
+     * was loaded before the capture backend saved the frames.
      */
     private boolean reconcileDraftSessionItems() {
         boolean changed = false;
@@ -2033,7 +2082,7 @@ final class SpherifyLibrary {
 
     private static String requiredCaptureMetadataBlocker(JSONObject json) {
         if (!json.optBoolean("available", false)) {
-            return "draft frame rejected: exposure metadata unavailable";
+            return "source frame rejected: exposure metadata unavailable";
         }
         String[] positiveFields = {
                 "sensorExposureTimeNs",
@@ -2053,7 +2102,7 @@ final class SpherifyLibrary {
         };
         for (String field : positiveFields) {
             if (json.isNull(field) || json.optDouble(field, 0.0) <= 0.0) {
-                return "draft frame rejected: missing " + field;
+                return "source frame rejected: missing " + field;
             }
         }
         String[] requiredStateFields = {
@@ -2065,7 +2114,7 @@ final class SpherifyLibrary {
         };
         for (String field : requiredStateFields) {
             if (json.isNull(field)) {
-                return "draft frame rejected: missing " + field;
+                return "source frame rejected: missing " + field;
             }
         }
         return null;

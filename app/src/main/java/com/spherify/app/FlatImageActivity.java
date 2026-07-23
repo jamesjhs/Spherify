@@ -57,6 +57,15 @@ public class FlatImageActivity extends Activity {
         imageView.setAdjustViewBounds(true);
         imageView.setForegroundGravity(Gravity.CENTER);
         setContentView(imageView);
+        imageView.setOnApplyWindowInsetsListener((view, insets) -> {
+            view.setPadding(
+                    insets.getSystemWindowInsetLeft(),
+                    insets.getSystemWindowInsetTop(),
+                    insets.getSystemWindowInsetRight(),
+                    insets.getSystemWindowInsetBottom());
+            return insets;
+        });
+        imageView.requestApplyInsets();
 
         String imagePath = getIntent().getStringExtra(EXTRA_IMAGE_PATH);
         if (imagePath != null) {

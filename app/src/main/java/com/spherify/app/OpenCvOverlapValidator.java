@@ -41,7 +41,8 @@ final class OpenCvOverlapValidator {
             File candidateFile,
             CandidateQualityReport quality,
             List<CaptureFrameRecord> predictedNeighbors,
-            int candidateTargetPitchDegrees) {
+            int candidateTargetPitchDegrees,
+            boolean allowNoOverlapAnchorFrame) {
         JSONArray predicted = new JSONArray();
         for (CaptureFrameRecord neighbor : predictedNeighbors) {
             predicted.put(neighbor.id);
@@ -49,7 +50,7 @@ final class OpenCvOverlapValidator {
         if (!quality.pass) {
             return rejected(quality, predicted, "not_run", 0, -1.0, "quality gate", quality.rejectionReason);
         }
-        if (predictedNeighbors.isEmpty()) {
+        if (predictedNeighbors.isEmpty() && allowNoOverlapAnchorFrame) {
             return new CandidateAnalysisResult(
                     true,
                     quality,
@@ -62,6 +63,9 @@ final class OpenCvOverlapValidator {
                     "",
                     "",
                     new JSONArray());
+        }
+        if (predictedNeighbors.isEmpty()) {
+            return rejected(quality, predicted, "not_run", 0, -1.0, "no predicted overlap", "Weak overlap");
         }
         if (!initOpenCv()) {
             return rejected(quality, predicted, "opencv_unavailable", 0, -1.0, "OpenCV unavailable", "Could not align");
@@ -234,6 +238,7 @@ final class OpenCvOverlapValidator {
         Mat inlierMask = new Mat();
         MatOfPoint2f candidateMat = new MatOfPoint2f();
         MatOfPoint2f neighborMat = new MatOfPoint2f();
+        MatOfPoint2f projectedCandidateMat = new MatOfPoint2f();
         try {
             ORB orb = ORB.create(ORB_FEATURES);
             orb.detectAndCompute(candidateGray, new Mat(), candidateKeypoints, candidateDescriptors);
@@ -276,20 +281,23 @@ final class OpenCvOverlapValidator {
                 homography.release();
                 return null;
             }
+            Core.perspectiveTransform(candidateMat, projectedCandidateMat, homography);
             homography.release();
             byte[] mask = new byte[(int) inlierMask.total()];
             inlierMask.get(0, 0, mask);
+            Point[] projectedPoints = projectedCandidateMat.toArray();
             int inliers = 0;
             double residualTotal = 0.0;
             JSONArray controlPoints = new JSONArray();
-            for (int i = 0; i < mask.length && i < candidateControl.size(); i++) {
+            for (int i = 0; i < mask.length && i < candidateControl.size() && i < projectedPoints.length; i++) {
                 if (mask[i] == 0) {
                     continue;
                 }
                 Point left = candidateControl.get(i);
                 Point right = neighborControl.get(i);
-                double dx = right.x - left.x;
-                double dy = right.y - left.y;
+                Point projected = projectedPoints[i];
+                double dx = right.x - projected.x;
+                double dy = right.y - projected.y;
                 residualTotal += Math.sqrt(dx * dx + dy * dy);
                 inliers++;
                 if (controlPoints.length() < 24) {
@@ -315,6 +323,7 @@ final class OpenCvOverlapValidator {
             inlierMask.release();
             candidateMat.release();
             neighborMat.release();
+            projectedCandidateMat.release();
         }
     }
 

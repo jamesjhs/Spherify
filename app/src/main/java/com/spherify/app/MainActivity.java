@@ -15,8 +15,8 @@
  * and passes it to GLProjectionView. User adjustments update GLProjectionView.
  * Export asks GLProjectionView for a ProjectionExport, then SpherifyLibrary
  * stores the variant. Import uses Android photo/file picker Uris, then
- * SpherifyLibrary copies the selected image into the local library. Capture
- * starts CaptureActivity after camera permission. Gallery actions mutate
+ * SpherifyLibrary copies the selected image into the local library. Production
+ * capture starts the ARCore SharedCamera backend. Gallery actions mutate
  * LibraryItem records through SpherifyLibrary.
  *
  * External files/functions:
@@ -24,8 +24,7 @@
  * Opens Android photo picker or document picker for user imports.
  * Uses FileProvider to share/open local files outside the app.
  * Uses Android permissions for camera and location setup.
- * Uses Android SensorManager only for readiness summaries; live sensor reading
- * happens in CaptureActivity.
+ * Uses Android SensorManager only for readiness summaries.
  *
  * Imports/dependencies:
  * Android Activity/Dialog/Intent/View widgets build the UI programmatically.
@@ -79,7 +78,6 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
-import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -87,10 +85,8 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 
 import androidx.core.content.FileProvider;
 import androidx.core.content.ContextCompat;
@@ -101,6 +97,7 @@ public class MainActivity extends Activity {
     private static final int REQUEST_LOCATION_PERMISSION = 1003;
     private static final String PREFS = "spherify";
     private static final String PREF_SETUP_COMPLETE = "setupComplete";
+    private static final String PREF_LAST_INTEGRATED_MASTER_ID = "lastIntegratedMasterId";
     private static final String STATE_CURRENT_ITEM_ID = "currentItemId";
     private static final String STATE_PROJECTION_PREFIX = "projection.";
 
@@ -112,26 +109,10 @@ public class MainActivity extends Activity {
     private Button adjustButton;
     private Button exportButton;
     private AlertDialog activeLibraryDialog;
-    private AlertDialog activeStitchDialog;
-    private TextView activeStitchProgressView;
-    private TextView activeStitchLogView;
-    private ScrollView activeStitchScrollView;
-    private final java.util.ArrayDeque<String> activeStitchDebugLines = new java.util.ArrayDeque<>();
-    private Set<String> activeStitchCompletedSteps = new HashSet<>();
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
     private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
     private static final float GALLERY_DELETE_VERTICAL_SLOP = 90f;
-    private static final int STITCH_DEBUG_MAX_LINES = 90;
-    private static final String[][] STITCH_PROGRESS_STEPS = {
-            {"quality", "Stage 5A quality gate"},
-            {"input", "Session frame loading"},
-            {"lens", "Lens and pose-graph calibration"},
-            {"render", "Sharp master projection"},
-            {"write", "JPEG output"},
-            {"metadata", "Diagnostic metadata"},
-            {"library", "Library save"}
-    };
 
     /*
      * Function: onCreate
@@ -181,7 +162,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.4.1");
+        version.setText("0.4.2");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -309,7 +290,8 @@ public class MainActivity extends Activity {
      * Function: onRequestPermissionsResult
      * Arguments: requestCode identifies the permission request; permissions and
      * grantResults describe Android's response.
-     * Calls: super, Toast, startActivity(), showSensorSetup(), and
+     * Calls: super, Toast, launchSharedCameraCapture(),
+     * showSensorSetup(), and
      * showLocalStorageSetup().
      * Flow: continue the capture/setup branch that requested permission, or show
      * user feedback when camera/location permission is denied.
@@ -320,7 +302,7 @@ public class MainActivity extends Activity {
         if (requestCode == REQUEST_CAMERA_PERMISSION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 if (startCaptureAfterCameraPermission) {
-                    startActivity(new Intent(this, CaptureActivity.class));
+                    launchSharedCameraCapture();
                 } else {
                     showSensorSetup();
                 }
@@ -432,27 +414,20 @@ public class MainActivity extends Activity {
     /*
      * Function: showReadinessSetup
      * Arguments: none.
-     * Calls: AlertDialog.Builder, showSensorSetup(), and requestCameraSetup().
+     * Calls: AlertDialog.Builder, requestCameraSetup(), and
+     * showSensorSetup().
      * Flow: explain the major capture capabilities and let the user either grant
      * essentials first or walk through setup one item at a time.
      */
     private void showReadinessSetup() {
         new AlertDialog.Builder(this)
                 .setTitle("A few things make the sphere work")
-                .setMessage("Camera captures draft frames, motion sensors guide future capture, location can prepare map-ready images, and cloud publishing can be connected later.")
+                .setMessage("Camera and AR tracking create the source graph for PhotoSphere capture. Location can prepare map-ready images, and cloud publishing can be connected later.")
                 .setNegativeButton("Choose one by one", (dialog, which) -> showSensorSetup())
                 .setPositiveButton("Grant essentials", (dialog, which) -> requestCameraSetup())
                 .show();
     }
 
-    /*
-     * Function: requestCameraSetup
-     * Arguments: none.
-     * Calls: ContextCompat.checkSelfPermission(), AlertDialog.Builder,
-     * requestPermissions(), and showSensorSetup().
-     * Flow: if camera permission is already present, advance setup; otherwise
-     * explain why camera helps and request permission if the user agrees.
-     */
     private void requestCameraSetup() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -461,7 +436,7 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("Camera")
-                .setMessage("Camera access lets Spherify capture draft frames for PhotoSphere experiments.")
+                .setMessage("Camera access lets Spherify run the ARCore SharedCamera capture backend.")
                 .setNegativeButton("Skip for now", (dialog, which) -> showSensorSetup())
                 .setPositiveButton("Allow camera", (dialog, which) -> {
                     startCaptureAfterCameraPermission = false;
@@ -554,7 +529,7 @@ public class MainActivity extends Activity {
         markSetupComplete();
         new AlertDialog.Builder(this)
                 .setTitle("Ready to make a sphere")
-                .setMessage("Camera: " + permissionStatus(Manifest.permission.CAMERA)
+                .setMessage("Capture backend: ARCore SharedCamera pending"
                         + "\nMotion: " + sensorSummaryCompact()
                         + "\nLocal library: ready"
                         + "\nLocation: " + permissionStatus(Manifest.permission.ACCESS_FINE_LOCATION))
@@ -635,26 +610,30 @@ public class MainActivity extends Activity {
     /*
      * Function: startCaptureFlow
      * Arguments: none.
-     * Calls: ContextCompat.checkSelfPermission(), startActivity(),
+     * Calls: ContextCompat.checkSelfPermission(), launchSharedCameraCapture(),
      * AlertDialog.Builder, and requestPermissions().
-     * Flow: launch CaptureActivity immediately when camera permission exists, or
-     * request camera permission and remember to launch after approval.
+     * Flow: launch only the ARCore SharedCamera backend. The retired CameraX
+     * capture path is not reachable from production UI.
      */
     private void startCaptureFlow() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
-            startActivity(new Intent(this, CaptureActivity.class));
+            launchSharedCameraCapture();
             return;
         }
         new AlertDialog.Builder(this)
                 .setTitle("Allow camera")
-                .setMessage("Capture needs camera access. Imported images and saved variants still work without it.")
+                .setMessage("Capture needs camera access for ARCore SharedCamera tracking and Camera2 metadata.")
                 .setNegativeButton("Not now", null)
                 .setPositiveButton("Allow", (dialog, which) -> {
                     startCaptureAfterCameraPermission = true;
                     requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
                 })
                 .show();
+    }
+
+    private void launchSharedCameraCapture() {
+        startActivity(new Intent(this, SharedCameraCaptureActivity.class));
     }
 
     /*
@@ -1102,12 +1081,14 @@ public class MainActivity extends Activity {
     /*
      * Function: showBrowseFilters
      * Arguments: none.
-     * Calls: AlertDialog.Builder, showDraftFrames(), and showLibrary().
-     * Flow: present gallery filter choices and route the selection to either
-     * draft frame browsing or LibraryItem browsing.
+     * Calls: AlertDialog.Builder and showLibrary().
+     * Flow: present gallery filter choices for completed masters, imports, saved
+     * variants, and diagnostic capture sessions. Source frames are no longer a
+     * normal browse target because capture and spherification now complete in
+     * one workflow.
      */
     private void showBrowseFilters() {
-        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Pending", "Saved", "Draft Frames"};
+        String[] labels = {"All", "Masters", "Tiny Planets", "Imports", "Capture Sessions", "Saved"};
         String[] filters = {
                 LibraryItem.FILTER_ALL,
                 LibraryItem.FILTER_MASTERS,
@@ -1119,92 +1100,8 @@ public class MainActivity extends Activity {
 
         new AlertDialog.Builder(this)
                 .setTitle("Browse")
-                .setItems(labels, (dialog, which) -> {
-                    if (which == 6) {
-                        showDraftFrames();
-                    } else {
-                        showLibrary(filters[which], labels[which]);
-                    }
-                })
+                .setItems(labels, (dialog, which) -> showLibrary(filters[which], labels[which]))
                 .show();
-    }
-
-    /*
-     * Function: showDraftFrames
-     * Arguments: none.
-     * Calls: library.listDraftFrames(), Toast, DraftFrameAdapter, ListView, and
-     * AlertDialog.Builder.
-     * Flow: list CameraX draft JPEGs captured by CaptureActivity, render them
-     * with the same tap/open and left-swipe deletion pattern used by gallery
-     * images, offer a confirmed bulk-remove action, and keep a dialog reference
-     * for empty-list dismissal.
-     */
-    private void showDraftFrames() {
-        List<File> drafts = library.listDraftFrames();
-        if (drafts.isEmpty()) {
-            Toast.makeText(this, "No draft frames captured yet", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        ListView listView = new ListView(this);
-        DraftFrameAdapter adapter = new DraftFrameAdapter(drafts);
-        listView.setAdapter(adapter);
-        listView.setDividerHeight(1);
-
-        activeLibraryDialog = new AlertDialog.Builder(this)
-                .setTitle("Draft Frames - swipe left to delete")
-                .setView(listView)
-                .setNegativeButton("Close", null)
-                .setPositiveButton("Remove All Drafts", null)
-                .show();
-        activeLibraryDialog
-                .getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(v -> confirmDeleteAllDraftFrames());
-        Toast.makeText(this, "Swipe left on a draft frame to delete it", Toast.LENGTH_SHORT).show();
-    }
-
-    /*
-     * Function: confirmDeleteAllDraftFrames
-     * Arguments: none.
-     * Calls: library.listDraftFrames(), AlertDialog.Builder, and
-     * deleteAllDraftFrames().
-     * Flow: ask for explicit confirmation before bulk-deleting raw draft frames,
-     * including the current count so the user understands the scope.
-     */
-    private void confirmDeleteAllDraftFrames() {
-        int count = library.listDraftFrames().size();
-        if (count == 0) {
-            Toast.makeText(this, "No draft frames to delete", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Remove all draft frames?")
-                .setMessage("This will delete " + count
-                        + " draft frame" + (count == 1 ? "" : "s")
-                        + " from app storage. This action cannot be undone.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Remove All", (dialog, which) -> deleteAllDraftFrames())
-                .show();
-    }
-
-    /*
-     * Function: deleteAllDraftFrames
-     * Arguments: none.
-     * Calls: library.deleteAllDraftFrames(), AlertDialog.dismiss(), and Toast.
-     * Flow: clear every draft JPEG and draft metadata row, close the draft list
-     * because it is now empty, and show a concise completion message.
-     */
-    private void deleteAllDraftFrames() {
-        try {
-            library.deleteAllDraftFrames();
-            if (activeLibraryDialog != null) {
-                activeLibraryDialog.dismiss();
-                activeLibraryDialog = null;
-            }
-            Toast.makeText(this, "All draft frames removed", Toast.LENGTH_SHORT).show();
-        } catch (IOException e) {
-            Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
     }
 
     /*
@@ -1290,53 +1187,20 @@ public class MainActivity extends Activity {
     }
 
     /*
-     * Function: openFlatViewer
-     * Arguments: file is a local image file, such as a draft frame.
-     * Calls: Intent constructor, Intent.putExtra(), and startActivity().
-     * Flow: launch FlatImageActivity directly so draft frames always open inside
-     * Spherify instead of being handed to an external Android image app.
-     */
-    private void openFlatViewer(File file) {
-        Intent intent = new Intent(this, FlatImageActivity.class);
-        intent.putExtra(FlatImageActivity.EXTRA_IMAGE_PATH, file.getAbsolutePath());
-        startActivity(intent);
-    }
-
-    /*
      * Function: showDraftSession
-     * Arguments: item is a first-class draft capture LibraryItem.
-     * Calls: library.listDraftFrames(), DraftFrameAdapter, AlertDialog, and
-     * stitchDraftSession().
-     * Flow: open only the frames that belong to the selected draft session, so
-     * draft captures behave like browseable library records instead of loose
-     * files, with a Spherify action to generate a validated OpenCV master.
+     * Arguments: item is the compatibility LibraryItem behind one capture
+     * session.
+     * Calls: showSessionDiagnostics().
+     * Flow: expose capture sessions only as diagnostics/recovery records. The
+     * production PhotoSphere is created inside SharedCameraCaptureActivity, so
+     * MainActivity must not offer a separate post-capture Spherify action.
      */
     private void showDraftSession(LibraryItem item) {
-        List<File> drafts = library.listDraftFrames(item.id);
-        if (drafts.isEmpty()) {
-            if (library.findCaptureSession(item.id) != null) {
-                showSessionDiagnostics(item);
-            } else {
-                Toast.makeText(this, "This draft has no remaining frames", Toast.LENGTH_SHORT).show();
-            }
+        if (library.findCaptureSession(item.id) == null) {
+            Toast.makeText(this, "This capture session has no diagnostic record", Toast.LENGTH_SHORT).show();
             return;
         }
-
-        ListView listView = new ListView(this);
-        DraftFrameAdapter adapter = new DraftFrameAdapter(drafts);
-        listView.setAdapter(adapter);
-        listView.setDividerHeight(1);
-
-        activeLibraryDialog = new AlertDialog.Builder(this)
-                .setTitle(item.title + " - swipe left to delete")
-                .setView(listView)
-                .setNegativeButton("Close", null)
-                .setNeutralButton("Diagnostics", (dialog, which) -> showSessionDiagnostics(item))
-                .setPositiveButton("Spherify", null)
-                .show();
-        activeLibraryDialog
-                .getButton(AlertDialog.BUTTON_POSITIVE)
-                .setOnClickListener(v -> preflightDraftSession(item));
+        showSessionDiagnostics(item);
     }
 
     private void showSessionDiagnostics(LibraryItem item) {
@@ -1347,209 +1211,17 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    private void preflightDraftSession(LibraryItem item) {
-        try {
-            SpherifyLibrary.DraftQualityReport report = library.assessDraftStitchQuality(item);
-            if (!report.pass) {
-                new AlertDialog.Builder(this)
-                        .setTitle("Capture quality gate")
-                        .setMessage(report.summary())
-                        .setPositiveButton("OK", null)
-                        .show();
-                return;
-            }
-            stitchDraftSession(item, "normal", "blended");
-        } catch (IOException e) {
-            showSpherifyFailure(e.getMessage());
-        }
-    }
-
-    /*
-     * Function: stitchDraftSession
-     * Arguments: item is the selected draft-session LibraryItem.
-     * Calls: showSpherifyingDialog(), SpherifyLibrary.createMasterFromDraftSession()
-     * on a background thread, loadCurrentItem(), and showStitchSummary().
-     * Flow: close the pending browser, show a verbose non-cancelable processing
-     * dialog, run the OpenCV stitch, then make the generated master current
-     * without deleting the pending capture.
-     */
-    private void stitchDraftSession(LibraryItem item, String movementSensitivity, String renderMode) {
-        if (activeLibraryDialog != null) {
-            activeLibraryDialog.dismiss();
-            activeLibraryDialog = null;
-        }
-        showSpherifyingDialog(item, movementSensitivity, renderMode);
-        new Thread(() -> {
-            try {
-                StitchMasterResult result = library.createMasterFromDraftSession(
-                        item,
-                        movementSensitivity,
-                        renderMode,
-                        (stepKey, complete, message) -> updateSpherifyingProgress(stepKey, complete, message));
-                runOnUiThread(() -> {
-                    if (isFinishing()) return;
-                    dismissSpherifyingDialog();
-                    currentItem = result.item;
-                    loadCurrentItem(null);
-                    showStitchSummary(result);
-                });
-            } catch (IOException e) {
-                runOnUiThread(() -> {
-                    if (isFinishing()) return;
-                    dismissSpherifyingDialog();
-                    showSpherifyFailure(e.getMessage());
-                });
-            }
-        }).start();
-    }
-
-    /*
-     * Function: showSpherifyingDialog
-     * Arguments: item names the pending capture; movementSensitivity labels the
-     * selected overlap rejection mode.
-     * Calls: AlertDialog.Builder and TextView setters.
-     * Flow: present a clear long-running status surface while the background
-     * Spherify job reads accepted graph frames, delegates solving/compositing
-     * to OpenCV, validates GPano requirements, and saves the result.
-     */
-    private void showSpherifyingDialog(LibraryItem item, String movementSensitivity, String renderMode) {
-        activeStitchCompletedSteps = new HashSet<>();
-        activeStitchDebugLines.clear();
-
-        activeStitchProgressView = new TextView(this);
-        activeStitchProgressView.setTextColor(0xFFE5E7EB);
-        activeStitchProgressView.setTextSize(12);
-        activeStitchProgressView.setLineSpacing(3, 1.0f);
-        activeStitchProgressView.setPadding(18, 14, 18, 12);
-        activeStitchProgressView.setBackgroundColor(0xFF101820);
-
-        activeStitchLogView = new TextView(this);
-        activeStitchLogView.setTextColor(0xFF7DFF9A);
-        activeStitchLogView.setTextSize(9);
-        activeStitchLogView.setLineSpacing(2, 1.0f);
-        activeStitchLogView.setPadding(18, 10, 18, 10);
-        activeStitchLogView.setBackgroundColor(0xFF07110A);
-        activeStitchLogView.setTypeface(android.graphics.Typeface.MONOSPACE);
-
-        activeStitchScrollView = new ScrollView(this);
-        activeStitchScrollView.setBackgroundColor(0xFF07110A);
-        activeStitchScrollView.addView(activeStitchLogView, new ScrollView.LayoutParams(
-                ScrollView.LayoutParams.MATCH_PARENT,
-                ScrollView.LayoutParams.WRAP_CONTENT));
-        activeStitchScrollView.setLayoutParams(new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(78)));
-
-        LinearLayout dialogContent = new LinearLayout(this);
-        dialogContent.setOrientation(LinearLayout.VERTICAL);
-        dialogContent.setBackgroundColor(0xFF07110A);
-        dialogContent.addView(activeStitchProgressView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-        dialogContent.addView(activeStitchScrollView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(78)));
-
-        appendSpherifyingDebug("$ spherify --version 0.4.1 --validated-graph --debug concise");
-        appendSpherifyingDebug("Preparing " + item.title);
-        appendSpherifyingDebug("Graph-readiness gate: strict");
-        appendSpherifyingDebug("Output: OpenCV native panorama with GPano validation");
-        appendSpherifyingDebug("Movement sensitivity: " + movementSensitivity);
-        appendSpherifyingDebug("Keep Spherify open while this finishes.");
-        renderSpherifyingProgress();
-
-        activeStitchDialog = new AlertDialog.Builder(this)
-                .setTitle("Spherifying...")
-                .setView(dialogContent)
-                .create();
-        activeStitchDialog.setCancelable(false);
-        activeStitchDialog.setCanceledOnTouchOutside(false);
-        activeStitchDialog.setOnCancelListener(null);
-        activeStitchDialog.show();
-    }
-
-    private void dismissSpherifyingDialog() {
-        if (activeStitchDialog != null) {
-            activeStitchDialog.dismiss();
-            activeStitchDialog = null;
-        }
-        activeStitchProgressView = null;
-        activeStitchLogView = null;
-        activeStitchScrollView = null;
-        activeStitchDebugLines.clear();
-    }
-
-    private void updateSpherifyingProgress(String stepKey, boolean complete, String message) {
-        runOnUiThread(() -> {
-            if (isFinishing() || activeStitchLogView == null) {
-                return;
-            }
-            if (complete) {
-                activeStitchCompletedSteps.add(stepKey);
-            }
-            appendSpherifyingDebug((complete ? "DONE  " : "WORK  ") + message);
-            renderSpherifyingProgress();
-        });
-    }
-
-    private void appendSpherifyingDebug(String message) {
-        activeStitchDebugLines.addLast(String.format(Locale.US, "%1$tH:%1$tM:%1$tS  %2$s", System.currentTimeMillis(), message));
-        while (activeStitchDebugLines.size() > STITCH_DEBUG_MAX_LINES) {
-            activeStitchDebugLines.removeFirst();
-        }
-    }
-
-    private void renderSpherifyingProgress() {
-        if (activeStitchProgressView == null || activeStitchLogView == null) {
-            return;
-        }
-        StringBuilder progress = new StringBuilder();
-        progress.append("Progress\n");
-        for (String[] step : STITCH_PROGRESS_STEPS) {
-            boolean complete = activeStitchCompletedSteps.contains(step[0]);
-            progress.append(complete ? "✓ " : "• ")
-                    .append(step[1])
-                    .append('\n');
-        }
-        activeStitchProgressView.setText(progress.toString());
-
-        StringBuilder message = new StringBuilder();
-        message.append("spherify@0.4.1:~$ ./graph-stitch --live\n");
-        for (String line : activeStitchDebugLines) {
-            message.append(line).append('\n');
-        }
-        activeStitchLogView.setText(message.toString());
-        ScrollView scrollView = activeStitchScrollView;
-        if (scrollView != null) {
-            scrollView.post(() -> {
-                if (scrollView.getParent() != null) {
-                    scrollView.fullScroll(View.FOCUS_DOWN);
-                }
-            });
-        }
-    }
-
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private void showSpherifyFailure(String message) {
-        new AlertDialog.Builder(this)
-                .setTitle("Spherify needs a better capture")
-                .setMessage(message == null || message.isEmpty()
-                        ? "The capture could not pass the stitch quality gate."
-                        : message)
-                .setPositiveButton("OK", null)
-                .show();
     }
 
     /*
      * Function: refreshLibraryAfterCapture
      * Arguments: none.
      * Calls: SpherifyLibrary.refresh() and updateLabels().
-     * Flow: MainActivity may resume after CaptureActivity has saved draft frames
-     * through a separate SpherifyLibrary instance. Reload metadata and reconcile
-     * Pending records so Browse immediately shows the new capture session.
+     * Flow: MainActivity may resume after the capture backend has written a
+     * master or diagnostic session through a separate SpherifyLibrary instance.
+     * Reload metadata so Browse immediately reflects the integrated result.
      */
     private void refreshLibraryAfterCapture() {
         if (library == null) {
@@ -1558,6 +1230,21 @@ public class MainActivity extends Activity {
         try {
             String currentId = currentItem == null ? "" : currentItem.id;
             library.refresh();
+            String integratedMasterId = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getString(PREF_LAST_INTEGRATED_MASTER_ID, "");
+            if (integratedMasterId != null && !integratedMasterId.isEmpty()) {
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit()
+                        .remove(PREF_LAST_INTEGRATED_MASTER_ID)
+                        .apply();
+                for (LibraryItem item : library.list(LibraryItem.FILTER_ALL)) {
+                    if (integratedMasterId.equals(item.id)) {
+                        currentItem = item;
+                        loadCurrentItem(null);
+                        return;
+                    }
+                }
+            }
             if (!currentId.isEmpty()) {
                 for (LibraryItem item : library.list(LibraryItem.FILTER_ALL)) {
                     if (currentId.equals(item.id)) {
@@ -1570,35 +1257,6 @@ public class MainActivity extends Activity {
         } catch (IOException e) {
             Toast.makeText(this, "Library refresh failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
-    }
-
-    /*
-     * Function: showStitchSummary
-     * Arguments: result contains the new master and public quality summary.
-     * Calls: AlertDialog.Builder and StringBuilder.
-     * Flow: tell the user what the first-pass pipeline rendered and identify
-     * known weak areas instead of treating every generated master as map-ready.
-     */
-    private void showStitchSummary(StitchMasterResult result) {
-        StringBuilder message = new StringBuilder();
-        message.append("Created ").append(result.item.title)
-                .append("\nFrames used: ").append(result.stitch.renderedFrames)
-                .append("\nEstimated coverage: ").append(result.stitch.coveragePercent).append("%")
-                .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames)
-                .append("\n\nPublic quality review: ").append(result.stitch.reviewState)
-                .append("\n").append(result.stitch.validationSummary)
-                .append("\n\nPublishing to Google Maps is not enabled from Spherify.");
-        if (!result.stitch.warnings.isEmpty()) {
-            message.append("\n\nWarnings:");
-            for (String warning : result.stitch.warnings) {
-                message.append("\n- ").append(warning);
-            }
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Graph master created")
-                .setMessage(message.toString())
-                .setPositiveButton("Open", null)
-                .show();
     }
 
     /*
@@ -1817,28 +1475,6 @@ public class MainActivity extends Activity {
     }
 
     /*
-     * Function: deleteDraftFrame
-     * Arguments: draft is the frame file; adapter/visibleDrafts back the list;
-     * swipedRow is the animated row to reset if deletion is canceled.
-     * Calls: AlertDialog.Builder, resetSwipedRow(), and performDraftDelete().
-     * Flow: mirror normal gallery deletion for draft frames, including a clear
-     * confirmation before removing local capture data.
-     */
-    private void deleteDraftFrame(
-            File draft,
-            BaseAdapter adapter,
-            List<File> visibleDrafts,
-            View swipedRow) {
-        new AlertDialog.Builder(this)
-                .setTitle("Delete draft frame")
-                .setMessage("Are you sure you want to delete? This action cannot be undone.\n\n" + draft.getName())
-                .setNegativeButton("Cancel", (dialog, which) -> resetSwipedRow(swipedRow))
-                .setOnCancelListener(dialog -> resetSwipedRow(swipedRow))
-                .setPositiveButton("Delete", (dialog, which) -> performDraftDelete(draft, adapter, visibleDrafts))
-                .show();
-    }
-
-    /*
      * Function: deleteGalleryItem
      * Arguments: item is the target; adapter refreshes the ListView; visibleItems
      * is the mutable list shown by the adapter; swipedRow is the animated row
@@ -1899,30 +1535,6 @@ public class MainActivity extends Activity {
                 loadCurrentItem(null);
             }
             Toast.makeText(this, "Deleted " + item.title, Toast.LENGTH_SHORT).show();
-        } catch (IOException e) {
-            Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
-    }
-
-    /*
-     * Function: performDraftDelete
-     * Arguments: draft is the file to remove; adapter and visibleDrafts keep the
-     * Draft Frames ListView synchronized.
-     * Calls: library.deleteDraftFrame(), adapter.notifyDataSetChanged(),
-     * AlertDialog.dismiss(), and Toast.
-     * Flow: remove the JPEG plus matching draft metadata, delete the row from
-     * the visible list, close the dialog if no drafts remain, and show feedback.
-     */
-    private void performDraftDelete(File draft, BaseAdapter adapter, List<File> visibleDrafts) {
-        try {
-            library.deleteDraftFrame(draft);
-            visibleDrafts.remove(draft);
-            adapter.notifyDataSetChanged();
-            if (visibleDrafts.isEmpty() && activeLibraryDialog != null) {
-                activeLibraryDialog.dismiss();
-                activeLibraryDialog = null;
-            }
-            Toast.makeText(this, "Deleted " + draft.getName(), Toast.LENGTH_SHORT).show();
         } catch (IOException e) {
             Toast.makeText(this, "Delete failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -2136,188 +1748,6 @@ public class MainActivity extends Activity {
 
         private static float clamp01(float value) {
             return Math.max(0f, Math.min(1f, value));
-        }
-    }
-
-    /*
-     * Class: DraftFrameAdapter
-     * Educational overview:
-     * Adapter that renders raw CameraX draft JPEG files in the Draft Frames
-     * browser. Drafts are not full LibraryItem records yet, but the user should
-     * still be able to inspect and delete them with the same list behavior as
-     * normal gallery images.
-     *
-     * Data flow:
-     * showDraftFrames() provides a mutable file list -> getView() renders each
-     * row -> tap opens the JPEG in FlatImageActivity -> left swipe calls deleteDraftFrame()
-     * -> performDraftDelete() mutates the same list and notifies this adapter.
-     *
-     * Key variables:
-     * drafts: mutable list currently visible in the Draft Frames dialog.
-     */
-    private final class DraftFrameAdapter extends BaseAdapter {
-        private final List<File> drafts;
-
-        /*
-         * Function: DraftFrameAdapter constructor
-         * Arguments: drafts is the visible draft-file list.
-         * Calls: no external functions.
-         * Flow: store the list reference so row rendering and deletion stay in
-         * sync with showDraftFrames().
-         */
-        DraftFrameAdapter(List<File> drafts) {
-            this.drafts = drafts;
-        }
-
-        /*
-         * Function: getCount
-         * Arguments: none.
-         * Calls: List.size().
-         * Flow: tell ListView how many draft rows to request.
-         */
-        @Override
-        public int getCount() {
-            return drafts.size();
-        }
-
-        /*
-         * Function: getItem
-         * Arguments: position is the row index requested by ListView.
-         * Calls: List.get().
-         * Flow: return the draft File for a row.
-         */
-        @Override
-        public File getItem(int position) {
-            return drafts.get(position);
-        }
-
-        /*
-         * Function: getItemId
-         * Arguments: position is the row index requested by ListView.
-         * Calls: no external functions.
-         * Flow: use the row position as a simple id for this in-memory draft
-         * dialog list.
-         */
-        @Override
-        public long getItemId(int position) {
-            return position;
-        }
-
-        /*
-         * Function: getView
-         * Arguments: position identifies the row; convertView is unused because
-         * this custom row is rebuilt; parent is the ListView container.
-         * Calls: getItem(), BitmapFactory.decodeFile(), openFlatViewer(),
-         * deleteDraftFrame(), and animation APIs.
-         * Flow: build a thumbnail/name/detail row layered over a red delete
-         * background, open on tap, reveal delete on left swipe, and confirm once
-         * the swipe passes the threshold.
-         */
-        @Override
-        public View getView(int position, View convertView, ViewGroup parent) {
-            File draft = getItem(position);
-            FrameLayout container = new FrameLayout(MainActivity.this);
-            container.setBackgroundColor(0xFFB91C1C);
-            container.setMinimumHeight(92);
-
-            TextView deleteLabel = new TextView(MainActivity.this);
-            deleteLabel.setText("Delete");
-            deleteLabel.setTextColor(0xFFFFFFFF);
-            deleteLabel.setTextSize(15);
-            deleteLabel.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
-            deleteLabel.setPadding(18, 0, 24, 0);
-            deleteLabel.setAlpha(0f);
-            container.addView(deleteLabel, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT));
-
-            LinearLayout row = new LinearLayout(MainActivity.this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(18, 10, 18, 10);
-            row.setBackgroundColor(0xFFFFFFFF);
-            row.setMinimumHeight(92);
-
-            ImageView thumbnail = new ImageView(MainActivity.this);
-            thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            Bitmap bitmap = BitmapFactory.decodeFile(draft.getAbsolutePath());
-            if (bitmap != null) {
-                thumbnail.setImageBitmap(bitmap);
-            }
-            LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(72, 72);
-            imageParams.setMargins(0, 0, 16, 0);
-            row.addView(thumbnail, imageParams);
-
-            LinearLayout labels = new LinearLayout(MainActivity.this);
-            labels.setOrientation(LinearLayout.VERTICAL);
-
-            TextView title = new TextView(MainActivity.this);
-            title.setText(draft.getName());
-            title.setTextColor(0xFF0F172A);
-            title.setTextSize(16);
-
-            TextView detail = new TextView(MainActivity.this);
-            detail.setText("Draft frame  |  " + draft.length() / 1024L + " KB");
-            detail.setTextColor(0xFF475569);
-            detail.setTextSize(12);
-
-            labels.addView(title);
-            labels.addView(detail);
-            row.addView(labels, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
-            container.addView(row, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT));
-
-            float[] downX = new float[1];
-            float[] downY = new float[1];
-            boolean[] swiping = new boolean[1];
-            boolean[] deleted = new boolean[1];
-            container.setOnTouchListener((view, event) -> {
-                switch (event.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        downX[0] = event.getRawX();
-                        downY[0] = event.getRawY();
-                        swiping[0] = false;
-                        deleted[0] = false;
-                        deleteLabel.setAlpha(0f);
-                        row.setAlpha(1f);
-                        row.setTranslationX(0f);
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        float dx = event.getRawX() - downX[0];
-                        float dy = event.getRawY() - downY[0];
-                        if (dx < 0 && Math.abs(dy) < GALLERY_DELETE_VERTICAL_SLOP) {
-                            swiping[0] = true;
-                            view.getParent().requestDisallowInterceptTouchEvent(true);
-                            row.setTranslationX(Math.max(dx, -GALLERY_DELETE_SWIPE_DISTANCE));
-                            deleteLabel.setAlpha(Math.min(1f, Math.max(0f, (-dx - 24f) / 80f)));
-                            if (!deleted[0] && dx <= -GALLERY_DELETE_SWIPE_DISTANCE) {
-                                deleted[0] = true;
-                                row.animate().translationX(-GALLERY_DELETE_SWIPE_DISTANCE).alpha(0.9f).setDuration(120).start();
-                                deleteDraftFrame(draft, DraftFrameAdapter.this, drafts, row);
-                            }
-                        }
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        float totalDx = event.getRawX() - downX[0];
-                        float totalDy = event.getRawY() - downY[0];
-                        if (!swiping[0] && !deleted[0]
-                                && Math.abs(totalDx) < 24f
-                                && Math.abs(totalDy) < 24f) {
-                            openFlatViewer(draft);
-                        } else if (!deleted[0]) {
-                            row.animate().translationX(0f).alpha(1f).setDuration(120).start();
-                            deleteLabel.animate().alpha(0f).setDuration(120).start();
-                        }
-                        return true;
-                    default:
-                        return true;
-                }
-            });
-            return container;
         }
     }
 

@@ -19,7 +19,7 @@
             android:name="com.google.ar.core"
             android:value="optional" />
         <activity
-            android:name=".CaptureActivity"
+            android:name=".SharedCameraCaptureActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
         <activity
