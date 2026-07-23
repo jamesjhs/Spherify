@@ -181,7 +181,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.6.1");
+        version.setText("0.7.4");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -1314,7 +1314,11 @@ public class MainActivity extends Activity {
     private void showDraftSession(LibraryItem item) {
         List<File> drafts = library.listDraftFrames(item.id);
         if (drafts.isEmpty()) {
-            Toast.makeText(this, "This draft has no remaining frames", Toast.LENGTH_SHORT).show();
+            if (library.findCaptureSession(item.id) != null) {
+                showSessionDiagnostics(item);
+            } else {
+                Toast.makeText(this, "This draft has no remaining frames", Toast.LENGTH_SHORT).show();
+            }
             return;
         }
 
@@ -1327,11 +1331,20 @@ public class MainActivity extends Activity {
                 .setTitle(item.title + " - swipe left to delete")
                 .setView(listView)
                 .setNegativeButton("Close", null)
+                .setNeutralButton("Diagnostics", (dialog, which) -> showSessionDiagnostics(item))
                 .setPositiveButton("Spherify", null)
                 .show();
         activeLibraryDialog
                 .getButton(AlertDialog.BUTTON_POSITIVE)
                 .setOnClickListener(v -> preflightDraftSession(item));
+    }
+
+    private void showSessionDiagnostics(LibraryItem item) {
+        new AlertDialog.Builder(this)
+                .setTitle("Session Diagnostics")
+                .setMessage(library.describeCaptureSessionDiagnostics(item.id))
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     private void preflightDraftSession(LibraryItem item) {
@@ -1345,7 +1358,7 @@ public class MainActivity extends Activity {
                         .show();
                 return;
             }
-            stitchDraftSession(item, "normal", "strongest");
+            stitchDraftSession(item, "normal", "blended");
         } catch (IOException e) {
             showSpherifyFailure(e.getMessage());
         }
@@ -1437,10 +1450,10 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(78)));
 
-        appendSpherifyingDebug("$ spherify --phase 5A --debug verbose");
+        appendSpherifyingDebug("$ spherify --version 0.7.4 --graph-seam-blend --debug verbose");
         appendSpherifyingDebug("Preparing " + item.title);
-        appendSpherifyingDebug("Capture quality gate: strict");
-        appendSpherifyingDebug("Output: sharp source-selected master");
+        appendSpherifyingDebug("Graph-readiness gate: strict");
+        appendSpherifyingDebug("Output: optimized 2:1 equirectangular master");
         appendSpherifyingDebug("Movement sensitivity: " + movementSensitivity);
         appendSpherifyingDebug("Keep Spherify open while this finishes.");
         renderSpherifyingProgress();
@@ -1501,7 +1514,7 @@ public class MainActivity extends Activity {
         activeStitchProgressView.setText(progress.toString());
 
         StringBuilder message = new StringBuilder();
-        message.append("spherify@phase5:~$ ./stitch --live\n");
+        message.append("spherify@0.7.4:~$ ./graph-stitch --live\n");
         for (String line : activeStitchDebugLines) {
             message.append(line).append('\n');
         }
@@ -1571,7 +1584,10 @@ public class MainActivity extends Activity {
         message.append("Created ").append(result.item.title)
                 .append("\nFrames used: ").append(result.stitch.renderedFrames)
                 .append("\nEstimated coverage: ").append(result.stitch.coveragePercent).append("%")
-                .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames);
+                .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames)
+                .append("\n\nPublic quality review: ").append(result.stitch.reviewState)
+                .append("\n").append(result.stitch.validationSummary)
+                .append("\n\nPublishing to Google Maps or Google Photos is not enabled from Spherify.");
         if (!result.stitch.warnings.isEmpty()) {
             message.append("\n\nWarnings:");
             for (String warning : result.stitch.warnings) {
@@ -1579,7 +1595,7 @@ public class MainActivity extends Activity {
             }
         }
         new AlertDialog.Builder(this)
-                .setTitle("Phase 5 master created")
+                .setTitle("Graph master created")
                 .setMessage(message.toString())
                 .setPositiveButton("Open", null)
                 .show();

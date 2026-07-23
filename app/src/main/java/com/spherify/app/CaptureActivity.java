@@ -70,6 +70,7 @@ import android.hardware.camera2.TotalCaptureResult;
 import android.location.Location;
 import android.location.LocationManager;
 import android.media.Image;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.util.Rational;
@@ -119,8 +120,11 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -315,9 +319,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private long latestArFrameTimestampNs;
     private long latestArMetadataTimestampNs;
     private long latestArDebugLogAt;
+    private long latestSessionReadinessWriteAt;
+    private long candidateFeedbackUntil;
     private String latestArTrackingState = "unknown";
     private String latestArMetadataFailure = "";
     private String latestArMetadataFieldSummary = "";
+    private String latestCandidateFeedback = "";
     private final LinkedHashMap<Long, String> captureMetadataByTimestamp = new LinkedHashMap<>();
     private String captureProfile = CAPTURE_PROFILE_HANDHELD;
     private Bitmap latestArPreviewBitmap;
@@ -332,6 +339,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private byte[] yuvNv21Buffer;
     private java.io.ByteArrayOutputStream yuvJpegStream;
     private int[] featherPixelBuffer;
+    private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor();
+    private final CandidateQualityScorer candidateQualityScorer = new CandidateQualityScorer();
+    private final OpenCvOverlapValidator overlapValidator = new OpenCvOverlapValidator();
     private final CameraCaptureSession.CaptureCallback camera2CaptureCallback =
             new CameraCaptureSession.CaptureCallback() {
                 @Override
@@ -378,6 +388,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
             rotationVector = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         }
+        ensureCaptureSessionRecord();
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -499,6 +510,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         verifyArCoreSupport();
         startArCoreCapture();
         updateCompassUi();
+        persistCaptureSessionReadiness(false);
         root.post(this::showHorizonSweepInstructions);
     }
 
@@ -543,6 +555,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        captureExecutor.shutdownNow();
         synchronized (arFrameLock) {
             if (latestArPreviewBitmap != null) {
                 latestArPreviewBitmap.recycle();
@@ -1972,6 +1985,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             return;
         }
         boolean ready = isCaptureSetupReady();
+        persistCaptureSessionReadiness(captureInProgress);
         if (compassStatusText != null) {
             setViewText(compassStatusText, String.format(
                     Locale.US,
@@ -2009,7 +2023,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     horizonPitchProgress());
         }
         if (statusText != null) {
-            if (!arCoreReady) {
+            if (System.currentTimeMillis() < candidateFeedbackUntil && latestCandidateFeedback != null && !latestCandidateFeedback.isEmpty()) {
+                setViewText(statusText, latestCandidateFeedback);
+            } else if (!arCoreReady) {
                 setViewText(statusText, "ARCore required");
             } else if (!compassCalibrationComplete) {
                 setViewText(statusText, calibrationStarted
@@ -2024,6 +2040,73 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             }
         }
         updateGuideState();
+    }
+
+    private void ensureCaptureSessionRecord() {
+        try {
+            CaptureSessionRecord session = library.ensureCaptureSession(
+                    sessionId,
+                    CaptureMode.fromStorageValue(captureProfile),
+                    buildReadinessSnapshot());
+            if (session != null && !session.id.equals(sessionId)) {
+                sessionId = session.id;
+                capturePrefs.edit().putString(PREF_ACTIVE_SESSION_ID, sessionId).apply();
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "could not create capture-session record", e);
+        }
+    }
+
+    private void persistCaptureSessionReadiness(boolean capturing) {
+        long now = System.currentTimeMillis();
+        if (now - latestSessionReadinessWriteAt < 1500L && !capturing) {
+            return;
+        }
+        latestSessionReadinessWriteAt = now;
+        try {
+            library.updateCaptureSessionReadiness(sessionId, buildReadinessSnapshot(), capturing);
+        } catch (IOException e) {
+            Log.w(TAG, "could not update capture-session readiness", e);
+        }
+    }
+
+    private JSONObject buildReadinessSnapshot() {
+        JSONObject json = new JSONObject();
+        try {
+            JSONObject exposure = latestCaptureReadyMetadataJson == null
+                    ? null
+                    : new JSONObject(latestCaptureReadyMetadataJson);
+            boolean exposureMetadataReady = exposure != null && exposure.optBoolean("available", false);
+            boolean intrinsicsReady = exposureMetadataReady
+                    && exposure.optDouble("imageFocalLengthXPixels", 0.0) > 0.0
+                    && exposure.optDouble("imageFocalLengthYPixels", 0.0) > 0.0
+                    && exposure.optInt("imageIntrinsicsWidth", 0) > 0
+                    && exposure.optInt("imageIntrinsicsHeight", 0) > 0;
+            json.put("cameraPermission", ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                    == PackageManager.PERMISSION_GRANTED);
+            json.put("arCoreTracking", arCoreReady && "TRACKING".equals(latestArTrackingState));
+            json.put("gyroRotationVectorStable", gyroscope != null
+                    && rotationVector != null
+                    && hasHeadingReading
+                    && hasPitchRollReading
+                    && stabilityProgress() >= 0.75f);
+            json.put("cameraIntrinsicsAvailable", intrinsicsReady || cameraSensorPhysicalSize != null);
+            json.put("storageAvailable", getFilesDir() != null && getFilesDir().getUsableSpace() > 64L * 1024L * 1024L);
+            json.put("locationOptional", ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED
+                    || ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED);
+            json.put("exposureFocusLockStatus", exposureMetadataReady
+                    ? ("AE " + exposure.optString("aeState", "unknown")
+                    + ", AWB " + exposure.optString("awbState", "unknown")
+                    + ", AF " + exposure.optString("afState", "unknown"))
+                    : "waiting for capture metadata");
+            json.put("captureProfile", captureProfile);
+            json.put("deviceCameraId", Build.MANUFACTURER + " " + Build.MODEL);
+        } catch (JSONException ignored) {
+            // Leave partial readiness facts in place; diagnostics can still show them.
+        }
+        return json;
     }
 
     private static void setViewText(TextView view, String text) {
@@ -2514,7 +2597,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 (horizonBin + 0.5f) * 360f / HORIZON_REFERENCE_BIN_COUNT
                         - horizonStartHeadingDegrees));
         int targetPitchDegrees = 0;
-        new Thread(() -> {
+        captureExecutor.submit(() -> {
             byte[] uprightJpeg = orientCapturedJpegUpright(jpeg);
             try (FileOutputStream output = new FileOutputStream(outputFile)) {
                 output.write(uprightJpeg);
@@ -2535,7 +2618,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 // Best-effort cleanup of an incomplete horizon keyframe.
                 outputFile.delete();
             }
-        }).start();
+        });
     }
 
     /*
@@ -5055,7 +5138,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 : relativeSweepYawDegrees(compassHeadingDegrees);
         float recordedPitchDegrees = isPolarLayer(sweepLayerIndex) ? targetPitchDegrees : pitchDegrees;
         float recordedRollDegrees = isPolarLayer(sweepLayerIndex) ? targetYawDegrees : rollDegrees;
-        new Thread(() -> {
+        double recordedYawRate = keyframeYawRateDegreesPerSecond;
+        double recordedPitchRate = keyframePitchRateDegreesPerSecond;
+        double recordedRollRate = keyframeRollRateDegreesPerSecond;
+        captureExecutor.submit(() -> {
             byte[] uprightJpeg = orientCapturedJpegUpright(packet.jpeg);
             try (FileOutputStream output = new FileOutputStream(outputFile)) {
                 output.write(uprightJpeg);
@@ -5072,7 +5158,33 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             }
             try {
                 String location = readLocationSummary();
-                library.recordDraftFrame(
+                CandidateQualityReport quality = candidateQualityScorer.score(
+                        outputFile,
+                        recordedYawRate,
+                        recordedPitchRate,
+                        recordedRollRate);
+                List<CaptureFrameRecord> predictedNeighbors = library.predictedAcceptedNeighbors(
+                        sessionId,
+                        targetYawDegrees,
+                        targetPitchDegrees);
+                CandidateAnalysisResult analysis;
+                if (quality.pass && predictedNeighbors.isEmpty() && library.acceptedFrameCount(sessionId) > 0) {
+                    analysis = new CandidateAnalysisResult(
+                            false,
+                            quality,
+                            new org.json.JSONArray(),
+                            "not_run_no_predicted_overlap",
+                            0,
+                            -1.0,
+                            0.0,
+                            "target has no accepted neighbor within expected overlap",
+                            "Weak overlap",
+                            "",
+                            new org.json.JSONArray());
+                } else {
+                    analysis = overlapValidator.analyze(outputFile, quality, predictedNeighbors);
+                }
+                library.recordAnalyzedCandidateFrame(
                         outputFile,
                         sessionId,
                         location,
@@ -5083,46 +5195,68 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                         targetPitchDegrees,
                         manualBlockCapture ? "manual-block" : captureMode,
                         captureProfile,
-                        packet.exposureJson);
+                        packet.exposureJson,
+                        analysis);
                 runOnUiThread(() -> {
                     captureInProgress = false;
-                    sweepCaptureBins[sweepLayerIndex][sweepBin] = true;
-                    if (previewStrip != null
-                            && sweepLayerIndex > 0
-                            && sweepLayerIndex < sweepCapturePreviewFrames.length) {
-                        if (sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] != null) {
-                            sweepCapturePreviewFrames[sweepLayerIndex][sweepBin].recycle();
+                    if (analysis.accepted) {
+                        sweepCaptureBins[sweepLayerIndex][sweepBin] = true;
+                        if (previewStrip != null
+                                && sweepLayerIndex > 0
+                                && sweepLayerIndex < sweepCapturePreviewFrames.length) {
+                            if (sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] != null) {
+                                sweepCapturePreviewFrames[sweepLayerIndex][sweepBin].recycle();
+                            }
+                            sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] = previewStrip;
+                            updateSweepLayerPreviewPanorama();
+                        } else if (previewStrip != null) {
+                            previewStrip.recycle();
                         }
-                        sweepCapturePreviewFrames[sweepLayerIndex][sweepBin] = previewStrip;
-                        updateSweepLayerPreviewPanorama();
-                    } else if (previewStrip != null) {
-                        previewStrip.recycle();
+                        lastCapturedSweepLayerIndex = sweepLayerIndex;
+                        lastCapturedSweepBin = sweepBin;
+                        latestCandidateFeedback = analysis.inlierCount > 0
+                                ? "Accepted - overlap valid"
+                                : "Accepted - first frame";
+                        candidateFeedbackUntil = System.currentTimeMillis() + 2600L;
+                        statusText.setText(latestCandidateFeedback);
+                        if (!"sweep-auto".equals(captureMode) && !"polar-auto".equals(captureMode)) {
+                            Toast.makeText(CaptureActivity.this, "Candidate accepted", Toast.LENGTH_SHORT).show();
+                        }
+                    } else {
+                        if (previewStrip != null) {
+                            previewStrip.recycle();
+                        }
+                        latestCandidateFeedback = analysis.rejectionReason == null || analysis.rejectionReason.isEmpty()
+                                ? "Needs recapture"
+                                : analysis.rejectionReason;
+                        candidateFeedbackUntil = System.currentTimeMillis() + 4200L;
+                        statusText.setText(latestCandidateFeedback);
+                        if (!"sweep-auto".equals(captureMode) && !"polar-auto".equals(captureMode)) {
+                            Toast.makeText(CaptureActivity.this, latestCandidateFeedback, Toast.LENGTH_LONG).show();
+                        }
                     }
-                    lastCapturedSweepLayerIndex = sweepLayerIndex;
-                    lastCapturedSweepBin = sweepBin;
-                    statusText.setText("Slice painted");
                     updateCompassUi();
                     updateGuideState();
-                    if (!"sweep-auto".equals(captureMode) && !"polar-auto".equals(captureMode)) {
-                        Toast.makeText(CaptureActivity.this, "Sweep slice saved", Toast.LENGTH_SHORT).show();
-                    }
                 });
-                Log.d(TAG, "capture commit saved mode=" + captureMode
+                Log.d(TAG, "candidate analyzed mode=" + captureMode
                         + " layer=" + sweepLayerIndex
                         + " bin=" + sweepBin
+                        + " accepted=" + analysis.accepted
+                        + " reason=" + analysis.rejectionReason
+                        + " ransac=" + analysis.opencvRansacResult
+                        + " inliers=" + analysis.inlierCount
                         + " file=" + outputFile.getAbsolutePath());
             } catch (IOException e) {
-                outputFile.delete();
                 runOnUiThread(() -> {
                     captureInProgress = false;
                     Toast.makeText(
                             CaptureActivity.this,
-                            "Metadata failed: " + e.getMessage(),
+                        "Metadata failed: " + e.getMessage(),
                             Toast.LENGTH_LONG).show();
                 });
                 Log.w(TAG, "capture metadata write failed", e);
             }
-        }).start();
+        });
     }
 
     /*

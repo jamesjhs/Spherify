@@ -73,8 +73,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 final class SpherifyLibrary {
     private static final int THUMBNAIL_SIZE = 320;
@@ -87,6 +89,7 @@ final class SpherifyLibrary {
     private final File thumbnailsDir;
     private final File metadataFile;
     private final File draftMetadataFile;
+    private final File captureSessionsFile;
     private final ArrayList<LibraryItem> items = new ArrayList<>();
 
     interface ProgressReporter {
@@ -109,9 +112,10 @@ final class SpherifyLibrary {
         thumbnailsDir = new File(root, "thumbnails");
         metadataFile = new File(root, "metadata.json");
         draftMetadataFile = new File(root, "drafts.json");
+        captureSessionsFile = new File(root, "capture-sessions.json");
         ensureDirs();
         load();
-        if (reconcileDraftSessionItems()) {
+        if (reconcileCaptureSessionItems() | reconcileDraftSessionItems()) {
             save();
         }
     }
@@ -312,7 +316,7 @@ final class SpherifyLibrary {
     List<LibraryItem> list(String filter) {
         ArrayList<LibraryItem> result = new ArrayList<>();
         for (LibraryItem item : items) {
-            if (item.imageFile().exists() && item.matchesFilter(filter)) {
+            if ((item.imageFile().exists() || isRecoverableCaptureSessionItem(item)) && item.matchesFilter(filter)) {
                 result.add(item);
             }
         }
@@ -330,9 +334,148 @@ final class SpherifyLibrary {
      */
     void refresh() throws IOException {
         load();
-        if (reconcileDraftSessionItems()) {
+        if (reconcileCaptureSessionItems() | reconcileDraftSessionItems()) {
             save();
         }
+    }
+
+    CaptureSessionRecord createCaptureSession(CaptureMode captureMode, JSONObject readiness) throws IOException {
+        long now = System.currentTimeMillis();
+        String id = newId(now);
+        CaptureSessionRecord session = new CaptureSessionRecord(
+                id,
+                "Capture Session " + compactSessionLabel(id),
+                now,
+                now,
+                captureMode == null ? CaptureMode.HAND_HELD : captureMode,
+                readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW,
+                false,
+                readiness,
+                new ArrayList<>(),
+                new ArrayList<>());
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        sessions.add(session);
+        writeCaptureSessions(sessions);
+        upsertCaptureSessionItem(session, null);
+        return session;
+    }
+
+    CaptureSessionRecord ensureCaptureSession(String sessionId, CaptureMode captureMode, JSONObject readiness) throws IOException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return createCaptureSession(captureMode, readiness);
+        }
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        for (CaptureSessionRecord session : sessions) {
+            if (sessionId.equals(session.id)) {
+                session.captureMode = captureMode == null ? session.captureMode : captureMode;
+                session.readiness = readiness == null ? session.readiness : readiness;
+                if (session.status == SessionStatus.NEW && readinessPasses(session.readiness)) {
+                    session.status = SessionStatus.READY;
+                }
+                session.updatedAt = System.currentTimeMillis();
+                writeCaptureSessions(sessions);
+                upsertCaptureSessionItem(session, firstExistingFrame(session));
+                return session;
+            }
+        }
+        long now = System.currentTimeMillis();
+        CaptureSessionRecord session = new CaptureSessionRecord(
+                sessionId,
+                "Capture Session " + compactSessionLabel(sessionId),
+                now,
+                now,
+                captureMode == null ? CaptureMode.HAND_HELD : captureMode,
+                readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW,
+                false,
+                readiness,
+                new ArrayList<>(),
+                new ArrayList<>());
+        sessions.add(session);
+        writeCaptureSessions(sessions);
+        upsertCaptureSessionItem(session, null);
+        return session;
+    }
+
+    void updateCaptureSessionReadiness(String sessionId, JSONObject readiness, boolean capturing) throws IOException {
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        boolean changed = false;
+        for (CaptureSessionRecord session : sessions) {
+            if (session.id.equals(sessionId)) {
+                session.readiness = readiness == null ? new JSONObject() : readiness;
+                if (capturing) {
+                    session.status = SessionStatus.CAPTURING;
+                } else if (session.status == SessionStatus.NEW
+                        || session.status == SessionStatus.READY
+                        || session.status == SessionStatus.CAPTURING) {
+                    session.status = readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW;
+                }
+                session.updatedAt = System.currentTimeMillis();
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            writeCaptureSessions(sessions);
+        }
+    }
+
+    CaptureSessionRecord findCaptureSession(String sessionId) {
+        for (CaptureSessionRecord session : readCaptureSessions()) {
+            if (session.id.equals(sessionId)) {
+                return session;
+            }
+        }
+        return null;
+    }
+
+    String describeCaptureSessionDiagnostics(String sessionId) {
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        if (session == null) {
+            return "No 0.7.1 capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
+        }
+        StringBuilder message = new StringBuilder();
+        message.append("Format: 0.7.1 capture session")
+                .append("\nSession: ").append(session.id)
+                .append("\nMode: ").append(session.captureMode.label)
+                .append("\nStatus: ").append(session.status.storageValue)
+                .append("\nDiagnostic Spherify: ").append(session.diagnosticSpherifyAllowed ? "allowed" : "off")
+                .append("\nFrames: source ").append(session.countFrames(CaptureFrameRole.SOURCE))
+                .append(", candidates ").append(session.countFrames(CaptureFrameRole.CANDIDATE))
+                .append(", accepted ").append(session.countFrames(CaptureFrameRole.ACCEPTED))
+                .append(", rejected ").append(session.countFrames(CaptureFrameRole.REJECTED))
+                .append("\nGraph edges: ").append(session.graphEdges.size())
+                .append("\n\nReadiness\n")
+                .append(formatJsonObject(session.readiness));
+        if (session.frames.isEmpty()) {
+            message.append("\n\nFrames\nNo frames recorded yet. Missing targets are the unpainted guide positions.");
+            return message.toString();
+        }
+        message.append("\n\nFrames");
+        for (CaptureFrameRecord frame : session.frames) {
+            message.append("\n\n").append(frame.id)
+                    .append(" [").append(frame.role.storageValue).append("]")
+                    .append("\nRaw path: ").append(frame.rawFacts.filePath)
+                    .append("\nRaw target: yaw ").append(frame.rawFacts.targetYawDegrees)
+                    .append(", pitch ").append(frame.rawFacts.targetPitchDegrees)
+                    .append("\nRaw pose: yaw ").append(formatOne(frame.rawFacts.capturedYawDegrees))
+                    .append(", pitch ").append(formatOne(frame.rawFacts.capturedPitchDegrees))
+                    .append(", roll ").append(formatOne(frame.rawFacts.capturedRollDegrees))
+                    .append("\nRaw location: ").append(emptyAsMissing(frame.rawFacts.locationSummary))
+                    .append("\nRaw intrinsics: ").append(frame.rawFacts.intrinsics.optBoolean("available", false) ? "available" : "missing")
+                    .append("\nRaw exposure/focus/WB: ").append(frame.rawFacts.exposure.optBoolean("available", false) ? "available" : "missing")
+                    .append("\nAnalysis blur/exposure/texture: ")
+                    .append(formatScore(frame.analysisFacts.blurScore)).append(" / ")
+                    .append(formatScore(frame.analysisFacts.exposureScore)).append(" / ")
+                    .append(formatScore(frame.analysisFacts.textureScore))
+                    .append("\nAnalysis overlap: ").append(frame.analysisFacts.predictedOverlapSet.length())
+                    .append(" predicted, RANSAC ").append(frame.analysisFacts.opencvRansacResult)
+                    .append(", inliers ").append(frame.analysisFacts.inlierCount)
+                    .append(", residual ").append(formatScore(frame.analysisFacts.residualScore))
+                    .append(", confidence ").append(formatScore(frame.analysisFacts.confidence))
+                    .append("\nWeak/recapture hint: ").append(emptyAsMissing(frame.analysisFacts.parallaxRiskHint))
+                    .append("\nRejection: ").append(emptyAsMissing(frame.analysisFacts.rejectionReason));
+        }
+        return message.toString();
     }
 
     /*
@@ -490,6 +633,14 @@ final class SpherifyLibrary {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
             throw new IOException("select a draft session first");
         }
+        CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
+        if (captureSession == null) {
+            throw new IOException("Spherify 0.7.3 requires a validated capture graph; this older draft session has no graph record.");
+        }
+        GraphReadinessReport graphReadiness = validateCaptureGraphReadiness(captureSession);
+        if (!graphReadiness.pass) {
+            throw new IOException(graphReadiness.failureMessage());
+        }
         report(progress, "quality", false, "Running Stage 5A input session integrity checks");
         List<DraftFrameRecord> records = listDraftFrameRecords(draftSession.id);
         if (records.isEmpty()) {
@@ -500,17 +651,19 @@ final class SpherifyLibrary {
             throw new IOException(qualityReport.failureMessage());
         }
         report(progress, "quality", true, String.format(
-                "Quality gate passed: %d frames, pose %d/%d, intrinsics %d/%d",
+                "Quality and graph gates passed: %d frames, pose %d/%d, intrinsics %d/%d, graph edges %d/%d",
                 qualityReport.readableFrames,
                 qualityReport.poseFrames,
                 qualityReport.readableFrames,
                 qualityReport.intrinsicsFrames,
-                qualityReport.readableFrames));
+                qualityReport.readableFrames,
+                graphReadiness.acceptedEdges,
+                graphReadiness.totalEdges));
 
         long now = System.currentTimeMillis();
         String id = newId(now);
         File imageFile = new File(mastersDir, id + ".jpg");
-        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity, renderMode, progress);
+        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(captureSession, imageFile, movementSensitivity, renderMode, progress);
         report(progress, "library", false, "Creating thumbnail and library master record");
         File thumbnailFile = makeThumbnail(imageFile, id);
         LibraryItem item = new LibraryItem(
@@ -540,7 +693,88 @@ final class SpherifyLibrary {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
             throw new IOException("select a draft session first");
         }
-        return validateDraftStitchQuality(listDraftFrameRecords(draftSession.id));
+        DraftQualityReport draftQuality = validateDraftStitchQuality(listDraftFrameRecords(draftSession.id));
+        CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
+        GraphReadinessReport graphQuality = captureSession == null
+                ? GraphReadinessReport.missingSession()
+                : validateCaptureGraphReadiness(captureSession);
+        return draftQuality.withGraphReadiness(graphQuality);
+    }
+
+    private static GraphReadinessReport validateCaptureGraphReadiness(CaptureSessionRecord session) {
+        if (session == null) {
+            return GraphReadinessReport.missingSession();
+        }
+        ArrayList<String> acceptedFrameIds = new ArrayList<>();
+        for (CaptureFrameRecord frame : session.frames) {
+            if (frame.role == CaptureFrameRole.ACCEPTED && new File(frame.rawFacts.filePath).exists()) {
+                acceptedFrameIds.add(frame.id);
+            }
+        }
+        ArrayList<String> blockers = new ArrayList<>();
+        if (acceptedFrameIds.size() < 3) {
+            blockers.add("graph needs at least 3 readable accepted frames; found " + acceptedFrameIds.size());
+        }
+        HashMap<String, Integer> componentIndexes = new HashMap<>();
+        for (String frameId : acceptedFrameIds) {
+            componentIndexes.put(frameId, componentIndexes.size());
+        }
+        int acceptedEdges = 0;
+        int rejectedEdges = 0;
+        for (CaptureGraphEdgeRecord edge : session.graphEdges) {
+            if (!componentIndexes.containsKey(edge.fromFrameId) || !componentIndexes.containsKey(edge.toFrameId)) {
+                rejectedEdges++;
+                continue;
+            }
+            if (!graphEdgeLooksSolvable(edge)) {
+                rejectedEdges++;
+                continue;
+            }
+            acceptedEdges++;
+            union(componentIndexes, edge.fromFrameId, edge.toFrameId);
+        }
+        if (acceptedEdges < Math.max(2, acceptedFrameIds.size() - 1)) {
+            blockers.add("graph is too sparse after filtering; usable edges " + acceptedEdges + "/" + session.graphEdges.size());
+        }
+        String root = acceptedFrameIds.isEmpty() ? "" : find(componentIndexes, acceptedFrameIds.get(0));
+        for (String frameId : acceptedFrameIds) {
+            if (!root.equals(find(componentIndexes, frameId))) {
+                blockers.add("accepted frame graph is disconnected after weak/parallax edges are removed");
+                break;
+            }
+        }
+        return new GraphReadinessReport(blockers.isEmpty(), acceptedFrameIds.size(), session.graphEdges.size(), acceptedEdges, rejectedEdges, blockers);
+    }
+
+    private static boolean graphEdgeLooksSolvable(CaptureGraphEdgeRecord edge) {
+        if (edge.confidence < 0.18 || edge.inlierCount < 8 || edge.controlPoints.length() < 4) {
+            return false;
+        }
+        if (edge.residualScore > 80.0) {
+            return false;
+        }
+        String parallax = edge.parallaxRiskHint.toLowerCase(Locale.US);
+        return !parallax.contains("high") && !parallax.contains("near-object");
+    }
+
+    private static void union(HashMap<String, Integer> componentIndexes, String first, String second) {
+        Integer firstComponent = componentIndexes.get(first);
+        Integer secondComponent = componentIndexes.get(second);
+        if (firstComponent == null || secondComponent == null || firstComponent.equals(secondComponent)) {
+            return;
+        }
+        int replacement = Math.min(firstComponent, secondComponent);
+        int removed = Math.max(firstComponent, secondComponent);
+        for (Map.Entry<String, Integer> entry : componentIndexes.entrySet()) {
+            if (entry.getValue() == removed) {
+                entry.setValue(replacement);
+            }
+        }
+    }
+
+    private static String find(HashMap<String, Integer> componentIndexes, String frameId) {
+        Integer component = componentIndexes.get(frameId);
+        return component == null ? "" : String.valueOf(component);
     }
 
     private static DraftQualityReport validateDraftStitchQuality(List<DraftFrameRecord> records) {
@@ -654,6 +888,7 @@ final class SpherifyLibrary {
         final boolean handheld;
         final List<String> blockers;
         final List<String> warnings;
+        final GraphReadinessReport graphReadiness;
 
         DraftQualityReport(
                 boolean pass,
@@ -682,6 +917,56 @@ final class SpherifyLibrary {
             this.handheld = handheld;
             this.blockers = blockers;
             this.warnings = warnings;
+            this.graphReadiness = null;
+        }
+
+        private DraftQualityReport(
+                boolean pass,
+                int readableFrames,
+                int poseFrames,
+                int intrinsicsFrames,
+                int movingOrManualFrames,
+                int horizonFrames,
+                int upper30Frames,
+                int lower30Frames,
+                int upperHighFrames,
+                int lowerHighFrames,
+                boolean handheld,
+                List<String> blockers,
+                List<String> warnings,
+                GraphReadinessReport graphReadiness) {
+            this.pass = pass && (graphReadiness == null || graphReadiness.pass);
+            this.readableFrames = readableFrames;
+            this.poseFrames = poseFrames;
+            this.intrinsicsFrames = intrinsicsFrames;
+            this.movingOrManualFrames = movingOrManualFrames;
+            this.horizonFrames = horizonFrames;
+            this.upper30Frames = upper30Frames;
+            this.lower30Frames = lower30Frames;
+            this.upperHighFrames = upperHighFrames;
+            this.lowerHighFrames = lowerHighFrames;
+            this.handheld = handheld;
+            this.blockers = blockers;
+            this.warnings = warnings;
+            this.graphReadiness = graphReadiness;
+        }
+
+        DraftQualityReport withGraphReadiness(GraphReadinessReport graphReadiness) {
+            return new DraftQualityReport(
+                    pass,
+                    readableFrames,
+                    poseFrames,
+                    intrinsicsFrames,
+                    movingOrManualFrames,
+                    horizonFrames,
+                    upper30Frames,
+                    lower30Frames,
+                    upperHighFrames,
+                    lowerHighFrames,
+                    handheld,
+                    blockers,
+                    warnings,
+                    graphReadiness);
         }
 
         String failureMessage() {
@@ -691,6 +976,9 @@ final class SpherifyLibrary {
             }
             for (String blocker : blockers) {
                 message.append("; ").append(blocker);
+            }
+            if (graphReadiness != null && !graphReadiness.pass) {
+                message.append("; ").append(graphReadiness.failureMessage());
             }
             return message.toString();
         }
@@ -705,9 +993,22 @@ final class SpherifyLibrary {
                     .append(", -30 ").append(lower30Frames)
                     .append(", +65 ").append(upperHighFrames)
                     .append(", -65 ").append(lowerHighFrames);
+            if (graphReadiness != null) {
+                message.append("\nGraph: frames ").append(graphReadiness.acceptedFrames)
+                        .append(", usable edges ").append(graphReadiness.acceptedEdges)
+                        .append("/")
+                        .append(graphReadiness.totalEdges)
+                        .append(", rejected ").append(graphReadiness.rejectedEdges);
+            }
             if (!blockers.isEmpty()) {
                 message.append("\n\nBlockers:");
                 for (String blocker : blockers) {
+                    message.append("\n- ").append(blocker);
+                }
+            }
+            if (graphReadiness != null && !graphReadiness.blockers.isEmpty()) {
+                message.append(blockers.isEmpty() ? "\n\nBlockers:" : "");
+                for (String blocker : graphReadiness.blockers) {
                     message.append("\n- ").append(blocker);
                 }
             }
@@ -716,6 +1017,44 @@ final class SpherifyLibrary {
                 for (String warning : warnings) {
                     message.append("\n- ").append(warning);
                 }
+            }
+            return message.toString();
+        }
+    }
+
+    static final class GraphReadinessReport {
+        final boolean pass;
+        final int acceptedFrames;
+        final int totalEdges;
+        final int acceptedEdges;
+        final int rejectedEdges;
+        final List<String> blockers;
+
+        GraphReadinessReport(
+                boolean pass,
+                int acceptedFrames,
+                int totalEdges,
+                int acceptedEdges,
+                int rejectedEdges,
+                List<String> blockers) {
+            this.pass = pass;
+            this.acceptedFrames = acceptedFrames;
+            this.totalEdges = totalEdges;
+            this.acceptedEdges = acceptedEdges;
+            this.rejectedEdges = rejectedEdges;
+            this.blockers = blockers;
+        }
+
+        static GraphReadinessReport missingSession() {
+            ArrayList<String> blockers = new ArrayList<>();
+            blockers.add("Spherify 0.7.3 requires a validated capture graph; no capture-session record was found");
+            return new GraphReadinessReport(false, 0, 0, 0, 0, blockers);
+        }
+
+        String failureMessage() {
+            StringBuilder message = new StringBuilder("graph-readiness gate failed");
+            for (String blocker : blockers) {
+                message.append("; ").append(blocker);
             }
             return message.toString();
         }
@@ -774,6 +1113,7 @@ final class SpherifyLibrary {
         } catch (JSONException e) {
             throw new IOException("could not reset draft metadata", e);
         }
+        writeCaptureSessions(new ArrayList<>());
         items.removeIf(item -> LibraryItem.TYPE_DRAFT_SESSION.equals(item.type));
         save();
     }
@@ -895,14 +1235,536 @@ final class SpherifyLibrary {
             json.put("exposure", exposure);
             array.put(json);
             writeDraftMetadata(array);
+            recordCaptureSessionFrame(
+                    imageFile,
+                    sessionId,
+                    locationSummary,
+                    headingDegrees,
+                    pitchDegrees,
+                    rollDegrees,
+                    targetYawDegrees,
+                    targetPitchDegrees,
+                    captureMode,
+                    captureProfile,
+                    exposure,
+                    now);
             upsertDraftSessionItem(imageFile, sessionId, now);
         } catch (JSONException e) {
             throw new IOException("could not write draft metadata", e);
         }
     }
 
+    List<CaptureFrameRecord> predictedAcceptedNeighbors(String sessionId, int targetYawDegrees, int targetPitchDegrees) {
+        ArrayList<CaptureFrameRecord> neighbors = new ArrayList<>();
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        if (session == null) {
+            return neighbors;
+        }
+        for (CaptureFrameRecord frame : session.frames) {
+            if (frame.role != CaptureFrameRole.ACCEPTED) {
+                continue;
+            }
+            File file = new File(frame.rawFacts.filePath);
+            if (!file.exists()) {
+                continue;
+            }
+            float yawDelta = Math.abs(signedHeadingDelta(targetYawDegrees, frame.rawFacts.targetYawDegrees));
+            float pitchDelta = Math.abs(targetPitchDegrees - frame.rawFacts.targetPitchDegrees);
+            if (pitchDelta <= 42f && yawDelta <= 70f) {
+                neighbors.add(frame);
+            }
+        }
+        Collections.sort(neighbors, (left, right) -> {
+            float leftScore = Math.abs(signedHeadingDelta(targetYawDegrees, left.rawFacts.targetYawDegrees))
+                    + Math.abs(targetPitchDegrees - left.rawFacts.targetPitchDegrees) * 1.5f;
+            float rightScore = Math.abs(signedHeadingDelta(targetYawDegrees, right.rawFacts.targetYawDegrees))
+                    + Math.abs(targetPitchDegrees - right.rawFacts.targetPitchDegrees) * 1.5f;
+            return Float.compare(leftScore, rightScore);
+        });
+        if (neighbors.size() > 4) {
+            return new ArrayList<>(neighbors.subList(0, 4));
+        }
+        return neighbors;
+    }
+
+    int acceptedFrameCount(String sessionId) {
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        return session == null ? 0 : session.countFrames(CaptureFrameRole.ACCEPTED);
+    }
+
+    void recordAnalyzedCandidateFrame(
+            File imageFile,
+            String sessionId,
+            String locationSummary,
+            float headingDegrees,
+            float pitchDegrees,
+            float rollDegrees,
+            int targetYawDegrees,
+            int targetPitchDegrees,
+            String captureMode,
+            String captureProfile,
+            String exposureJson,
+            CandidateAnalysisResult result) throws IOException {
+        long now = System.currentTimeMillis();
+        try {
+            JSONObject exposure = parseExposureJson(exposureJson);
+            String metadataBlocker = requiredCaptureMetadataBlocker(exposure);
+            CandidateAnalysisResult finalResult = result;
+            if (metadataBlocker != null) {
+                CandidateQualityReport quality = new CandidateQualityReport(false, 0.0, 0.0, 0.0, "Metadata incomplete");
+                finalResult = new CandidateAnalysisResult(
+                        false,
+                        quality,
+                        new JSONArray(),
+                        "metadata_incomplete",
+                        0,
+                        -1.0,
+                        0.0,
+                        metadataBlocker,
+                        "Metadata incomplete",
+                        "",
+                        new JSONArray());
+            }
+            CaptureRawFacts rawFacts = buildRawFacts(
+                    imageFile,
+                    locationSummary,
+                    headingDegrees,
+                    pitchDegrees,
+                    rollDegrees,
+                    targetYawDegrees,
+                    targetPitchDegrees,
+                    captureProfile,
+                    exposure,
+                    now);
+            ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+            CaptureSessionRecord session = findOrCreateSession(
+                    sessions,
+                    sessionId,
+                    CaptureMode.fromStorageValue(captureProfile),
+                    now);
+            String frameId = "frame-" + friendlyDateLabel(now) + "-" + session.frames.size();
+            session.frames.add(new CaptureFrameRecord(
+                    frameId + "-candidate",
+                    sessionId,
+                    CaptureFrameRole.CANDIDATE,
+                    rawFacts,
+                    finalResult.toAnalysisFacts()));
+            if (finalResult.accepted) {
+                session.frames.add(new CaptureFrameRecord(
+                        frameId + "-source",
+                        sessionId,
+                        CaptureFrameRole.SOURCE,
+                        rawFacts,
+                        finalResult.toAnalysisFacts()));
+                session.frames.add(new CaptureFrameRecord(
+                        frameId + "-accepted",
+                        sessionId,
+                        CaptureFrameRole.ACCEPTED,
+                        rawFacts,
+                        finalResult.toAnalysisFacts()));
+                if (!finalResult.acceptedNeighborFrameId.isEmpty()) {
+                    session.graphEdges.add(new CaptureGraphEdgeRecord(
+                            "edge-" + frameId,
+                            sessionId,
+                            finalResult.acceptedNeighborFrameId,
+                            frameId + "-accepted",
+                            finalResult.inlierCount,
+                            finalResult.residualScore,
+                            finalResult.confidence,
+                            finalResult.parallaxRiskHint,
+                            finalResult.controlPoints));
+                }
+                appendDraftMetadata(
+                        imageFile,
+                        sessionId,
+                        locationSummary,
+                        headingDegrees,
+                        pitchDegrees,
+                        rollDegrees,
+                        targetYawDegrees,
+                        targetPitchDegrees,
+                        captureMode,
+                        captureProfile,
+                        exposure,
+                        now);
+                session.status = session.countFrames(CaptureFrameRole.ACCEPTED) >= 3
+                        ? SessionStatus.CAPTURE_COMPLETE
+                        : SessionStatus.CAPTURING;
+            } else {
+                session.frames.add(new CaptureFrameRecord(
+                        frameId + "-rejected",
+                        sessionId,
+                        CaptureFrameRole.REJECTED,
+                        rawFacts,
+                        finalResult.toAnalysisFacts()));
+                session.status = SessionStatus.NEEDS_RECAPTURE;
+            }
+            session.updatedAt = now;
+            writeCaptureSessions(sessions);
+            upsertCaptureSessionItem(session, imageFile);
+        } catch (JSONException e) {
+            throw new IOException("could not write candidate metadata", e);
+        }
+    }
+
+    private void recordCaptureSessionFrame(
+            File imageFile,
+            String sessionId,
+            String locationSummary,
+            float headingDegrees,
+            float pitchDegrees,
+            float rollDegrees,
+            int targetYawDegrees,
+            int targetPitchDegrees,
+            String captureMode,
+            String captureProfile,
+            JSONObject exposure,
+            long now) throws IOException, JSONException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        CaptureSessionRecord target = null;
+        for (CaptureSessionRecord session : sessions) {
+            if (sessionId.equals(session.id)) {
+                target = session;
+                break;
+            }
+        }
+        if (target == null) {
+            target = new CaptureSessionRecord(
+                    sessionId,
+                    "Capture Session " + compactSessionLabel(sessionId),
+                    now,
+                    now,
+                    CaptureMode.fromStorageValue(captureProfile),
+                    SessionStatus.CAPTURING,
+                    false,
+                    new JSONObject(),
+                    new ArrayList<>(),
+                    new ArrayList<>());
+            sessions.add(target);
+        }
+        JSONObject intrinsics = new JSONObject();
+        intrinsics.put("available", exposure != null
+                && exposure.optDouble("imageFocalLengthXPixels", 0.0) > 0.0
+                && exposure.optDouble("imageFocalLengthYPixels", 0.0) > 0.0
+                && exposure.optInt("imageIntrinsicsWidth", 0) > 0
+                && exposure.optInt("imageIntrinsicsHeight", 0) > 0);
+        intrinsics.put("focalLengthXPixels", exposure == null ? 0.0 : exposure.optDouble("imageFocalLengthXPixels", 0.0));
+        intrinsics.put("focalLengthYPixels", exposure == null ? 0.0 : exposure.optDouble("imageFocalLengthYPixels", 0.0));
+        intrinsics.put("principalPointXPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointXPixels", 0.0));
+        intrinsics.put("principalPointYPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointYPixels", 0.0));
+        intrinsics.put("width", exposure == null ? 0 : exposure.optInt("imageIntrinsicsWidth", 0));
+        intrinsics.put("height", exposure == null ? 0 : exposure.optInt("imageIntrinsicsHeight", 0));
+
+        String frameId = "frame-" + friendlyDateLabel(now) + "-" + target.frames.size();
+        CaptureRawFacts rawFacts = new CaptureRawFacts(
+                imageFile.getAbsolutePath(),
+                now,
+                targetYawDegrees,
+                targetPitchDegrees,
+                headingDegrees,
+                pitchDegrees,
+                rollDegrees,
+                true,
+                intrinsics,
+                exposure,
+                locationSummary,
+                normalizeCaptureProfile(captureProfile),
+                Build.MANUFACTURER + " " + Build.MODEL,
+                "");
+        target.frames.add(new CaptureFrameRecord(
+                frameId + "-source",
+                sessionId,
+                CaptureFrameRole.SOURCE,
+                rawFacts,
+                CaptureAnalysisFacts.placeholder()));
+        target.frames.add(new CaptureFrameRecord(
+                frameId + "-candidate",
+                sessionId,
+                CaptureFrameRole.CANDIDATE,
+                rawFacts,
+                CaptureAnalysisFacts.placeholder()));
+        target.status = SessionStatus.CANDIDATE_PENDING_ANALYSIS;
+        target.updatedAt = now;
+        writeCaptureSessions(sessions);
+    }
+
+    private CaptureSessionRecord findOrCreateSession(
+            ArrayList<CaptureSessionRecord> sessions,
+            String sessionId,
+            CaptureMode captureMode,
+            long now) {
+        for (CaptureSessionRecord session : sessions) {
+            if (sessionId.equals(session.id)) {
+                return session;
+            }
+        }
+        CaptureSessionRecord session = new CaptureSessionRecord(
+                sessionId,
+                "Capture Session " + compactSessionLabel(sessionId),
+                now,
+                now,
+                captureMode == null ? CaptureMode.HAND_HELD : captureMode,
+                SessionStatus.CAPTURING,
+                false,
+                new JSONObject(),
+                new ArrayList<>(),
+                new ArrayList<>());
+        sessions.add(session);
+        return session;
+    }
+
+    private CaptureRawFacts buildRawFacts(
+            File imageFile,
+            String locationSummary,
+            float headingDegrees,
+            float pitchDegrees,
+            float rollDegrees,
+            int targetYawDegrees,
+            int targetPitchDegrees,
+            String captureProfile,
+            JSONObject exposure,
+            long now) throws JSONException {
+        JSONObject intrinsics = new JSONObject();
+        intrinsics.put("available", exposure != null
+                && exposure.optDouble("imageFocalLengthXPixels", 0.0) > 0.0
+                && exposure.optDouble("imageFocalLengthYPixels", 0.0) > 0.0
+                && exposure.optInt("imageIntrinsicsWidth", 0) > 0
+                && exposure.optInt("imageIntrinsicsHeight", 0) > 0);
+        intrinsics.put("focalLengthXPixels", exposure == null ? 0.0 : exposure.optDouble("imageFocalLengthXPixels", 0.0));
+        intrinsics.put("focalLengthYPixels", exposure == null ? 0.0 : exposure.optDouble("imageFocalLengthYPixels", 0.0));
+        intrinsics.put("principalPointXPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointXPixels", 0.0));
+        intrinsics.put("principalPointYPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointYPixels", 0.0));
+        intrinsics.put("width", exposure == null ? 0 : exposure.optInt("imageIntrinsicsWidth", 0));
+        intrinsics.put("height", exposure == null ? 0 : exposure.optInt("imageIntrinsicsHeight", 0));
+        return new CaptureRawFacts(
+                imageFile.getAbsolutePath(),
+                now,
+                targetYawDegrees,
+                targetPitchDegrees,
+                headingDegrees,
+                pitchDegrees,
+                rollDegrees,
+                true,
+                intrinsics,
+                exposure,
+                locationSummary,
+                normalizeCaptureProfile(captureProfile),
+                Build.MANUFACTURER + " " + Build.MODEL,
+                "");
+    }
+
+    private void appendDraftMetadata(
+            File imageFile,
+            String sessionId,
+            String locationSummary,
+            float headingDegrees,
+            float pitchDegrees,
+            float rollDegrees,
+            int targetYawDegrees,
+            int targetPitchDegrees,
+            String captureMode,
+            String captureProfile,
+            JSONObject exposure,
+            long now) throws IOException, JSONException {
+        JSONArray array = readDraftMetadataOrThrow();
+        JSONObject json = new JSONObject();
+        json.put("path", imageFile.getAbsolutePath());
+        json.put("sessionId", sessionId == null ? "" : sessionId);
+        json.put("createdAt", now);
+        json.put("location", locationSummary == null ? "" : locationSummary);
+        json.put("headingDegrees", headingDegrees);
+        json.put("pitchDegrees", pitchDegrees);
+        json.put("rollDegrees", rollDegrees);
+        json.put("targetYawDegrees", targetYawDegrees);
+        json.put("targetPitchDegrees", targetPitchDegrees);
+        json.put("captureMode", captureMode == null ? "manual" : captureMode);
+        json.put("captureProfile", normalizeCaptureProfile(captureProfile));
+        json.put("exposure", exposure);
+        array.put(json);
+        writeDraftMetadata(array);
+    }
+
+    private ArrayList<CaptureSessionRecord> readCaptureSessions() {
+        ArrayList<CaptureSessionRecord> sessions = new ArrayList<>();
+        if (!captureSessionsFile.exists()) {
+            return sessions;
+        }
+        try (FileInputStream input = new FileInputStream(captureSessionsFile)) {
+            byte[] data = new byte[(int) captureSessionsFile.length()];
+            int read = input.read(data);
+            if (read <= 0) {
+                return sessions;
+            }
+            JSONArray array = new JSONArray(new String(data, 0, read, StandardCharsets.UTF_8));
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject json = array.optJSONObject(i);
+                if (json != null) {
+                    CaptureSessionRecord session = CaptureSessionRecord.fromJson(json);
+                    if (!session.id.isEmpty()) {
+                        sessions.add(session);
+                    }
+                }
+            }
+        } catch (IOException | JSONException ignored) {
+            return new ArrayList<>();
+        }
+        return sessions;
+    }
+
+    private void writeCaptureSessions(List<CaptureSessionRecord> sessions) throws IOException {
+        JSONArray array = new JSONArray();
+        try {
+            for (CaptureSessionRecord session : sessions) {
+                array.put(session.toJson());
+            }
+            try (FileOutputStream output = new FileOutputStream(captureSessionsFile)) {
+                output.write(array.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (JSONException e) {
+            throw new IOException("could not write capture-session metadata", e);
+        }
+    }
+
+    private boolean reconcileCaptureSessionItems() {
+        boolean changed = false;
+        for (CaptureSessionRecord session : readCaptureSessions()) {
+            LibraryItem existing = findDraftSessionItem(session.id);
+            File firstFrame = firstExistingFrame(session);
+            if (existing == null) {
+                items.add(new LibraryItem(
+                        session.id,
+                        session.title,
+                        LibraryItem.TYPE_DRAFT_SESSION,
+                        "capture_0_7_1",
+                        "capture_session",
+                        "",
+                        firstFrame == null ? "" : firstFrame.getAbsolutePath(),
+                        firstFrame == null ? "" : firstFrame.getAbsolutePath(),
+                        session.createdAt,
+                        session.updatedAt));
+                changed = true;
+            } else {
+                if (!"capture_0_7_1".equals(existing.source)) {
+                    existing.title = session.title;
+                    changed = true;
+                }
+                if (firstFrame != null && !existing.imageFile().exists()) {
+                    existing.imagePath = firstFrame.getAbsolutePath();
+                    existing.thumbnailPath = firstFrame.getAbsolutePath();
+                    changed = true;
+                }
+                if (session.updatedAt > existing.updatedAt) {
+                    existing.updatedAt = session.updatedAt;
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    private void upsertCaptureSessionItem(CaptureSessionRecord session, File representativeFrame) throws IOException {
+        LibraryItem existing = findDraftSessionItem(session.id);
+        String framePath = representativeFrame == null ? "" : representativeFrame.getAbsolutePath();
+        if (existing == null) {
+            items.add(new LibraryItem(
+                    session.id,
+                    session.title,
+                    LibraryItem.TYPE_DRAFT_SESSION,
+                    "capture_0_7_1",
+                    "capture_session",
+                    "",
+                    framePath,
+                    framePath,
+                    session.createdAt,
+                    session.updatedAt));
+        } else {
+            existing.title = session.title;
+            if (!framePath.isEmpty()) {
+                existing.imagePath = framePath;
+                existing.thumbnailPath = framePath;
+            }
+            existing.updatedAt = session.updatedAt;
+        }
+        save();
+    }
+
+    private File firstExistingFrame(CaptureSessionRecord session) {
+        for (CaptureFrameRecord frame : session.frames) {
+            File file = new File(frame.rawFacts.filePath);
+            if (file.exists()) {
+                return file;
+            }
+        }
+        return null;
+    }
+
+    private boolean isRecoverableCaptureSessionItem(LibraryItem item) {
+        return LibraryItem.TYPE_DRAFT_SESSION.equals(item.type) && findCaptureSession(item.id) != null;
+    }
+
+    private void removeCaptureSession(String sessionId) throws IOException {
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        boolean removed = false;
+        for (int i = sessions.size() - 1; i >= 0; i--) {
+            if (sessionId.equals(sessions.get(i).id)) {
+                sessions.remove(i);
+                removed = true;
+            }
+        }
+        if (removed) {
+            writeCaptureSessions(sessions);
+        }
+    }
+
+    private static boolean readinessPasses(JSONObject readiness) {
+        return readiness != null
+                && readiness.optBoolean("cameraPermission", false)
+                && readiness.optBoolean("arCoreTracking", false)
+                && readiness.optBoolean("gyroRotationVectorStable", false)
+                && readiness.optBoolean("cameraIntrinsicsAvailable", false)
+                && readiness.optBoolean("storageAvailable", false);
+    }
+
+    private static String formatJsonObject(JSONObject json) {
+        if (json == null || json.length() == 0) {
+            return "not captured";
+        }
+        StringBuilder result = new StringBuilder();
+        JSONArray names = json.names();
+        if (names == null) {
+            return "not captured";
+        }
+        for (int i = 0; i < names.length(); i++) {
+            String name = names.optString(i);
+            result.append(name).append(": ").append(json.opt(name)).append('\n');
+        }
+        return result.toString().trim();
+    }
+
+    private static String formatOne(float value) {
+        return String.format(Locale.US, "%.1f", value);
+    }
+
+    private static String formatScore(double value) {
+        return value < 0.0 ? "pending" : String.format(Locale.US, "%.2f", value);
+    }
+
+    private static String emptyAsMissing(String value) {
+        return value == null || value.isEmpty() ? "missing" : value;
+    }
+
+    private static float signedHeadingDelta(float target, float current) {
+        float delta = (target - current + 540f) % 360f - 180f;
+        return delta < -180f ? delta + 360f : delta;
+    }
+
     private static String normalizeCaptureProfile(String captureProfile) {
-        return "fixed_gimbal".equals(captureProfile) ? "fixed_gimbal" : "handheld";
+        return "fixed_gimbal".equals(captureProfile) || "tripod_phone_mount".equals(captureProfile)
+                ? "fixed_gimbal"
+                : "handheld";
     }
 
     /*
@@ -926,6 +1788,7 @@ final class SpherifyLibrary {
                 }
             }
             writeDraftMetadata(kept);
+            removeCaptureSession(sessionId);
             items.removeIf(item -> sessionId.equals(item.id)
                     && LibraryItem.TYPE_DRAFT_SESSION.equals(item.type));
             save();

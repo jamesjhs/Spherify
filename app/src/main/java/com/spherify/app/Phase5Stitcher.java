@@ -27,13 +27,18 @@ import org.opencv.core.Point;
 import org.opencv.features.BFMatcher;
 import org.opencv.features.ORB;
 import org.opencv.geometry.Geometry;
+import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -96,6 +101,33 @@ final class Phase5Stitcher {
             String movementSensitivityMode,
             String renderModeName,
             SpherifyLibrary.ProgressReporter progress) throws IOException {
+        return stitch(records, null, outputFile, movementSensitivityMode, renderModeName, progress);
+    }
+
+    static Result stitch(
+            CaptureSessionRecord graphSession,
+            File outputFile,
+            String movementSensitivityMode,
+            String renderModeName,
+            SpherifyLibrary.ProgressReporter progress) throws IOException {
+        if (graphSession == null) {
+            throw new IOException("Spherify 0.7.3 requires a validated capture graph");
+        }
+        report(progress, "input", false, "Loading accepted frames from validated capture graph " + graphSession.id);
+        ArrayList<DraftFrameRecord> records = acceptedDraftRecordsFromGraphSession(graphSession);
+        if (records.isEmpty()) {
+            throw new IOException("capture graph has no readable accepted frames");
+        }
+        return stitch(records, graphSession, outputFile, movementSensitivityMode, renderModeName, progress);
+    }
+
+    private static Result stitch(
+            List<DraftFrameRecord> records,
+            CaptureSessionRecord graphSession,
+            File outputFile,
+            String movementSensitivityMode,
+            String renderModeName,
+            SpherifyLibrary.ProgressReporter progress) throws IOException {
         report(progress, "input", false, "Loading draft frames from the selected session");
         ArrayList<DraftFrameRecord> usable = new ArrayList<>();
         for (DraftFrameRecord record : records) {
@@ -114,10 +146,12 @@ final class Phase5Stitcher {
         CaptureProfile captureProfile = CaptureProfile.from(usable);
         CameraLensPriors cameraLensPriors = CameraLensPriors.from(usable);
         report(progress, "lens", false, "Phase 5B camera priors: " + cameraLensPriors.summary(usable.size()));
-        Calibration calibration = calibrate(usable, movementSensitivity, captureProfile, progress);
+        Calibration calibration = graphSession == null
+                ? calibrate(usable, movementSensitivity, captureProfile, progress)
+                : calibrateGraphSession(usable, graphSession, captureProfile, progress);
         report(progress, "lens", true, String.format(
                 Locale.US,
-                "Lens model ready: %.1f x %.1f FOV, matched overlaps %d (%d OpenCV)",
+                "Optimized lens model ready: %.1f x %.1f FOV, matched overlaps %d (%d OpenCV)",
                 calibration.lensModel.horizontalFovDegrees,
                 calibration.lensModel.verticalFovDegrees,
                 calibration.matchedOverlapCount,
@@ -128,11 +162,16 @@ final class Phase5Stitcher {
         float[] green = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         float[] blue = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         float[] weights = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
+        int[] seamSource = new int[OUTPUT_WIDTH * OUTPUT_HEIGHT];
+        float[] seamScores = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         boolean[][] coverage = new boolean[COVERAGE_ROWS][COVERAGE_COLUMNS];
+        SeamFinder seamFinder = new SeamFinder(calibration);
         int rendered = 0;
         int missingExposure = 0;
 
-        report(progress, "render", false, "Projecting sharp source-selected frames into the master");
+        report(progress, "render", false, renderMode.diagnostic
+                ? "Projecting diagnostic frame-selection render from optimized poses"
+                : "Projecting optimized frames into the equirectangular master");
         for (DraftFrameRecord record : usable) {
             Bitmap frame = decodeFrame(record.imageFile);
             if (frame == null) {
@@ -155,7 +194,10 @@ final class Phase5Stitcher {
                     red,
                     green,
                     blue,
-                    weights);
+                    weights,
+                    seamSource,
+                    seamScores,
+                    seamFinder);
             frame.recycle();
             rendered++;
             if (rendered == 1 || rendered == usable.size() || rendered % 5 == 0) {
@@ -167,9 +209,22 @@ final class Phase5Stitcher {
             throw new IOException("could not decode any draft frames");
         }
         report(progress, "render", true, "Projected " + rendered + " frames into the master");
+        SeamReport seamReport = seamFinder.report(seamScores);
+        report(progress, "render", true, "Selected seams: low-confidence penalties "
+                + seamReport.lowConfidenceSeamPixels + ", exposure penalties " + seamReport.exposurePenaltyPixels);
 
         report(progress, "write", false, "Composing final bitmap and writing JPEG");
         Bitmap output = composeOutput(red, green, blue, weights, progress);
+        if (!renderMode.diagnostic) {
+            output = MultibandBlender.cosmeticBlend(output, weights, progress);
+        }
+        ExportValidationReport exportValidation = ExportValidator.validate(
+                output,
+                weights,
+                coverage,
+                calibration,
+                seamReport,
+                usable);
         try (FileOutputStream out = new FileOutputStream(outputFile)) {
             if (!output.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
                 throw new IOException("could not write stitched master");
@@ -181,15 +236,92 @@ final class Phase5Stitcher {
         int coveragePercent = Math.round(100f * coveredCells(coverage) / (COVERAGE_COLUMNS * COVERAGE_ROWS));
         report(progress, "write", true, "Wrote stitched JPEG with estimated coverage " + coveragePercent + "%");
         report(progress, "metadata", false, "Writing Phase 5 diagnostics into image metadata");
-        writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity, renderMode);
+        writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity, renderMode, seamReport, exportValidation);
+        PhotoSphereXmp.write(outputFile, usable, coveragePercent);
         report(progress, "metadata", true, "Embedded stitch diagnostics and warning summary");
-        return new Result(rendered, coveragePercent, missingExposure, warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity));
+        return new Result(
+                rendered,
+                coveragePercent,
+                missingExposure,
+                exportValidation.reviewState,
+                exportValidation.summary,
+                warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity, exportValidation, seamReport));
     }
 
     private static void report(SpherifyLibrary.ProgressReporter progress, String stepKey, boolean complete, String message) {
         if (progress != null) {
             progress.onProgress(stepKey, complete, message);
         }
+    }
+
+    private static ArrayList<DraftFrameRecord> acceptedDraftRecordsFromGraphSession(CaptureSessionRecord session) {
+        ArrayList<DraftFrameRecord> records = new ArrayList<>();
+        for (CaptureFrameRecord frame : session.frames) {
+            if (frame.role != CaptureFrameRole.ACCEPTED) {
+                continue;
+            }
+            File file = new File(frame.rawFacts.filePath);
+            if (!file.exists()) {
+                continue;
+            }
+            JSONObject exposure = frame.rawFacts.exposure;
+            JSONObject intrinsics = frame.rawFacts.intrinsics;
+            float imageFocalLengthXPixels = (float) firstPositive(
+                    exposure.optDouble("imageFocalLengthXPixels", 0.0),
+                    intrinsics.optDouble("imageFocalLengthXPixels", 0.0),
+                    intrinsics.optDouble("fx", 0.0));
+            float imageFocalLengthYPixels = (float) firstPositive(
+                    exposure.optDouble("imageFocalLengthYPixels", 0.0),
+                    intrinsics.optDouble("imageFocalLengthYPixels", 0.0),
+                    intrinsics.optDouble("fy", 0.0));
+            records.add(new DraftFrameRecord(
+                    file,
+                    session.id,
+                    frame.rawFacts.timestampMillis,
+                    frame.rawFacts.locationSummary,
+                    frame.rawFacts.capturedYawDegrees,
+                    frame.rawFacts.capturedPitchDegrees,
+                    frame.rawFacts.capturedRollDegrees,
+                    frame.rawFacts.capturedPoseAvailable,
+                    frame.rawFacts.captureProfile,
+                    frame.rawFacts.targetYawDegrees,
+                    frame.rawFacts.targetPitchDegrees,
+                    session.captureMode.storageValue,
+                    exposure.optBoolean("available", false),
+                    (float) exposure.optDouble("lensFocalLengthMm", 0.0),
+                    (float) exposure.optDouble("sensorPhysicalWidthMm", 0.0),
+                    (float) exposure.optDouble("sensorPhysicalHeightMm", 0.0),
+                    imageFocalLengthXPixels,
+                    imageFocalLengthYPixels,
+                    (float) firstPositive(
+                            exposure.optDouble("imagePrincipalPointXPixels", 0.0),
+                            intrinsics.optDouble("imagePrincipalPointXPixels", 0.0),
+                            intrinsics.optDouble("cx", 0.0)),
+                    (float) firstPositive(
+                            exposure.optDouble("imagePrincipalPointYPixels", 0.0),
+                            intrinsics.optDouble("imagePrincipalPointYPixels", 0.0),
+                            intrinsics.optDouble("cy", 0.0)),
+                    (int) firstPositive(
+                            exposure.optDouble("imageIntrinsicsWidth", 0.0),
+                            intrinsics.optDouble("imageIntrinsicsWidth", 0.0),
+                            intrinsics.optDouble("width", 0.0)),
+                    (int) firstPositive(
+                            exposure.optDouble("imageIntrinsicsHeight", 0.0),
+                            intrinsics.optDouble("imageIntrinsicsHeight", 0.0),
+                            intrinsics.optDouble("height", 0.0))));
+        }
+        records.sort(Comparator.comparingLong(record -> record.createdAt));
+        return records;
+    }
+
+    private static double firstPositive(double first, double second, double third) {
+        if (first > 0.0) {
+            return first;
+        }
+        if (second > 0.0) {
+            return second;
+        }
+        return Math.max(0.0, third);
     }
 
     private static Bitmap decodeFrame(File file) {
@@ -316,6 +448,70 @@ final class Phase5Stitcher {
                 sparseDepthHints,
                 CameraLensPriors.from(records),
                 estimateExposureGains(frames));
+    }
+
+    private static Calibration calibrateGraphSession(
+            List<DraftFrameRecord> records,
+            CaptureSessionRecord session,
+            CaptureProfile captureProfile,
+            SpherifyLibrary.ProgressReporter progress) throws IOException {
+        LensModel lensModel = estimateLensModel(records);
+        report(progress, "lens", false, "Decoding graph calibration frames");
+        ArrayList<CalibrationFrame> frames = new ArrayList<>();
+        HashMap<String, DraftFrameRecord> acceptedRecordsById = new HashMap<>();
+        HashMap<String, CalibrationFrame> calibrationById = new HashMap<>();
+        for (CaptureFrameRecord frameRecord : session.frames) {
+            if (frameRecord.role != CaptureFrameRole.ACCEPTED) {
+                continue;
+            }
+            DraftFrameRecord draft = draftRecordFor(frameRecord, records);
+            if (draft == null) {
+                continue;
+            }
+            acceptedRecordsById.put(frameRecord.id, draft);
+            CalibrationFrame frame = CalibrationFrame.decode(draft, lensModel);
+            if (frame != null) {
+                calibrationById.put(frameRecord.id, frame);
+                frames.add(frame);
+            }
+        }
+        GraphBuildResult graph = GraphBuildResult.from(session, acceptedRecordsById, calibrationById, lensModel);
+        if (!graph.ready()) {
+            throw new IOException("graph-readiness gate failed; " + graph.failureReason());
+        }
+        report(progress, "lens", false, "Filtered graph edges: accepted " + graph.edges.size()
+                + ", rejected " + graph.rejectedEdges + " (" + graph.rejectedReasons + ")");
+        GraphBundleSolver solver = GraphBundleSolver.from(records, graph.edges, lensModel);
+        report(progress, "lens", false, "Running global graph optimization over yaw, pitch, roll, FOV, and radial distortion");
+        OptimizedCameraGraph optimized = solver.solve(progress).withRejectedEdges(graph.rejectedEdges);
+        report(progress, "lens", false, String.format(
+                Locale.US,
+                "Graph solve residuals: mean %.2f px, max %.2f px, closure %.2f deg",
+                optimized.diagnostics.meanResidualPixels,
+                optimized.diagnostics.maxResidualPixels,
+                optimized.diagnostics.closureErrorDegrees));
+        SparseDepthHints sparseDepthHints = SparseDepthHints.from(new FeatureMatchGraph(graph.toFeatureEdges(), true), captureProfile);
+        return new Calibration(
+                optimized.lensModel,
+                optimized.toPoseCorrections(records),
+                optimized.diagnostics.edgesUsed,
+                optimized.diagnostics.edgesUsed,
+                optimized.diagnostics.meanConfidence,
+                captureProfile,
+                sparseDepthHints,
+                CameraLensPriors.from(records),
+                estimateExposureGains(frames),
+                optimized.diagnostics);
+    }
+
+    private static DraftFrameRecord draftRecordFor(CaptureFrameRecord frame, List<DraftFrameRecord> records) {
+        String path = new File(frame.rawFacts.filePath).getAbsolutePath();
+        for (DraftFrameRecord record : records) {
+            if (path.equals(record.imageFile.getAbsolutePath())) {
+                return record;
+            }
+        }
+        return null;
     }
 
     private static Map<String, Float> estimateExposureGains(List<CalibrationFrame> frames) {
@@ -952,17 +1148,20 @@ final class Phase5Stitcher {
             float[] red,
             float[] green,
             float[] blue,
-            float[] weights) {
-        blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, projection.bounds, red, green, blue, weights);
+            float[] weights,
+            int[] seamSource,
+            float[] seamScores,
+            SeamFinder seamFinder) {
+        blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, projection.bounds, red, green, blue, weights, seamSource, seamScores, seamFinder);
         if (projection.bounds.left < 0f) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights, seamSource, seamScores, seamFinder);
         }
         if (projection.bounds.right > OUTPUT_WIDTH) {
             RectF shifted = new RectF(projection.bounds);
             shifted.offset(-OUTPUT_WIDTH, 0f);
-            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights);
+            blendOne(frame, projection, lensModel, renderMode, frameIndex, exposureGain, shifted, red, green, blue, weights, seamSource, seamScores, seamFinder);
         }
     }
 
@@ -977,7 +1176,10 @@ final class Phase5Stitcher {
             float[] red,
             float[] green,
             float[] blue,
-            float[] weights) {
+            float[] weights,
+            int[] seamSource,
+            float[] seamScores,
+            SeamFinder seamFinder) {
         int startX = clamp((int) Math.floor(bounds.left), 0, OUTPUT_WIDTH - 1);
         int endX = clamp((int) Math.ceil(bounds.right), 0, OUTPUT_WIDTH - 1);
         int startY = clamp((int) Math.floor(bounds.top), 0, OUTPUT_HEIGHT - 1);
@@ -1033,6 +1235,7 @@ final class Phase5Stitcher {
                     color = applyExposureGain(color, exposureGain);
                 }
                 int index = outputRow + x;
+                float seamScore = seamFinder.score(frameIndex, sourceU, sourceV, weight, exposureGain);
                 if (renderMode.selectsBestSource && weight <= weights[index]) {
                     continue;
                 }
@@ -1042,10 +1245,15 @@ final class Phase5Stitcher {
                     blue[index] = (color & 0xFF) * weight;
                     weights[index] = weight;
                 } else {
-                    red[index] += ((color >> 16) & 0xFF) * weight;
-                    green[index] += ((color >> 8) & 0xFF) * weight;
-                    blue[index] += (color & 0xFF) * weight;
-                    weights[index] += weight;
+                    float seamWeight = seamFinder.blendWeight(weight, seamScore, seamScores[index], seamSource[index] == frameIndex);
+                    red[index] += ((color >> 16) & 0xFF) * seamWeight;
+                    green[index] += ((color >> 8) & 0xFF) * seamWeight;
+                    blue[index] += (color & 0xFF) * seamWeight;
+                    weights[index] += seamWeight;
+                    if (seamScore > seamScores[index]) {
+                        seamScores[index] = seamScore;
+                        seamSource[index] = frameIndex;
+                    }
                 }
             }
         }
@@ -1150,12 +1358,14 @@ final class Phase5Stitcher {
             int missingExposure,
             Calibration calibration,
             MovementSensitivity movementSensitivity,
-            RenderMode renderMode) {
+            RenderMode renderMode,
+            SeamReport seamReport,
+            ExportValidationReport exportValidation) {
         try {
             ExifInterface exif = new ExifInterface(file.getAbsolutePath());
             exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, String.format(
                     Locale.US,
-                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; phase5bLensPrior=%s; posePriors=%d; intrinsicsPriors=%d; focalPriors=%d; sparseDepthHints=%s",
+                    "Spherify 0.7.4 graph seam stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; phase5bLensPrior=%s; posePriors=%d; intrinsicsPriors=%d; focalPriors=%d; sparseDepthHints=%s; graphEdgesUsed=%d; graphEdgesRejected=%d; meanResidualPx=%.2f; maxResidualPx=%.2f; closureErrorDeg=%.2f; parallaxWarnings=%d; exposureGainImages=%d; seamLowConfidencePixels=%d; seamExposurePenaltyPixels=%d; reviewState=%s; exportValidation=%s",
                     sessionId,
                     renderedFrames,
                     coveragePercent,
@@ -1173,9 +1383,20 @@ final class Phase5Stitcher {
                     calibration.cameraLensPriors.posePriorCount,
                     calibration.cameraLensPriors.intrinsicsPriorCount,
                     calibration.cameraLensPriors.focalLengthPriorCount,
-                    calibration.sparseDepthHints.metadataLabel));
+                    calibration.sparseDepthHints.metadataLabel,
+                    calibration.solveDiagnostics.edgesUsed,
+                    calibration.solveDiagnostics.edgesRejected,
+                    calibration.solveDiagnostics.meanResidualPixels,
+                    calibration.solveDiagnostics.maxResidualPixels,
+                    calibration.solveDiagnostics.closureErrorDegrees,
+                    calibration.solveDiagnostics.parallaxWarnings,
+                    calibration.exposureGains.size(),
+                    seamReport.lowConfidenceSeamPixels,
+                    seamReport.exposurePenaltyPixels,
+                    exportValidation.reviewState,
+                    exportValidation.summary));
             exif.setAttribute(ExifInterface.TAG_MAKE, "Spherify");
-            exif.setAttribute(ExifInterface.TAG_MODEL, "Phase 5 draft stitcher");
+            exif.setAttribute(ExifInterface.TAG_MODEL, "0.7.4 seam/blend/export pipeline");
             exif.saveAttributes();
         } catch (IOException ignored) {
             // The master is still usable if optional metadata writing fails.
@@ -1187,7 +1408,9 @@ final class Phase5Stitcher {
             int coveragePercent,
             int missingExposure,
             Calibration calibration,
-            MovementSensitivity movementSensitivity) {
+            MovementSensitivity movementSensitivity,
+            ExportValidationReport exportValidation,
+            SeamReport seamReport) {
         ArrayList<String> warnings = new ArrayList<>();
         if (renderedFrames < 12) {
             warnings.add("Low frame count for a complete sphere");
@@ -1216,6 +1439,22 @@ final class Phase5Stitcher {
                 calibration.lensModel.horizontalFovDegrees,
                 calibration.lensModel.radialK1,
                 calibration.lensModel.radialK2));
+        if (calibration.solveDiagnostics.edgesUsed > 0) {
+            warnings.add(String.format(
+                    Locale.US,
+                    "Graph solver used %d edges; residual mean %.2f px, max %.2f px, closure %.2f deg",
+                    calibration.solveDiagnostics.edgesUsed,
+                    calibration.solveDiagnostics.meanResidualPixels,
+                    calibration.solveDiagnostics.maxResidualPixels,
+                    calibration.solveDiagnostics.closureErrorDegrees));
+            warnings.add("Exposure compensation: per-image gain on " + calibration.exposureGains.size() + " frames");
+        }
+        if (calibration.solveDiagnostics.parallaxWarnings > 0) {
+            warnings.add("Parallax warning: " + calibration.solveDiagnostics.parallaxWarnings + " graph edges still have high reprojection residuals");
+        }
+        warnings.add("Public quality state: " + exportValidation.reviewState + " (" + exportValidation.summary + ")");
+        warnings.add("Seam selection: low-confidence penalties " + seamReport.lowConfidenceSeamPixels
+                + ", exposure penalties " + seamReport.exposurePenaltyPixels);
         warnings.add("Capture profile: " + calibration.captureProfile.label);
         if (calibration.captureProfile == CaptureProfile.HANDHELD) {
             warnings.add("Hand-held parallax expected; use geometry debug output to inspect close-object conflicts");
@@ -1235,6 +1474,101 @@ final class Phase5Stitcher {
     private static float headingDeltaDegrees(float first, float second) {
         float delta = Math.abs(normalizeDegrees(first) - normalizeDegrees(second));
         return delta > 180f ? 360f - delta : delta;
+    }
+
+    private static float signedHeadingDelta(float first, float second) {
+        float delta = normalizeDegrees(first) - normalizeDegrees(second);
+        if (delta > 180f) {
+            delta -= 360f;
+        } else if (delta < -180f) {
+            delta += 360f;
+        }
+        return delta;
+    }
+
+    private static float relativeYaw(DraftFrameRecord from, DraftFrameRecord to, LensModel lensModel) {
+        float fromYaw = from.capturedPoseAvailable ? from.headingDegrees : from.targetYawDegrees;
+        float toYaw = to.capturedPoseAvailable ? to.headingDegrees : to.targetYawDegrees;
+        return signedHeadingDelta(toYaw, fromYaw);
+    }
+
+    private static float relativePitch(DraftFrameRecord from, DraftFrameRecord to, LensModel lensModel) {
+        float fromPitch = from.capturedPoseAvailable ? from.pitchDegrees : from.targetPitchDegrees;
+        float toPitch = to.capturedPoseAvailable ? to.pitchDegrees : to.targetPitchDegrees;
+        return toPitch - fromPitch;
+    }
+
+    private static void unionComponents(HashMap<String, Integer> components, String first, String second) {
+        Integer firstComponent = components.get(first);
+        Integer secondComponent = components.get(second);
+        if (firstComponent == null || secondComponent == null || firstComponent.equals(secondComponent)) {
+            return;
+        }
+        int replacement = Math.min(firstComponent, secondComponent);
+        int removed = Math.max(firstComponent, secondComponent);
+        for (Map.Entry<String, Integer> entry : components.entrySet()) {
+            if (entry.getValue() == removed) {
+                entry.setValue(replacement);
+            }
+        }
+    }
+
+    private static String componentRoot(HashMap<String, Integer> components, String frameId) {
+        Integer component = components.get(frameId);
+        return component == null ? "" : String.valueOf(component);
+    }
+
+    private static Ray pixelToWorld(OptimizedFrame frame, float x, float y, int width, int height, LensModel lensModel) {
+        float planeX = (x / Math.max(1f, width) - 0.5f) * 2f;
+        float planeY = (0.5f - y / Math.max(1f, height)) * 2f;
+        float radiusSquared = planeX * planeX + planeY * planeY;
+        float scale = 1f
+                - lensModel.radialK1 * radiusSquared
+                - lensModel.radialK2 * radiusSquared * radiusSquared;
+        planeX *= scale;
+        planeY *= scale;
+        float tanHalfHorizontal = (float) Math.tan(Math.toRadians(lensModel.horizontalFovDegrees / 2f));
+        float tanHalfVertical = (float) Math.tan(Math.toRadians(lensModel.verticalFovDegrees / 2f));
+        CameraBasis basis = CameraBasis.from(frame.yawDegrees, frame.pitchDegrees, frame.rollDegrees);
+        Ray local = new Ray(planeX * tanHalfHorizontal, planeY * tanHalfVertical, 1f);
+        float length = (float) Math.sqrt(local.x * local.x + local.y * local.y + local.z * local.z);
+        local = new Ray(local.x / length, local.y / length, local.z / length);
+        return normalizeRay(new Ray(
+                basis.right.x * local.x + basis.up.x * local.y + basis.forward.x * local.z,
+                basis.right.y * local.x + basis.up.y * local.y + basis.forward.y * local.z,
+                basis.right.z * local.x + basis.up.z * local.y + basis.forward.z * local.z));
+    }
+
+    private static float[] worldToPixel(OptimizedFrame frame, Ray ray, int width, int height, LensModel lensModel) {
+        CameraBasis basis = CameraBasis.from(frame.yawDegrees, frame.pitchDegrees, frame.rollDegrees);
+        float localX = basis.dotRight(ray);
+        float localY = basis.dotUp(ray);
+        float localZ = Math.max(0.001f, basis.dotForward(ray));
+        float tanHalfHorizontal = (float) Math.tan(Math.toRadians(lensModel.horizontalFovDegrees / 2f));
+        float tanHalfVertical = (float) Math.tan(Math.toRadians(lensModel.verticalFovDegrees / 2f));
+        float planeX = localX / (localZ * tanHalfHorizontal);
+        float planeY = localY / (localZ * tanHalfVertical);
+        float[] compensated = compensateRadial(planeX, planeY, lensModel);
+        return new float[]{
+                (compensated[0] * 0.5f + 0.5f) * width,
+                (0.5f - compensated[1] * 0.5f) * height
+        };
+    }
+
+    private static Ray normalizeRay(Ray ray) {
+        float length = (float) Math.sqrt(ray.x * ray.x + ray.y * ray.y + ray.z * ray.z);
+        if (length <= 0.0001f) {
+            return new Ray(0f, 0f, 1f);
+        }
+        return new Ray(ray.x / length, ray.y / length, ray.z / length);
+    }
+
+    private static float yawOf(Ray ray) {
+        return normalizeDegrees((float) Math.toDegrees(Math.atan2(ray.x, ray.z)));
+    }
+
+    private static float pitchOf(Ray ray) {
+        return (float) Math.toDegrees(Math.asin(clamp(ray.y, -1f, 1f)));
     }
 
     private static float clamp(float value, float minimum, float maximum) {
@@ -1331,16 +1665,18 @@ final class Phase5Stitcher {
     }
 
     private enum RenderMode {
-        STRONGEST_SOURCE("sharp-best-source", true),
-        CONTRIBUTOR_MAP("contributor-map", true),
-        BLENDED("blended", false);
+        STRONGEST_SOURCE("diagnostic-sharp-best-source", true, true),
+        CONTRIBUTOR_MAP("diagnostic-contributor-map", true, true),
+        BLENDED("optimized-blended-master", false, false);
 
         final String label;
         final boolean selectsBestSource;
+        final boolean diagnostic;
 
-        RenderMode(String label, boolean selectsBestSource) {
+        RenderMode(String label, boolean selectsBestSource, boolean diagnostic) {
             this.label = label;
             this.selectsBestSource = selectsBestSource;
+            this.diagnostic = diagnostic;
         }
 
         static RenderMode from(String mode) {
@@ -1350,7 +1686,7 @@ final class Phase5Stitcher {
             if ("contributors".equals(mode)) {
                 return CONTRIBUTOR_MAP;
             }
-            return STRONGEST_SOURCE;
+            return BLENDED;
         }
     }
 
@@ -1439,6 +1775,434 @@ final class Phase5Stitcher {
         }
     }
 
+    private static final class GraphBuildResult {
+        final List<GraphControlEdge> edges;
+        final int rejectedEdges;
+        final String rejectedReasons;
+
+        private GraphBuildResult(List<GraphControlEdge> edges, int rejectedEdges, String rejectedReasons) {
+            this.edges = edges;
+            this.rejectedEdges = rejectedEdges;
+            this.rejectedReasons = rejectedReasons;
+        }
+
+        static GraphBuildResult from(
+                CaptureSessionRecord session,
+                Map<String, DraftFrameRecord> recordsById,
+                Map<String, CalibrationFrame> calibrationById,
+                LensModel lensModel) {
+            ArrayList<GraphControlEdge> edges = new ArrayList<>();
+            int weak = 0;
+            int missing = 0;
+            int parallax = 0;
+            HashSet<String> seenPairs = new HashSet<>();
+            for (CaptureGraphEdgeRecord edge : session.graphEdges) {
+                DraftFrameRecord from = recordsById.get(edge.fromFrameId);
+                DraftFrameRecord to = recordsById.get(edge.toFrameId);
+                CalibrationFrame fromFrame = calibrationById.get(edge.fromFrameId);
+                CalibrationFrame toFrame = calibrationById.get(edge.toFrameId);
+                if (from == null || to == null || fromFrame == null || toFrame == null) {
+                    missing++;
+                    continue;
+                }
+                if (!edgeLooksSolvable(edge)) {
+                    weak++;
+                    continue;
+                }
+                String hint = edge.parallaxRiskHint.toLowerCase(Locale.US);
+                if (hint.contains("high") || hint.contains("near-object")) {
+                    parallax++;
+                    continue;
+                }
+                String pairKey = edge.fromFrameId.compareTo(edge.toFrameId) <= 0
+                        ? edge.fromFrameId + "|" + edge.toFrameId
+                        : edge.toFrameId + "|" + edge.fromFrameId;
+                if (!seenPairs.add(pairKey)) {
+                    weak++;
+                    continue;
+                }
+                ArrayList<GraphControlPoint> points = new ArrayList<>();
+                for (int i = 0; i < edge.controlPoints.length(); i++) {
+                    JSONObject point = edge.controlPoints.optJSONObject(i);
+                    if (point == null) {
+                        continue;
+                    }
+                    points.add(new GraphControlPoint(
+                            (float) point.optDouble("neighborX", 0.0),
+                            (float) point.optDouble("neighborY", 0.0),
+                            (float) point.optDouble("candidateX", 0.0),
+                            (float) point.optDouble("candidateY", 0.0)));
+                }
+                if (points.size() < 4) {
+                    weak++;
+                    continue;
+                }
+                edges.add(new GraphControlEdge(
+                        edge.fromFrameId,
+                        edge.toFrameId,
+                        from,
+                        to,
+                        fromFrame.width,
+                        fromFrame.height,
+                        toFrame.width,
+                        toFrame.height,
+                        (float) edge.confidence,
+                        (float) edge.residualScore,
+                        points,
+                        relativeYaw(from, to, lensModel),
+                        relativePitch(from, to, lensModel)));
+            }
+            String reasons = "weak=" + weak + ", missing=" + missing + ", parallax=" + parallax;
+            return new GraphBuildResult(edges, weak + missing + parallax, reasons);
+        }
+
+        boolean ready() {
+            if (edges.size() < 2) {
+                return false;
+            }
+            HashMap<String, Integer> components = new HashMap<>();
+            for (GraphControlEdge edge : edges) {
+                components.putIfAbsent(edge.fromFrameId, components.size());
+                components.putIfAbsent(edge.toFrameId, components.size());
+                unionComponents(components, edge.fromFrameId, edge.toFrameId);
+            }
+            String root = "";
+            for (String frameId : components.keySet()) {
+                if (root.isEmpty()) {
+                    root = componentRoot(components, frameId);
+                } else if (!root.equals(componentRoot(components, frameId))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        String failureReason() {
+            return "usable graph edges=" + edges.size() + ", rejected=" + rejectedEdges + " (" + rejectedReasons + ")";
+        }
+
+        List<FeatureMatchEdge> toFeatureEdges() {
+            ArrayList<FeatureMatchEdge> featureEdges = new ArrayList<>();
+            for (GraphControlEdge edge : edges) {
+                featureEdges.add(new FeatureMatchEdge(
+                        edge.from.record.imageFile.getAbsolutePath(),
+                        edge.to.record.imageFile.getAbsolutePath(),
+                        edge.relativeYawDegrees,
+                        edge.relativePitchDegrees,
+                        0f,
+                        edge.confidence,
+                        edge.residualScore,
+                        true));
+            }
+            return featureEdges;
+        }
+
+        private static boolean edgeLooksSolvable(CaptureGraphEdgeRecord edge) {
+            return edge.confidence >= 0.18
+                    && edge.inlierCount >= 8
+                    && edge.residualScore <= 80.0
+                    && edge.controlPoints.length() >= 4;
+        }
+    }
+
+    private static final class GraphBundleSolver {
+        final HashMap<String, OptimizedFrame> frames = new HashMap<>();
+        final List<GraphControlEdge> edges;
+        LensModel lensModel;
+
+        private GraphBundleSolver(List<GraphControlEdge> edges, LensModel lensModel) {
+            this.edges = edges;
+            this.lensModel = lensModel;
+        }
+
+        static GraphBundleSolver from(List<DraftFrameRecord> records, List<GraphControlEdge> edges, LensModel lensModel) {
+            GraphBundleSolver solver = new GraphBundleSolver(edges, lensModel);
+            for (DraftFrameRecord record : records) {
+                solver.frames.put(record.imageFile.getAbsolutePath(), OptimizedFrame.from(record));
+            }
+            return solver;
+        }
+
+        OptimizedCameraGraph solve(SpherifyLibrary.ProgressReporter progress) {
+            float fovVelocity = 0f;
+            float distortionVelocity = 0f;
+            for (int iteration = 0; iteration < 64; iteration++) {
+                HashMap<String, PoseDelta> deltas = new HashMap<>();
+                float signedFovResidual = 0f;
+                float signedDistortionResidual = 0f;
+                int residualSamples = 0;
+                for (GraphControlEdge edge : edges) {
+                    OptimizedFrame from = frames.get(edge.from.record.imageFile.getAbsolutePath());
+                    OptimizedFrame to = frames.get(edge.to.record.imageFile.getAbsolutePath());
+                    if (from == null || to == null) {
+                        continue;
+                    }
+                    float weight = edge.weight();
+                    for (GraphControlPoint point : edge.points) {
+                        Ray fromRay = pixelToWorld(from, point.fromX, point.fromY, edge.fromWidth, edge.fromHeight, lensModel);
+                        Ray toRay = pixelToWorld(to, point.toX, point.toY, edge.toWidth, edge.toHeight, lensModel);
+                        float fromYaw = yawOf(fromRay);
+                        float toYaw = yawOf(toRay);
+                        float fromPitch = pitchOf(fromRay);
+                        float toPitch = pitchOf(toRay);
+                        float yawResidual = signedHeadingDelta(toYaw, fromYaw);
+                        float pitchResidual = toPitch - fromPitch;
+                        float edgeDistance = Math.max(Math.abs(point.toX / Math.max(1f, edge.toWidth) - 0.5f),
+                                Math.abs(point.toY / Math.max(1f, edge.toHeight) - 0.5f));
+                        deltas.computeIfAbsent(edge.from.record.imageFile.getAbsolutePath(), ignored -> new PoseDelta())
+                                .add(yawResidual, pitchResidual, -pitchResidual * edgeDistance * 0.10f, weight);
+                        deltas.computeIfAbsent(edge.to.record.imageFile.getAbsolutePath(), ignored -> new PoseDelta())
+                                .add(-yawResidual, -pitchResidual, pitchResidual * edgeDistance * 0.10f, weight);
+                        signedFovResidual += (Math.abs(yawResidual) - Math.abs(pitchResidual)) * weight;
+                        signedDistortionResidual += (edgeDistance - 0.22f) * (Math.abs(yawResidual) + Math.abs(pitchResidual)) * weight;
+                        residualSamples++;
+                    }
+                }
+                for (Map.Entry<String, PoseDelta> entry : deltas.entrySet()) {
+                    OptimizedFrame frame = frames.get(entry.getKey());
+                    if (frame == null) {
+                        continue;
+                    }
+                    PoseDelta delta = entry.getValue();
+                    float step = 0.28f / Math.max(1f, delta.weightTotal);
+                    frame.yawDegrees = normalizeDegrees(frame.yawDegrees + delta.yawDegrees * step);
+                    frame.pitchDegrees = clamp(frame.pitchDegrees + delta.pitchDegrees * step, -89f, 89f);
+                    frame.rollDegrees = clamp((frame.rollDegrees + delta.rollDegrees * step) * 0.997f, -6f, 6f);
+                    applyPosePrior(frame);
+                }
+                if (residualSamples > 0) {
+                    fovVelocity = fovVelocity * 0.82f + signedFovResidual / residualSamples * 0.006f;
+                    distortionVelocity = distortionVelocity * 0.88f + signedDistortionResidual / residualSamples * 0.00008f;
+                    lensModel = new LensModel(
+                            clamp(lensModel.horizontalFovDegrees + fovVelocity, 42f, 88f),
+                            clamp(lensModel.verticalFovDegrees - fovVelocity * 0.55f, MIN_VERTICAL_FOV_DEGREES, MAX_VERTICAL_FOV_DEGREES),
+                            clamp(lensModel.radialK1 - distortionVelocity, -0.22f, 0.08f),
+                            clamp(lensModel.radialK2 + distortionVelocity * 0.45f, -0.06f, 0.10f),
+                            lensModel.focalLengthMm);
+                }
+                if (iteration == 0 || iteration == 31 || iteration == 63) {
+                    report(progress, "lens", false, "Graph optimizer iteration " + (iteration + 1) + "/64");
+                }
+            }
+            SolveDiagnostics diagnostics = residualDiagnostics();
+            return new OptimizedCameraGraph(lensModel, frames, diagnostics);
+        }
+
+        private void applyPosePrior(OptimizedFrame frame) {
+            frame.yawDegrees = normalizeDegrees(frame.yawDegrees + signedHeadingDelta(frame.baseYawDegrees, frame.yawDegrees) * 0.018f);
+            frame.pitchDegrees = clamp(frame.pitchDegrees + (frame.basePitchDegrees - frame.pitchDegrees) * 0.018f, -89f, 89f);
+            frame.rollDegrees = clamp(frame.rollDegrees + (frame.baseRollDegrees - frame.rollDegrees) * 0.010f, -6f, 6f);
+        }
+
+        private SolveDiagnostics residualDiagnostics() {
+            float total = 0f;
+            float max = 0f;
+            float confidenceTotal = 0f;
+            int samples = 0;
+            int parallaxWarnings = 0;
+            float closureTotal = 0f;
+            for (GraphControlEdge edge : edges) {
+                OptimizedFrame from = frames.get(edge.from.record.imageFile.getAbsolutePath());
+                OptimizedFrame to = frames.get(edge.to.record.imageFile.getAbsolutePath());
+                if (from == null || to == null) {
+                    continue;
+                }
+                float edgeResidual = 0f;
+                for (GraphControlPoint point : edge.points) {
+                    Ray fromRay = pixelToWorld(from, point.fromX, point.fromY, edge.fromWidth, edge.fromHeight, lensModel);
+                    float[] projected = worldToPixel(to, fromRay, edge.toWidth, edge.toHeight, lensModel);
+                    float dx = projected[0] - point.toX;
+                    float dy = projected[1] - point.toY;
+                    float residual = (float) Math.sqrt(dx * dx + dy * dy);
+                    total += residual;
+                    edgeResidual += residual;
+                    max = Math.max(max, residual);
+                    samples++;
+                }
+                if (!edge.points.isEmpty() && edgeResidual / edge.points.size() > 24f) {
+                    parallaxWarnings++;
+                }
+                closureTotal += Math.abs(signedHeadingDelta(
+                        normalizeDegrees(from.yawDegrees + edge.relativeYawDegrees),
+                        to.yawDegrees));
+                confidenceTotal += edge.confidence;
+            }
+            return new SolveDiagnostics(
+                    edges.size(),
+                    0,
+                    samples == 0 ? 0f : total / samples,
+                    max,
+                    edges.isEmpty() ? 0f : closureTotal / edges.size(),
+                    parallaxWarnings,
+                    edges.isEmpty() ? 0f : confidenceTotal / edges.size());
+        }
+    }
+
+    private static final class OptimizedCameraGraph {
+        final LensModel lensModel;
+        final Map<String, OptimizedFrame> frames;
+        final SolveDiagnostics diagnostics;
+
+        OptimizedCameraGraph(LensModel lensModel, Map<String, OptimizedFrame> frames, SolveDiagnostics diagnostics) {
+            this.lensModel = lensModel;
+            this.frames = frames;
+            this.diagnostics = diagnostics;
+        }
+
+        OptimizedCameraGraph withRejectedEdges(int rejectedEdges) {
+            return new OptimizedCameraGraph(
+                    lensModel,
+                    frames,
+                    new SolveDiagnostics(
+                            diagnostics.edgesUsed,
+                            rejectedEdges,
+                            diagnostics.meanResidualPixels,
+                            diagnostics.maxResidualPixels,
+                            diagnostics.closureErrorDegrees,
+                            diagnostics.parallaxWarnings,
+                            diagnostics.meanConfidence));
+        }
+
+        Map<String, PoseCorrection> toPoseCorrections(List<DraftFrameRecord> records) {
+            HashMap<String, PoseCorrection> corrections = new HashMap<>();
+            for (DraftFrameRecord record : records) {
+                OptimizedFrame frame = frames.get(record.imageFile.getAbsolutePath());
+                if (frame == null) {
+                    continue;
+                }
+                PoseCorrection correction = new PoseCorrection();
+                correction.yawDegrees = signedHeadingDelta(frame.yawDegrees, frame.baseYawDegrees);
+                correction.pitchDegrees = frame.pitchDegrees - frame.basePitchDegrees;
+                correction.rollDegrees = frame.rollDegrees - frame.baseRollDegrees;
+                correction.samples = 1;
+                correction.weightTotal = 1f;
+                corrections.put(record.imageFile.getAbsolutePath(), correction);
+            }
+            return corrections;
+        }
+    }
+
+    private static final class SolveDiagnostics {
+        final int edgesUsed;
+        final int edgesRejected;
+        final float meanResidualPixels;
+        final float maxResidualPixels;
+        final float closureErrorDegrees;
+        final int parallaxWarnings;
+        final float meanConfidence;
+
+        SolveDiagnostics(
+                int edgesUsed,
+                int edgesRejected,
+                float meanResidualPixels,
+                float maxResidualPixels,
+                float closureErrorDegrees,
+                int parallaxWarnings,
+                float meanConfidence) {
+            this.edgesUsed = edgesUsed;
+            this.edgesRejected = edgesRejected;
+            this.meanResidualPixels = meanResidualPixels;
+            this.maxResidualPixels = maxResidualPixels;
+            this.closureErrorDegrees = closureErrorDegrees;
+            this.parallaxWarnings = parallaxWarnings;
+            this.meanConfidence = meanConfidence;
+        }
+
+        static SolveDiagnostics legacy() {
+            return new SolveDiagnostics(0, 0, 0f, 0f, 0f, 0, 0f);
+        }
+    }
+
+    private static final class OptimizedFrame {
+        final DraftFrameRecord record;
+        final float baseYawDegrees;
+        final float basePitchDegrees;
+        final float baseRollDegrees;
+        float yawDegrees;
+        float pitchDegrees;
+        float rollDegrees;
+
+        private OptimizedFrame(DraftFrameRecord record, float yawDegrees, float pitchDegrees, float rollDegrees) {
+            this.record = record;
+            this.baseYawDegrees = yawDegrees;
+            this.basePitchDegrees = pitchDegrees;
+            this.baseRollDegrees = rollDegrees;
+            this.yawDegrees = yawDegrees;
+            this.pitchDegrees = pitchDegrees;
+            this.rollDegrees = rollDegrees;
+        }
+
+        static OptimizedFrame from(DraftFrameRecord record) {
+            float yaw = record.capturedPoseAvailable ? record.headingDegrees : record.targetYawDegrees;
+            float pitch = record.capturedPoseAvailable ? record.pitchDegrees : record.targetPitchDegrees;
+            float roll = record.capturedPoseAvailable ? record.rollDegrees : 0f;
+            return new OptimizedFrame(record, normalizeDegrees(yaw), clamp(pitch, -89f, 89f), clamp(roll, -8f, 8f));
+        }
+    }
+
+    private static final class GraphControlEdge {
+        final String fromFrameId;
+        final String toFrameId;
+        final CalibrationFrame from;
+        final CalibrationFrame to;
+        final int fromWidth;
+        final int fromHeight;
+        final int toWidth;
+        final int toHeight;
+        final float confidence;
+        final float residualScore;
+        final List<GraphControlPoint> points;
+        final float relativeYawDegrees;
+        final float relativePitchDegrees;
+
+        GraphControlEdge(
+                String fromFrameId,
+                String toFrameId,
+                DraftFrameRecord fromRecord,
+                DraftFrameRecord toRecord,
+                int fromWidth,
+                int fromHeight,
+                int toWidth,
+                int toHeight,
+                float confidence,
+                float residualScore,
+                List<GraphControlPoint> points,
+                float relativeYawDegrees,
+                float relativePitchDegrees) {
+            this.fromFrameId = fromFrameId;
+            this.toFrameId = toFrameId;
+            this.from = new CalibrationFrame(fromRecord, fromWidth, fromHeight, new int[0], 0f, fromRecord.targetYawDegrees, fromRecord.targetPitchDegrees, false);
+            this.to = new CalibrationFrame(toRecord, toWidth, toHeight, new int[0], 0f, toRecord.targetYawDegrees, toRecord.targetPitchDegrees, false);
+            this.fromWidth = fromWidth;
+            this.fromHeight = fromHeight;
+            this.toWidth = toWidth;
+            this.toHeight = toHeight;
+            this.confidence = confidence;
+            this.residualScore = residualScore;
+            this.points = points;
+            this.relativeYawDegrees = relativeYawDegrees;
+            this.relativePitchDegrees = relativePitchDegrees;
+        }
+
+        float weight() {
+            return confidence * Math.max(1f, points.size() / 8f) / (1f + Math.max(0f, residualScore) / 36f);
+        }
+    }
+
+    private static final class GraphControlPoint {
+        final float fromX;
+        final float fromY;
+        final float toX;
+        final float toY;
+
+        GraphControlPoint(float fromX, float fromY, float toX, float toY) {
+            this.fromX = fromX;
+            this.fromY = fromY;
+            this.toX = toX;
+            this.toY = toY;
+        }
+    }
+
     private static final class Calibration {
         final LensModel lensModel;
         final Map<String, PoseCorrection> corrections;
@@ -1449,6 +2213,7 @@ final class Phase5Stitcher {
         final SparseDepthHints sparseDepthHints;
         final CameraLensPriors cameraLensPriors;
         final Map<String, Float> exposureGains;
+        final SolveDiagnostics solveDiagnostics;
 
         Calibration(
                 LensModel lensModel,
@@ -1460,6 +2225,21 @@ final class Phase5Stitcher {
                 SparseDepthHints sparseDepthHints,
                 CameraLensPriors cameraLensPriors,
                 Map<String, Float> exposureGains) {
+            this(lensModel, corrections, matchedOverlapCount, openCvMatchedOverlapCount, averageOverlapConfidence,
+                    captureProfile, sparseDepthHints, cameraLensPriors, exposureGains, SolveDiagnostics.legacy());
+        }
+
+        Calibration(
+                LensModel lensModel,
+                Map<String, PoseCorrection> corrections,
+                int matchedOverlapCount,
+                int openCvMatchedOverlapCount,
+                float averageOverlapConfidence,
+                CaptureProfile captureProfile,
+                SparseDepthHints sparseDepthHints,
+                CameraLensPriors cameraLensPriors,
+                Map<String, Float> exposureGains,
+                SolveDiagnostics solveDiagnostics) {
             this.lensModel = lensModel;
             this.corrections = corrections;
             this.matchedOverlapCount = matchedOverlapCount;
@@ -1469,6 +2249,7 @@ final class Phase5Stitcher {
             this.sparseDepthHints = sparseDepthHints;
             this.cameraLensPriors = cameraLensPriors;
             this.exposureGains = exposureGains;
+            this.solveDiagnostics = solveDiagnostics == null ? SolveDiagnostics.legacy() : solveDiagnostics;
         }
     }
 
@@ -2003,16 +2784,330 @@ final class Phase5Stitcher {
         }
     }
 
+    private static final class SeamFinder {
+        final Calibration calibration;
+        int lowConfidenceSeamPixels;
+        int exposurePenaltyPixels;
+
+        SeamFinder(Calibration calibration) {
+            this.calibration = calibration;
+        }
+
+        float score(int frameIndex, float sourceU, float sourceV, float baseWeight, float exposureGain) {
+            float centerPreference = centerWeight(sourceU, sourceV);
+            float edgePenalty = 1f - feather(sourceU) * feather(sourceV);
+            float confidence = calibration.solveDiagnostics.meanConfidence <= 0f
+                    ? 0.55f
+                    : calibration.solveDiagnostics.meanConfidence;
+            float exposurePenalty = Math.min(0.45f, Math.abs(exposureGain - 1f) * 0.65f);
+            float polePenalty = (sourceV < 0.10f || sourceV > 0.90f) && calibration.solveDiagnostics.parallaxWarnings > 0
+                    ? 0.22f
+                    : 0f;
+            float score = baseWeight * (0.55f + centerPreference * 0.45f)
+                    - edgePenalty * 0.20f
+                    - (1f - confidence) * 0.16f
+                    - exposurePenalty
+                    - polePenalty;
+            if (confidence < 0.35f || polePenalty > 0f) {
+                lowConfidenceSeamPixels++;
+            }
+            if (exposurePenalty > 0.08f) {
+                exposurePenaltyPixels++;
+            }
+            return score;
+        }
+
+        float blendWeight(float baseWeight, float score, float existingScore, boolean sameSource) {
+            if (existingScore <= 0f || score >= existingScore || sameSource) {
+                return baseWeight;
+            }
+            float ratio = clamp(score / Math.max(0.001f, existingScore), 0.18f, 1f);
+            return baseWeight * ratio * ratio;
+        }
+
+        SeamReport report(float[] seamScores) {
+            int weak = 0;
+            for (float score : seamScores) {
+                if (score > 0f && score < 0.12f) {
+                    weak++;
+                }
+            }
+            return new SeamReport(lowConfidenceSeamPixels + weak, exposurePenaltyPixels);
+        }
+    }
+
+    private static final class SeamReport {
+        final int lowConfidenceSeamPixels;
+        final int exposurePenaltyPixels;
+
+        SeamReport(int lowConfidenceSeamPixels, int exposurePenaltyPixels) {
+            this.lowConfidenceSeamPixels = lowConfidenceSeamPixels;
+            this.exposurePenaltyPixels = exposurePenaltyPixels;
+        }
+    }
+
+    private static final class MultibandBlender {
+        static Bitmap cosmeticBlend(Bitmap source, float[] weights, SpherifyLibrary.ProgressReporter progress) {
+            report(progress, "write", false, "Applying final multiband-style cosmetic blend");
+            int width = source.getWidth();
+            int height = source.getHeight();
+            int[] pixels = new int[width * height];
+            int[] blended = new int[pixels.length];
+            source.getPixels(pixels, 0, width, 0, 0, width, height);
+            for (int y = 0; y < height; y++) {
+                int row = y * width;
+                for (int x = 0; x < width; x++) {
+                    int index = row + x;
+                    if (weights[index] <= 0f) {
+                        blended[index] = pixels[index];
+                        continue;
+                    }
+                    int r = 0;
+                    int g = 0;
+                    int b = 0;
+                    int samples = 0;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int yy = clamp(y + dy, 0, height - 1);
+                        for (int dx = -1; dx <= 1; dx++) {
+                            int xx = (x + dx + width) % width;
+                            int color = pixels[yy * width + xx];
+                            r += (color >> 16) & 0xFF;
+                            g += (color >> 8) & 0xFF;
+                            b += color & 0xFF;
+                            samples++;
+                        }
+                    }
+                    int original = pixels[index];
+                    float localBlend = weights[index] < 0.35f ? 0.30f : 0.12f;
+                    int rr = clamp(Math.round(((original >> 16) & 0xFF) * (1f - localBlend) + (r / (float) samples) * localBlend), 0, 255);
+                    int gg = clamp(Math.round(((original >> 8) & 0xFF) * (1f - localBlend) + (g / (float) samples) * localBlend), 0, 255);
+                    int bb = clamp(Math.round((original & 0xFF) * (1f - localBlend) + (b / (float) samples) * localBlend), 0, 255);
+                    blended[index] = 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+                }
+            }
+            Bitmap result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            result.setPixels(blended, 0, width, 0, 0, width, height);
+            source.recycle();
+            return result;
+        }
+    }
+
+    private static final class ExportValidator {
+        static ExportValidationReport validate(
+                Bitmap output,
+                float[] weights,
+                boolean[][] coverage,
+                Calibration calibration,
+                SeamReport seamReport,
+                List<DraftFrameRecord> records) {
+            int holes = 0;
+            int horizonHoles = 0;
+            for (int y = 0; y < OUTPUT_HEIGHT; y++) {
+                int row = y * OUTPUT_WIDTH;
+                for (int x = 0; x < OUTPUT_WIDTH; x++) {
+                    if (weights[row + x] <= 0f) {
+                        holes++;
+                        if (Math.abs(y - OUTPUT_HEIGHT / 2) < OUTPUT_HEIGHT / 12) {
+                            horizonHoles++;
+                        }
+                    }
+                }
+            }
+            int wrapDifference = wrapDifference(output);
+            int topCoverage = rowCoverage(coverage, 0);
+            int bottomCoverage = rowCoverage(coverage, COVERAGE_ROWS - 1);
+            boolean hasLocation = false;
+            boolean hasHeading = false;
+            for (DraftFrameRecord record : records) {
+                hasLocation |= record.location != null && !record.location.isEmpty();
+                hasHeading |= record.capturedPoseAvailable;
+            }
+            ArrayList<String> blockers = new ArrayList<>();
+            ArrayList<String> notes = new ArrayList<>();
+            if (output.getWidth() != OUTPUT_WIDTH || output.getHeight() != OUTPUT_HEIGHT || output.getWidth() != output.getHeight() * 2) {
+                blockers.add("master is not exact 2:1 equirectangular");
+            }
+            if (holes > OUTPUT_WIDTH * OUTPUT_HEIGHT * 0.015f) {
+                blockers.add("major gaps detected");
+            }
+            if (wrapDifference > 42) {
+                blockers.add("broken wrap seam");
+            }
+            if (topCoverage < COVERAGE_COLUMNS / 3 || bottomCoverage < COVERAGE_COLUMNS / 3) {
+                blockers.add("weak pole coverage");
+            }
+            if (calibration.solveDiagnostics.maxResidualPixels > 42f || calibration.solveDiagnostics.meanResidualPixels > 14f) {
+                blockers.add("excessive graph residuals");
+            }
+            if (horizonHoles > OUTPUT_WIDTH * 8 || calibration.solveDiagnostics.closureErrorDegrees > 6f) {
+                blockers.add("horizon or closure needs review");
+            }
+            if (!hasLocation) {
+                notes.add("missing location metadata");
+            }
+            if (!hasHeading) {
+                notes.add("missing heading metadata");
+            }
+            if (seamReport.lowConfidenceSeamPixels > OUTPUT_WIDTH * OUTPUT_HEIGHT / 5) {
+                notes.add("many seam candidates crossed weak overlaps");
+            }
+            String state;
+            if (!blockers.isEmpty()) {
+                state = "Needs review";
+            } else if (!notes.isEmpty()) {
+                state = "Local master";
+            } else if (calibration.solveDiagnostics.parallaxWarnings > 0) {
+                state = "Creative export";
+            } else {
+                state = "Map-ready";
+            }
+            StringBuilder summary = new StringBuilder();
+            summary.append("holes=").append(holes)
+                    .append(", wrapDelta=").append(wrapDifference)
+                    .append(", poles=").append(topCoverage).append('/').append(bottomCoverage);
+            for (String blocker : blockers) {
+                summary.append("; ").append(blocker);
+            }
+            for (String note : notes) {
+                summary.append("; ").append(note);
+            }
+            return new ExportValidationReport(state, summary.toString(), blockers, notes);
+        }
+
+        private static int wrapDifference(Bitmap output) {
+            int[] left = new int[OUTPUT_HEIGHT];
+            int[] right = new int[OUTPUT_HEIGHT];
+            output.getPixels(left, 0, 1, 0, 0, 1, OUTPUT_HEIGHT);
+            output.getPixels(right, 0, 1, OUTPUT_WIDTH - 1, 0, 1, OUTPUT_HEIGHT);
+            long total = 0L;
+            for (int i = 0; i < OUTPUT_HEIGHT; i++) {
+                total += Math.abs(((left[i] >> 16) & 0xFF) - ((right[i] >> 16) & 0xFF));
+                total += Math.abs(((left[i] >> 8) & 0xFF) - ((right[i] >> 8) & 0xFF));
+                total += Math.abs((left[i] & 0xFF) - (right[i] & 0xFF));
+            }
+            return Math.round(total / (OUTPUT_HEIGHT * 3f));
+        }
+
+        private static int rowCoverage(boolean[][] coverage, int row) {
+            int count = 0;
+            for (boolean covered : coverage[clamp(row, 0, coverage.length - 1)]) {
+                if (covered) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+
+    private static final class ExportValidationReport {
+        final String reviewState;
+        final String summary;
+        final List<String> blockers;
+        final List<String> notes;
+
+        ExportValidationReport(String reviewState, String summary, List<String> blockers, List<String> notes) {
+            this.reviewState = reviewState;
+            this.summary = summary;
+            this.blockers = blockers;
+            this.notes = notes;
+        }
+    }
+
+    private static final class PhotoSphereXmp {
+        static void write(File file, List<DraftFrameRecord> records, int coveragePercent) {
+            try {
+                byte[] original = readAll(file);
+                if (original.length < 2 || (original[0] & 0xFF) != 0xFF || (original[1] & 0xFF) != 0xD8) {
+                    return;
+                }
+                String xmp = xmpPacket(records, coveragePercent);
+                byte[] identifier = "http://ns.adobe.com/xap/1.0/\0".getBytes(StandardCharsets.UTF_8);
+                byte[] payload = xmp.getBytes(StandardCharsets.UTF_8);
+                int length = identifier.length + payload.length + 2;
+                if (length > 0xFFFF) {
+                    return;
+                }
+                try (FileOutputStream output = new FileOutputStream(file)) {
+                    output.write(original, 0, 2);
+                    output.write(0xFF);
+                    output.write(0xE1);
+                    output.write((length >> 8) & 0xFF);
+                    output.write(length & 0xFF);
+                    output.write(identifier);
+                    output.write(payload);
+                    output.write(original, 2, original.length - 2);
+                }
+            } catch (IOException ignored) {
+                // XMP is required for map-ready export, but a local master still opens without it.
+            }
+        }
+
+        private static byte[] readAll(File file) throws IOException {
+            try (FileInputStream input = new FileInputStream(file);
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                }
+                return output.toByteArray();
+            }
+        }
+
+        private static String xmpPacket(List<DraftFrameRecord> records, int coveragePercent) {
+            DraftFrameRecord first = records.isEmpty() ? null : records.get(0);
+            String timestamp = first == null
+                    ? ""
+                    : new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                    .format(new java.util.Date(first.createdAt));
+            String heading = first != null && first.capturedPoseAvailable
+                    ? String.format(Locale.US, "%.1f", first.headingDegrees)
+                    : "";
+            String headingTag = heading.isEmpty() ? "" : "<GPano:PoseHeadingDegrees>" + heading + "</GPano:PoseHeadingDegrees>";
+            return "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>"
+                    + "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">"
+                    + "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+                    + "<rdf:Description xmlns:GPano=\"http://ns.google.com/photos/1.0/panorama/\" "
+                    + "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">"
+                    + "<GPano:ProjectionType>equirectangular</GPano:ProjectionType>"
+                    + "<GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>"
+                    + "<GPano:FullPanoWidthPixels>" + OUTPUT_WIDTH + "</GPano:FullPanoWidthPixels>"
+                    + "<GPano:FullPanoHeightPixels>" + OUTPUT_HEIGHT + "</GPano:FullPanoHeightPixels>"
+                    + "<GPano:CroppedAreaImageWidthPixels>" + OUTPUT_WIDTH + "</GPano:CroppedAreaImageWidthPixels>"
+                    + "<GPano:CroppedAreaImageHeightPixels>" + OUTPUT_HEIGHT + "</GPano:CroppedAreaImageHeightPixels>"
+                    + "<GPano:CroppedAreaLeftPixels>0</GPano:CroppedAreaLeftPixels>"
+                    + "<GPano:CroppedAreaTopPixels>0</GPano:CroppedAreaTopPixels>"
+                    + headingTag
+                    + "<GPano:LargestValidInteriorRectLeft>0</GPano:LargestValidInteriorRectLeft>"
+                    + "<GPano:LargestValidInteriorRectTop>0</GPano:LargestValidInteriorRectTop>"
+                    + "<GPano:LargestValidInteriorRectWidth>" + OUTPUT_WIDTH + "</GPano:LargestValidInteriorRectWidth>"
+                    + "<GPano:LargestValidInteriorRectHeight>" + Math.round(OUTPUT_HEIGHT * coveragePercent / 100f) + "</GPano:LargestValidInteriorRectHeight>"
+                    + "<xmp:CreatorTool>Spherify 0.7.4</xmp:CreatorTool>"
+                    + "<xmp:CreateDate>" + timestamp + "</xmp:CreateDate>"
+                    + "</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>";
+        }
+    }
+
     static final class Result {
         final int renderedFrames;
         final int coveragePercent;
         final int missingExposureFrames;
+        final String reviewState;
+        final String validationSummary;
         final List<String> warnings;
 
-        Result(int renderedFrames, int coveragePercent, int missingExposureFrames, List<String> warnings) {
+        Result(
+                int renderedFrames,
+                int coveragePercent,
+                int missingExposureFrames,
+                String reviewState,
+                String validationSummary,
+                List<String> warnings) {
             this.renderedFrames = renderedFrames;
             this.coveragePercent = coveragePercent;
             this.missingExposureFrames = missingExposureFrames;
+            this.reviewState = reviewState;
+            this.validationSummary = validationSummary;
             this.warnings = warnings;
         }
     }
