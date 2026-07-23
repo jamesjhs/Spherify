@@ -87,6 +87,16 @@ final class Phase5Stitcher {
             File outputFile,
             String movementSensitivityMode,
             String renderModeName) throws IOException {
+        return stitch(records, outputFile, movementSensitivityMode, renderModeName, null);
+    }
+
+    static Result stitch(
+            List<DraftFrameRecord> records,
+            File outputFile,
+            String movementSensitivityMode,
+            String renderModeName,
+            SpherifyLibrary.ProgressReporter progress) throws IOException {
+        report(progress, "input", false, "Loading draft frames from the selected session");
         ArrayList<DraftFrameRecord> usable = new ArrayList<>();
         for (DraftFrameRecord record : records) {
             if (record.imageFile.exists()) {
@@ -97,11 +107,23 @@ final class Phase5Stitcher {
         if (usable.isEmpty()) {
             throw new IOException("draft session has no readable frames");
         }
+        report(progress, "input", true, "Loaded " + usable.size() + " readable frames from one session");
+        report(progress, "lens", false, "Estimating lens FOV, radial compensation, and capture profile");
         MovementSensitivity movementSensitivity = MovementSensitivity.from(movementSensitivityMode);
         RenderMode renderMode = RenderMode.from(renderModeName);
         CaptureProfile captureProfile = CaptureProfile.from(usable);
-        Calibration calibration = calibrate(usable, movementSensitivity, captureProfile);
+        CameraLensPriors cameraLensPriors = CameraLensPriors.from(usable);
+        report(progress, "lens", false, "Phase 5B camera priors: " + cameraLensPriors.summary(usable.size()));
+        Calibration calibration = calibrate(usable, movementSensitivity, captureProfile, progress);
+        report(progress, "lens", true, String.format(
+                Locale.US,
+                "Lens model ready: %.1f x %.1f FOV, matched overlaps %d (%d OpenCV)",
+                calibration.lensModel.horizontalFovDegrees,
+                calibration.lensModel.verticalFovDegrees,
+                calibration.matchedOverlapCount,
+                calibration.openCvMatchedOverlapCount));
 
+        report(progress, "render", false, "Allocating 4096 x 2048 equirectangular buffers");
         float[] red = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         float[] green = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
         float[] blue = new float[OUTPUT_WIDTH * OUTPUT_HEIGHT];
@@ -110,9 +132,11 @@ final class Phase5Stitcher {
         int rendered = 0;
         int missingExposure = 0;
 
+        report(progress, "render", false, "Projecting sharp source-selected frames into the master");
         for (DraftFrameRecord record : usable) {
             Bitmap frame = decodeFrame(record.imageFile);
             if (frame == null) {
+                report(progress, "render", false, "Skipped unreadable frame " + record.imageFile.getName());
                 continue;
             }
             if (!record.exposureAvailable) {
@@ -134,13 +158,18 @@ final class Phase5Stitcher {
                     weights);
             frame.recycle();
             rendered++;
+            if (rendered == 1 || rendered == usable.size() || rendered % 5 == 0) {
+                report(progress, "render", false, "Projected " + rendered + "/" + usable.size() + " frames");
+            }
         }
 
         if (rendered == 0) {
             throw new IOException("could not decode any draft frames");
         }
+        report(progress, "render", true, "Projected " + rendered + " frames into the master");
 
-        Bitmap output = composeOutput(red, green, blue, weights);
+        report(progress, "write", false, "Composing final bitmap and writing JPEG");
+        Bitmap output = composeOutput(red, green, blue, weights, progress);
         try (FileOutputStream out = new FileOutputStream(outputFile)) {
             if (!output.compress(Bitmap.CompressFormat.JPEG, 92, out)) {
                 throw new IOException("could not write stitched master");
@@ -150,8 +179,17 @@ final class Phase5Stitcher {
         }
 
         int coveragePercent = Math.round(100f * coveredCells(coverage) / (COVERAGE_COLUMNS * COVERAGE_ROWS));
+        report(progress, "write", true, "Wrote stitched JPEG with estimated coverage " + coveragePercent + "%");
+        report(progress, "metadata", false, "Writing Phase 5 diagnostics into image metadata");
         writeMetadata(outputFile, usable.get(0).sessionId, rendered, coveragePercent, missingExposure, calibration, movementSensitivity, renderMode);
+        report(progress, "metadata", true, "Embedded stitch diagnostics and warning summary");
         return new Result(rendered, coveragePercent, missingExposure, warnings(rendered, coveragePercent, missingExposure, calibration, movementSensitivity));
+    }
+
+    private static void report(SpherifyLibrary.ProgressReporter progress, String stepKey, boolean complete, String message) {
+        if (progress != null) {
+            progress.onProgress(stepKey, complete, message);
+        }
     }
 
     private static Bitmap decodeFrame(File file) {
@@ -171,26 +209,40 @@ final class Phase5Stitcher {
     private static Calibration calibrate(
             List<DraftFrameRecord> records,
             MovementSensitivity movementSensitivity,
-            CaptureProfile captureProfile) {
+            CaptureProfile captureProfile,
+            SpherifyLibrary.ProgressReporter progress) {
         LensModel lensModel = estimateLensModel(records);
         ArrayList<CalibrationFrame> frames = new ArrayList<>();
+        report(progress, "lens", false, "Decoding low-resolution calibration frames");
+        int decodedCandidates = 0;
         for (DraftFrameRecord record : records) {
             CalibrationFrame frame = CalibrationFrame.decode(record, lensModel);
+            decodedCandidates++;
             if (frame != null && !frame.polar) {
                 frames.add(frame);
+            }
+            if (decodedCandidates == 1 || decodedCandidates == records.size() || decodedCandidates % 5 == 0) {
+                report(progress, "lens", false, "Calibration decode " + decodedCandidates + "/" + records.size()
+                        + " candidates, " + frames.size() + " non-polar frames");
             }
         }
         frames.sort((left, right) -> {
             int pitchCompare = Integer.compare(left.basePitchDegrees, right.basePitchDegrees);
             return pitchCompare != 0 ? pitchCompare : Float.compare(left.baseYawDegrees, right.baseYawDegrees);
         });
+        report(progress, "lens", false, "Sorted " + frames.size() + " calibration frames by row and yaw");
 
         HashMap<String, PoseCorrection> corrections = new HashMap<>();
         ArrayList<FeatureMatchEdge> matchEdges = new ArrayList<>();
         int matchedPairs = 0;
         int openCvMatchedPairs = 0;
         float confidenceTotal = 0f;
-        for (FramePair framePair : predictedOverlapPairs(frames, lensModel)) {
+        List<FramePair> overlapPairs = predictedOverlapPairs(frames, lensModel);
+        report(progress, "lens", false, "Predicted " + overlapPairs.size() + " candidate overlap pairs");
+        int processedPairs = 0;
+        int rejectedPairs = 0;
+        for (FramePair framePair : overlapPairs) {
+            processedPairs++;
             CalibrationFrame left = framePair.left;
             CalibrationFrame right = framePair.right;
             PairAdjustment adjustment = matchFeatureOverlap(left, right, movementSensitivity);
@@ -198,6 +250,11 @@ final class Phase5Stitcher {
                 adjustment = correlateOverlap(left, right, movementSensitivity);
             }
             if (adjustment == null || adjustment.confidence < movementSensitivity.minimumConfidence) {
+                rejectedPairs++;
+                if (processedPairs == 1 || processedPairs == overlapPairs.size() || processedPairs % 8 == 0) {
+                    report(progress, "lens", false, "Overlap pair " + processedPairs + "/" + overlapPairs.size()
+                            + ": accepted " + matchedPairs + ", rejected " + rejectedPairs);
+                }
                 continue;
             }
             float yawCorrection = -adjustment.horizontalOffsetPixels
@@ -234,13 +291,20 @@ final class Phase5Stitcher {
                 openCvMatchedPairs++;
             }
             confidenceTotal += adjustment.confidence;
+            if (processedPairs == 1 || processedPairs == overlapPairs.size() || processedPairs % 8 == 0) {
+                report(progress, "lens", false, "Overlap pair " + processedPairs + "/" + overlapPairs.size()
+                        + ": accepted " + matchedPairs + ", OpenCV " + openCvMatchedPairs);
+            }
         }
+        report(progress, "lens", false, "Averaging " + corrections.size() + " pose corrections");
         for (PoseCorrection correction : corrections.values()) {
             correction.averageAndClamp();
         }
         FeatureMatchGraph featureMatchGraph = new FeatureMatchGraph(matchEdges, true);
         GlobalPoseOptimization poseOptimization = GlobalPoseOptimization.from(featureMatchGraph, corrections);
+        report(progress, "lens", false, "Running residual pose-graph optimizer");
         poseOptimization.apply();
+        report(progress, "lens", false, "Estimating sparse parallax hints and exposure gains");
         SparseDepthHints sparseDepthHints = SparseDepthHints.from(featureMatchGraph, captureProfile);
         return new Calibration(
                 lensModel,
@@ -250,6 +314,7 @@ final class Phase5Stitcher {
                 matchedPairs == 0 ? 0f : confidenceTotal / matchedPairs,
                 captureProfile,
                 sparseDepthHints,
+                CameraLensPriors.from(records),
                 estimateExposureGains(frames));
     }
 
@@ -1004,18 +1069,28 @@ final class Phase5Stitcher {
         return new float[]{x * scale, y * scale};
     }
 
-    private static Bitmap composeOutput(float[] red, float[] green, float[] blue, float[] weights) {
+    private static Bitmap composeOutput(
+            float[] red,
+            float[] green,
+            float[] blue,
+            float[] weights,
+            SpherifyLibrary.ProgressReporter progress) {
         int[] pixels = new int[OUTPUT_WIDTH * OUTPUT_HEIGHT];
+        report(progress, "write", false, "Composing output pixels from source weights");
         for (int i = 0; i < pixels.length; i++) {
             if (weights[i] <= 0f) {
                 pixels[i] = 0xFF101820;
-                continue;
+            } else {
+                int r = clamp(Math.round(red[i] / weights[i]), 0, 255);
+                int g = clamp(Math.round(green[i] / weights[i]), 0, 255);
+                int b = clamp(Math.round(blue[i] / weights[i]), 0, 255);
+                pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
             }
-            int r = clamp(Math.round(red[i] / weights[i]), 0, 255);
-            int g = clamp(Math.round(green[i] / weights[i]), 0, 255);
-            int b = clamp(Math.round(blue[i] / weights[i]), 0, 255);
-            pixels[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            if (i > 0 && i % (OUTPUT_WIDTH * 256) == 0) {
+                report(progress, "write", false, "Composed row " + (i / OUTPUT_WIDTH) + "/" + OUTPUT_HEIGHT);
+            }
         }
+        report(progress, "write", false, "Uploading composed pixels into Bitmap");
         Bitmap output = Bitmap.createBitmap(OUTPUT_WIDTH, OUTPUT_HEIGHT, Bitmap.Config.ARGB_8888);
         output.setPixels(pixels, 0, OUTPUT_WIDTH, 0, 0, OUTPUT_WIDTH, OUTPUT_HEIGHT);
         return output;
@@ -1080,7 +1155,7 @@ final class Phase5Stitcher {
             ExifInterface exif = new ExifInterface(file.getAbsolutePath());
             exif.setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, String.format(
                     Locale.US,
-                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; sparseDepthHints=%s",
+                    "Spherify Phase 5 draft stitch; session=%s; frames=%d; estimatedCoverage=%d%%; missingExposure=%d; projection=equirectangular; hfov=%.1f; vfov=%.1f; k1=%.3f; k2=%.3f; matchedOverlaps=%d; openCvMatchedOverlaps=%d; movementSensitivity=%s; renderMode=%s; captureProfile=%s; phase5bLensPrior=%s; posePriors=%d; intrinsicsPriors=%d; focalPriors=%d; sparseDepthHints=%s",
                     sessionId,
                     renderedFrames,
                     coveragePercent,
@@ -1094,6 +1169,10 @@ final class Phase5Stitcher {
                     movementSensitivity.label,
                     renderMode.label,
                     calibration.captureProfile.label,
+                    calibration.cameraLensPriors.sourceLabel,
+                    calibration.cameraLensPriors.posePriorCount,
+                    calibration.cameraLensPriors.intrinsicsPriorCount,
+                    calibration.cameraLensPriors.focalLengthPriorCount,
                     calibration.sparseDepthHints.metadataLabel));
             exif.setAttribute(ExifInterface.TAG_MAKE, "Spherify");
             exif.setAttribute(ExifInterface.TAG_MODEL, "Phase 5 draft stitcher");
@@ -1303,6 +1382,63 @@ final class Phase5Stitcher {
         }
     }
 
+    private static final class CameraLensPriors {
+        final int posePriorCount;
+        final int intrinsicsPriorCount;
+        final int focalLengthPriorCount;
+        final String sourceLabel;
+
+        CameraLensPriors(
+                int posePriorCount,
+                int intrinsicsPriorCount,
+                int focalLengthPriorCount,
+                String sourceLabel) {
+            this.posePriorCount = posePriorCount;
+            this.intrinsicsPriorCount = intrinsicsPriorCount;
+            this.focalLengthPriorCount = focalLengthPriorCount;
+            this.sourceLabel = sourceLabel;
+        }
+
+        static CameraLensPriors from(List<DraftFrameRecord> records) {
+            int pose = 0;
+            int intrinsics = 0;
+            int focal = 0;
+            for (DraftFrameRecord record : records) {
+                if (record.capturedPoseAvailable) {
+                    pose++;
+                }
+                if (record.imageFocalLengthXPixels > 0f
+                        && record.imageFocalLengthYPixels > 0f
+                        && record.imageIntrinsicsWidth > 0
+                        && record.imageIntrinsicsHeight > 0) {
+                    intrinsics++;
+                }
+                if (record.lensFocalLengthMm > 0.5f && record.lensFocalLengthMm < 12f) {
+                    focal++;
+                }
+            }
+            String source = intrinsics > 0
+                    ? "arcore-image-intrinsics"
+                    : focal > 0
+                    ? "physical-focal-sensor-prior"
+                    : "bounded-default-lens-prior";
+            return new CameraLensPriors(pose, intrinsics, focal, source);
+        }
+
+        String summary(int frameCount) {
+            return String.format(
+                    Locale.US,
+                    "source=%s pose=%d/%d intrinsics=%d/%d focal=%d/%d",
+                    sourceLabel,
+                    posePriorCount,
+                    frameCount,
+                    intrinsicsPriorCount,
+                    frameCount,
+                    focalLengthPriorCount,
+                    frameCount);
+        }
+    }
+
     private static final class Calibration {
         final LensModel lensModel;
         final Map<String, PoseCorrection> corrections;
@@ -1311,6 +1447,7 @@ final class Phase5Stitcher {
         final float averageOverlapConfidence;
         final CaptureProfile captureProfile;
         final SparseDepthHints sparseDepthHints;
+        final CameraLensPriors cameraLensPriors;
         final Map<String, Float> exposureGains;
 
         Calibration(
@@ -1321,6 +1458,7 @@ final class Phase5Stitcher {
                 float averageOverlapConfidence,
                 CaptureProfile captureProfile,
                 SparseDepthHints sparseDepthHints,
+                CameraLensPriors cameraLensPriors,
                 Map<String, Float> exposureGains) {
             this.lensModel = lensModel;
             this.corrections = corrections;
@@ -1329,6 +1467,7 @@ final class Phase5Stitcher {
             this.averageOverlapConfidence = averageOverlapConfidence;
             this.captureProfile = captureProfile;
             this.sparseDepthHints = sparseDepthHints;
+            this.cameraLensPriors = cameraLensPriors;
             this.exposureGains = exposureGains;
         }
     }

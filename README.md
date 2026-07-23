@@ -1,10 +1,10 @@
 # Spherify
 
-Version: 0.5.15
+Version: 0.6.1
 
 Spherify is an Android Play Store app concept for creating 360-degree PhotoSphere and Tiny Planet images from a phone camera, device motion sensors, and location services, then saving them locally. Google Maps publishing and Google Photos upload are roadmap items and are not fully implemented in this prototype build.
 
-This repository now contains the first Android proof-of-concept application code. The 0.5.15 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, dot-by-dot photosphere capture with stricter still-keyframe auto capture, first-dot row anchoring, horizon-arrow guidance for high-pitch rows, guided eight-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata and ARCore intrinsics for FOV estimation, timestamp-matched image/metadata capture packets, ARCore metadata accessor hardening, Camera2 `TotalCaptureResult` metadata-buffer scaffolding, safer Capture startup UI threading, safer delete confirmations, rotation-state restore, Android launcher badge assets, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, capture profiles for hand-held versus fixed-gimbal sessions, Tiny Planet import center marking, full-resolution PhotoSphere export, a single sharp source-selected Spherify output for normal use, a strict draft quality gate with readable preflight failure dialogs, a verbose Spherifying status dialog, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, OpenCV ORB/RANSAC pose-graph matching, inlier control-point storage, iterative residual pose-graph correction, exposure gain normalization, movement-sensitive overlap rejection, conservative pose nudges, parallax-risk reporting, and corrected polar sizing.
+This repository now contains the first Android proof-of-concept application code. The 0.6.1 build includes a GPU-backed PhotoSphere/Tiny Planet viewer, local import, app-owned library storage, saved variants, thumbnails, metadata, basic library management, setup/readiness flow, adjustment controls, separated camera-distance and zoom/focal-length controls, refined Tiny Planet camera yaw, safer viewport pitch limits, ARCore-required capture gating, ARCore GL camera preview, ARCore session camera-frame capture, ARCore pose-driven guidance, corrected capture preview orientation, upright draft-frame saves, in-app flat draft-frame viewing, separate compass-calibration and horizon-reference sweeps, start/end landmark alignment for horizon sweeps, dot-by-dot photosphere capture with stricter still-keyframe auto capture, first-dot row anchoring, horizon-arrow guidance for high-pitch rows, guided eight-shot +/-65 degree high-pitch rings for polar-extreme coverage, always-on vertical alignment line, wider capture-progress overlay button, spherical-width preview rows, pitch-aware compass direction, pole-layer colour infill, first-class pending capture records, structured draft exposure metadata with non-blocking capture fallback, captured camera sensor-size metadata and ARCore intrinsics for FOV estimation, timestamp-matched image/metadata capture packets, ARCore metadata accessor hardening, Camera2 `TotalCaptureResult` metadata-buffer scaffolding, safer Capture startup UI threading, safer delete confirmations, rotation-state restore, Android launcher badge assets, tap-to-recapture layers, draft-frame deletion, confirmed bulk draft removal, robust Pending reconciliation after capture, capture profiles for hand-held versus fixed-gimbal sessions, Tiny Planet import center marking, full-resolution PhotoSphere export, a single sharp source-selected Spherify output for normal use, a strict draft quality gate with readable preflight failure dialogs, a compact five-line Spherifying debug terminal with separate completed-step checklist, and an experimental Phase 5 draft-session-to-equirectangular-master generator with calibrated pinhole lens projection, radial compensation, OpenCV ORB/RANSAC pose-graph matching, inlier control-point storage, iterative residual pose-graph correction, exposure gain normalization, Phase 5B camera/lens-prior diagnostics, movement-sensitive overlap rejection, conservative pose nudges, parallax-risk reporting, and corrected polar sizing.
 
 ## Developer Build and Run Runbook
 
@@ -30,7 +30,7 @@ Hard blockers (must be complete before upload):
 - Store listing text, screenshots, and in-app copy must not claim Google Maps publish or Google Photos upload unless that exact behavior is implemented, tested, and user-visible.
 - Permission declarations in the manifest must be minimal and justified by an active user-facing feature.
 
-Current repository compliance snapshot (0.5.15):
+Current repository compliance snapshot (0.6.1):
 
 - Implemented now: ARCore-based capture flow, local-first storage, in-app import/export/share, optional location tagging for draft metadata, experimental local draft stitching into app-created masters.
 - Not implemented now: direct Google Maps publish flow, Google Photos API upload flow, production release pipeline documentation.
@@ -269,6 +269,26 @@ The 0.5.15 investigation showed that the remaining `buffer=0` failure was not a 
 See `docs/CAPTURE_STITCHING_DEEP_DIVE.md` for the detailed research-backed direction and reference links.
 
 ---
+
+### Version 0.6.1 Progress
+
+This bugfix build tightens the live Spherifying diagnostics and starts Phase 5B camera/lens-prior reporting:
+
+- Splits the Spherifying dialog into a compact gross-progress checklist and a separate terminal-style debug stream.
+- Limits the visible terminal output to a five-line scrolling pane while retaining recent debug history for manual scrolling.
+- Keeps gross progress as bullet points that switch to tickmarks when each processing stage completes.
+- Starts Phase 5B by reporting captured pose priors, ARCore image-intrinsics priors, focal-length priors, and the selected lens-prior source in both live progress and stitched JPEG diagnostics.
+- Updates Gradle and the app header to version `0.6.1`.
+
+### Version 0.6.0 Progress
+
+This build commences the Stage 5A workflow in the user-facing Spherify path and makes the long-running process observable:
+
+- Adds a progress callback through `SpherifyLibrary.createMasterFromDraftSession()` and `Phase5Stitcher.stitch()`.
+- Shows a live scrolling debug stream inside the non-cancelable `Spherifying...` dialog while the background stitch job runs.
+- Adds completed-step tickmarks for the Stage 5A quality gate, session loading, lens/pose-graph calibration, sharp projection, JPEG write, diagnostic metadata, and library save.
+- Keeps incomplete sessions blocked before rendering while exposing readable progress and failure context in the popup.
+- Updates Gradle and the app header to version `0.6.0`.
 
 ### Version 0.5.15 Progress
 

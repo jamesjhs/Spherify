@@ -32,7 +32,7 @@
  * Bitmap/BitmapFactory decode images and create thumbnails.
  * File/InputStream/OutputStream classes copy bytes and create directories.
  * org.json classes serialize library and draft metadata.
- * UUID creates collision-resistant ids for image records.
+ * Date labels create friendly ids for image records.
  *
  * Key variables:
  * THUMBNAIL_SIZE: square thumbnail dimension in pixels.
@@ -68,11 +68,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.List;
-import java.util.UUID;
+import java.util.Locale;
 
 final class SpherifyLibrary {
     private static final int THUMBNAIL_SIZE = 320;
@@ -86,6 +88,10 @@ final class SpherifyLibrary {
     private final File metadataFile;
     private final File draftMetadataFile;
     private final ArrayList<LibraryItem> items = new ArrayList<>();
+
+    interface ProgressReporter {
+        void onProgress(String stepKey, boolean complete, String message);
+    }
 
     /*
      * Function: SpherifyLibrary constructor
@@ -131,7 +137,7 @@ final class SpherifyLibrary {
         }
 
         long now = System.currentTimeMillis();
-        String id = newId();
+        String id = newId(now);
         File imageFile = new File(mastersDir, id + ".jpg");
         copy(assetStream, imageFile);
         File thumbnailFile = makeThumbnail(imageFile, id);
@@ -162,7 +168,7 @@ final class SpherifyLibrary {
      */
     LibraryItem importImage(Uri uri, String projection) throws IOException {
         long now = System.currentTimeMillis();
-        String id = newId();
+        String id = newId(now);
         File imageFile = new File(mastersDir, id + ".jpg");
         try (InputStream input = context.getContentResolver().openInputStream(uri)) {
             if (input == null) {
@@ -179,11 +185,12 @@ final class SpherifyLibrary {
         }
 
         File thumbnailFile = makeThumbnail(imageFile, id);
+        String label = friendlyDateLabel(now);
         String title = "flat".equals(projection)
-                ? "Imported Flat " + items.size()
+                ? "Imported Flat " + label
                 : "tinyplanet".equals(projection)
-                ? "Imported Tiny Planet " + items.size()
-                : "Imported PhotoSphere " + items.size();
+                ? "Imported Tiny Planet " + label
+                : "Imported PhotoSphere " + label;
         LibraryItem item = new LibraryItem(
                 id,
                 title,
@@ -211,7 +218,7 @@ final class SpherifyLibrary {
      */
     LibraryItem saveVariant(LibraryItem parent, ProjectionExport export, String projection) throws IOException {
         long now = System.currentTimeMillis();
-        String id = newId();
+        String id = newId(now);
         File imageFile = new File(variantsDir, id + ".png");
         File thumbnailFile = new File(thumbnailsDir, id + ".jpg");
         copy(export.imageFile, imageFile);
@@ -219,7 +226,7 @@ final class SpherifyLibrary {
 
         LibraryItem item = new LibraryItem(
                 id,
-                projection.equals("tinyplanet") ? "Tiny Planet Variant" : "PhotoSphere Variant",
+                (projection.equals("tinyplanet") ? "Tiny Planet Variant " : "PhotoSphere Variant ") + friendlyDateLabel(now),
                 LibraryItem.TYPE_VARIANT,
                 "local",
                 projection,
@@ -243,7 +250,7 @@ final class SpherifyLibrary {
             throw new IOException("source image is missing");
         }
         long now = System.currentTimeMillis();
-        String id = newId();
+        String id = newId(now);
         String extension = fileExtension(sourceFile.getName());
         File imageFile = new File(variantsDir, id + extension);
         copy(sourceFile, imageFile);
@@ -251,7 +258,7 @@ final class SpherifyLibrary {
 
         LibraryItem item = new LibraryItem(
                 id,
-                "Full PhotoSphere Export",
+                "Full PhotoSphere Export " + friendlyDateLabel(now),
                 LibraryItem.TYPE_VARIANT,
                 "local",
                 "sphere",
@@ -280,7 +287,7 @@ final class SpherifyLibrary {
         }
         File destination = new File(
                 directory,
-                "photosphere-full-" + System.currentTimeMillis() + fileExtension(sourceFile.getName()));
+                "photosphere-full-" + friendlyDateLabel(System.currentTimeMillis()) + fileExtension(sourceFile.getName()));
         copy(sourceFile, destination);
         return destination;
     }
@@ -472,9 +479,18 @@ final class SpherifyLibrary {
             LibraryItem draftSession,
             String movementSensitivity,
             String renderMode) throws IOException {
+        return createMasterFromDraftSession(draftSession, movementSensitivity, renderMode, null);
+    }
+
+    StitchMasterResult createMasterFromDraftSession(
+            LibraryItem draftSession,
+            String movementSensitivity,
+            String renderMode,
+            ProgressReporter progress) throws IOException {
         if (draftSession == null || !LibraryItem.TYPE_DRAFT_SESSION.equals(draftSession.type)) {
             throw new IOException("select a draft session first");
         }
+        report(progress, "quality", false, "Running Stage 5A input session integrity checks");
         List<DraftFrameRecord> records = listDraftFrameRecords(draftSession.id);
         if (records.isEmpty()) {
             throw new IOException("draft session has no readable frames");
@@ -483,15 +499,23 @@ final class SpherifyLibrary {
         if (!qualityReport.pass) {
             throw new IOException(qualityReport.failureMessage());
         }
+        report(progress, "quality", true, String.format(
+                "Quality gate passed: %d frames, pose %d/%d, intrinsics %d/%d",
+                qualityReport.readableFrames,
+                qualityReport.poseFrames,
+                qualityReport.readableFrames,
+                qualityReport.intrinsicsFrames,
+                qualityReport.readableFrames));
 
         long now = System.currentTimeMillis();
-        String id = newId();
+        String id = newId(now);
         File imageFile = new File(mastersDir, id + ".jpg");
-        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity, renderMode);
+        Phase5Stitcher.Result stitch = Phase5Stitcher.stitch(records, imageFile, movementSensitivity, renderMode, progress);
+        report(progress, "library", false, "Creating thumbnail and library master record");
         File thumbnailFile = makeThumbnail(imageFile, id);
         LibraryItem item = new LibraryItem(
                 id,
-                "Stitched PhotoSphere " + compactSessionLabel(draftSession.id),
+                "Stitched PhotoSphere " + friendlyDateLabel(now),
                 LibraryItem.TYPE_MASTER,
                 "phase5_stitch",
                 "sphere",
@@ -502,7 +526,14 @@ final class SpherifyLibrary {
                 now);
         items.add(item);
         save();
+        report(progress, "library", true, "Saved master to the local Spherify library");
         return new StitchMasterResult(item, stitch);
+    }
+
+    private static void report(ProgressReporter progress, String stepKey, boolean complete, String message) {
+        if (progress != null) {
+            progress.onProgress(stepKey, complete, message);
+        }
     }
 
     DraftQualityReport assessDraftStitchQuality(LibraryItem draftSession) throws IOException {
@@ -815,7 +846,7 @@ final class SpherifyLibrary {
      */
     File createDraftFrameFile() throws IOException {
         mkdir(draftsDir);
-        return new File(draftsDir, "draft-frame-" + System.currentTimeMillis() + ".jpg");
+        return new File(draftsDir, friendlyDateLabel(System.currentTimeMillis()) + ".jpg");
     }
 
     /*
@@ -1253,7 +1284,7 @@ final class SpherifyLibrary {
         if (dot < 0 || dot >= name.length() - 1) {
             return ".jpg";
         }
-        String extension = name.substring(dot).toLowerCase(java.util.Locale.US);
+        String extension = name.substring(dot).toLowerCase(Locale.US);
         return extension.length() > 6 ? ".jpg" : extension;
     }
 
@@ -1384,11 +1415,15 @@ final class SpherifyLibrary {
 
     /*
      * Function: newId
-     * Arguments: none.
-     * Calls: UUID.randomUUID() and String.replace().
-     * Flow: create a compact id without dashes for file names and metadata keys.
+     * Arguments: createdAt is the creation time in milliseconds.
+     * Calls: friendlyDateLabel().
+     * Flow: create a readable date-based id for file names and metadata keys.
      */
-    private static String newId() {
-        return UUID.randomUUID().toString().replace("-", "");
+    private static String newId(long createdAt) {
+        return friendlyDateLabel(createdAt);
+    }
+
+    private static String friendlyDateLabel(long createdAt) {
+        return new SimpleDateFormat("yyMMddss-SSS", Locale.US).format(new Date(createdAt));
     }
 }

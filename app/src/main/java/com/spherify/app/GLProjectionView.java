@@ -59,6 +59,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -401,7 +404,7 @@ public class GLProjectionView extends GLSurfaceView {
             throw new IOException("could not create export directory");
         }
 
-        String stamp = String.valueOf(System.currentTimeMillis());
+        String stamp = new SimpleDateFormat("yyMMddss-SSS", Locale.US).format(new Date());
         String prefix = mode == Mode.SPHERE ? "photosphere" : "tinyplanet";
         File imageFile = new File(directory, prefix + "-" + stamp + ".png");
         File thumbnailFile = new File(directory, prefix + "-" + stamp + "-thumb.jpg");

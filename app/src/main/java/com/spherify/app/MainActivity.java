@@ -79,6 +79,7 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -86,8 +87,10 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 import androidx.core.content.FileProvider;
 import androidx.core.content.ContextCompat;
@@ -110,10 +113,25 @@ public class MainActivity extends Activity {
     private Button exportButton;
     private AlertDialog activeLibraryDialog;
     private AlertDialog activeStitchDialog;
+    private TextView activeStitchProgressView;
+    private TextView activeStitchLogView;
+    private ScrollView activeStitchScrollView;
+    private final java.util.ArrayDeque<String> activeStitchDebugLines = new java.util.ArrayDeque<>();
+    private Set<String> activeStitchCompletedSteps = new HashSet<>();
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
     private static final float GALLERY_DELETE_SWIPE_DISTANCE = 160f;
     private static final float GALLERY_DELETE_VERTICAL_SLOP = 90f;
+    private static final int STITCH_DEBUG_MAX_LINES = 90;
+    private static final String[][] STITCH_PROGRESS_STEPS = {
+            {"quality", "Stage 5A quality gate"},
+            {"input", "Session frame loading"},
+            {"lens", "Lens and pose-graph calibration"},
+            {"render", "Sharp master projection"},
+            {"write", "JPEG output"},
+            {"metadata", "Diagnostic metadata"},
+            {"library", "Library save"}
+    };
 
     /*
      * Function: onCreate
@@ -163,7 +181,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.5.9");
+        version.setText("0.6.1");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -1350,7 +1368,11 @@ public class MainActivity extends Activity {
         showSpherifyingDialog(item, movementSensitivity, renderMode);
         new Thread(() -> {
             try {
-                StitchMasterResult result = library.createMasterFromDraftSession(item, movementSensitivity, renderMode);
+                StitchMasterResult result = library.createMasterFromDraftSession(
+                        item,
+                        movementSensitivity,
+                        renderMode,
+                        (stepKey, complete, message) -> updateSpherifyingProgress(stepKey, complete, message));
                 runOnUiThread(() -> {
                     if (isFinishing()) return;
                     dismissSpherifyingDialog();
@@ -1378,23 +1400,54 @@ public class MainActivity extends Activity {
      * blends the equirectangular master, and saves the result.
      */
     private void showSpherifyingDialog(LibraryItem item, String movementSensitivity, String renderMode) {
-        TextView message = new TextView(this);
-        message.setTextColor(0xFF0F172A);
-        message.setTextSize(14);
-        message.setLineSpacing(4, 1.0f);
-        message.setPadding(34, 20, 34, 8);
-        message.setText("Preparing " + item.title
-                + "\n\n1. Reading pending capture frames"
-                + "\n2. Estimating lens FOV and radial compensation"
-                + "\n3. Matching OpenCV control points across the pose graph"
-                + "\n4. Optimising frame yaw, pitch, and roll"
-                + "\n5. Projecting a sharp source-selected master"
-                + "\n\nCapture quality gate: strict"
-                + "\nOutput: sharp source-selected master"
-                + "\n\nKeep Spherify open while this finishes.");
+        activeStitchCompletedSteps = new HashSet<>();
+        activeStitchDebugLines.clear();
+
+        activeStitchProgressView = new TextView(this);
+        activeStitchProgressView.setTextColor(0xFFE5E7EB);
+        activeStitchProgressView.setTextSize(12);
+        activeStitchProgressView.setLineSpacing(3, 1.0f);
+        activeStitchProgressView.setPadding(18, 14, 18, 12);
+        activeStitchProgressView.setBackgroundColor(0xFF101820);
+
+        activeStitchLogView = new TextView(this);
+        activeStitchLogView.setTextColor(0xFF7DFF9A);
+        activeStitchLogView.setTextSize(9);
+        activeStitchLogView.setLineSpacing(2, 1.0f);
+        activeStitchLogView.setPadding(18, 10, 18, 10);
+        activeStitchLogView.setBackgroundColor(0xFF07110A);
+        activeStitchLogView.setTypeface(android.graphics.Typeface.MONOSPACE);
+
+        activeStitchScrollView = new ScrollView(this);
+        activeStitchScrollView.setBackgroundColor(0xFF07110A);
+        activeStitchScrollView.addView(activeStitchLogView, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
+        activeStitchScrollView.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(78)));
+
+        LinearLayout dialogContent = new LinearLayout(this);
+        dialogContent.setOrientation(LinearLayout.VERTICAL);
+        dialogContent.setBackgroundColor(0xFF07110A);
+        dialogContent.addView(activeStitchProgressView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        dialogContent.addView(activeStitchScrollView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(78)));
+
+        appendSpherifyingDebug("$ spherify --phase 5A --debug verbose");
+        appendSpherifyingDebug("Preparing " + item.title);
+        appendSpherifyingDebug("Capture quality gate: strict");
+        appendSpherifyingDebug("Output: sharp source-selected master");
+        appendSpherifyingDebug("Movement sensitivity: " + movementSensitivity);
+        appendSpherifyingDebug("Keep Spherify open while this finishes.");
+        renderSpherifyingProgress();
+
         activeStitchDialog = new AlertDialog.Builder(this)
                 .setTitle("Spherifying...")
-                .setView(message)
+                .setView(dialogContent)
                 .create();
         activeStitchDialog.setCancelable(false);
         activeStitchDialog.setCanceledOnTouchOutside(false);
@@ -1407,6 +1460,64 @@ public class MainActivity extends Activity {
             activeStitchDialog.dismiss();
             activeStitchDialog = null;
         }
+        activeStitchProgressView = null;
+        activeStitchLogView = null;
+        activeStitchScrollView = null;
+        activeStitchDebugLines.clear();
+    }
+
+    private void updateSpherifyingProgress(String stepKey, boolean complete, String message) {
+        runOnUiThread(() -> {
+            if (isFinishing() || activeStitchLogView == null) {
+                return;
+            }
+            if (complete) {
+                activeStitchCompletedSteps.add(stepKey);
+            }
+            appendSpherifyingDebug((complete ? "DONE  " : "WORK  ") + message);
+            renderSpherifyingProgress();
+        });
+    }
+
+    private void appendSpherifyingDebug(String message) {
+        activeStitchDebugLines.addLast(String.format(Locale.US, "%1$tH:%1$tM:%1$tS  %2$s", System.currentTimeMillis(), message));
+        while (activeStitchDebugLines.size() > STITCH_DEBUG_MAX_LINES) {
+            activeStitchDebugLines.removeFirst();
+        }
+    }
+
+    private void renderSpherifyingProgress() {
+        if (activeStitchProgressView == null || activeStitchLogView == null) {
+            return;
+        }
+        StringBuilder progress = new StringBuilder();
+        progress.append("Progress\n");
+        for (String[] step : STITCH_PROGRESS_STEPS) {
+            boolean complete = activeStitchCompletedSteps.contains(step[0]);
+            progress.append(complete ? "✓ " : "• ")
+                    .append(step[1])
+                    .append('\n');
+        }
+        activeStitchProgressView.setText(progress.toString());
+
+        StringBuilder message = new StringBuilder();
+        message.append("spherify@phase5:~$ ./stitch --live\n");
+        for (String line : activeStitchDebugLines) {
+            message.append(line).append('\n');
+        }
+        activeStitchLogView.setText(message.toString());
+        ScrollView scrollView = activeStitchScrollView;
+        if (scrollView != null) {
+            scrollView.post(() -> {
+                if (scrollView.getParent() != null) {
+                    scrollView.fullScroll(View.FOCUS_DOWN);
+                }
+            });
+        }
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private void showSpherifyFailure(String message) {

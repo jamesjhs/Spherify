@@ -115,11 +115,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.UUID;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -5181,12 +5182,12 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     /*
      * Function: newSessionId
      * Arguments: none.
-     * Calls: UUID.randomUUID() and String.replace().
-     * Flow: create a compact stable id for all frames in one guided capture
-     * attempt so interrupted drafts can be recognized later.
+     * Calls: SimpleDateFormat.format().
+     * Flow: create a readable stable date id for all frames in one guided
+     * capture attempt so interrupted drafts can be recognized later.
      */
     private static String newSessionId() {
-        return UUID.randomUUID().toString().replace("-", "");
+        return new SimpleDateFormat("yyMMddss-SSS", Locale.US).format(new Date());
     }
 
     /*
