@@ -39,17 +39,17 @@ final class CaptureAnalysisFacts {
         this.rejectionReason = rejectionReason == null ? "" : rejectionReason;
     }
 
-    static CaptureAnalysisFacts placeholder() {
+    static CaptureAnalysisFacts empty() {
         return new CaptureAnalysisFacts(
                 -1.0,
                 -1.0,
                 -1.0,
                 new JSONArray(),
-                "pending",
+                "not_run",
                 0,
                 -1.0,
                 0.0,
-                "pending analysis",
+                "",
                 "");
     }
 
@@ -70,14 +70,14 @@ final class CaptureAnalysisFacts {
 
     static CaptureAnalysisFacts fromJson(JSONObject json) {
         if (json == null) {
-            return placeholder();
+            return empty();
         }
         return new CaptureAnalysisFacts(
                 json.optDouble("blurScore", -1.0),
                 json.optDouble("exposureScore", -1.0),
                 json.optDouble("textureScore", -1.0),
                 json.optJSONArray("predictedOverlapSet"),
-                json.optString("opencvRansacResult", "pending"),
+                json.optString("opencvRansacResult", "not_run"),
                 json.optInt("inlierCount", 0),
                 json.optDouble("residualScore", -1.0),
                 json.optDouble("confidence", 0.0),

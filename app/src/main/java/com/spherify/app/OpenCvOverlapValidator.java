@@ -16,6 +16,7 @@ import org.opencv.core.MatOfDMatch;
 import org.opencv.core.MatOfKeyPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
+import org.opencv.core.Rect;
 import org.opencv.features.BFMatcher;
 import org.opencv.features.ORB;
 import org.opencv.geometry.Geometry;
@@ -32,11 +33,15 @@ final class OpenCvOverlapValidator {
     private static final int MIN_INLIERS = 12;
     private static final double RATIO_TEST = 0.78;
     private static final double RANSAC_REPROJECTION_THRESHOLD = 8.0;
+    private static final double ADJACENT_ROW_MIN_PITCH_DELTA = 16.0;
+    private static final double ADJACENT_ROW_MAX_PITCH_DELTA = 48.0;
+    private static final double VERTICAL_OVERLAP_BAND_FRACTION = 0.62;
 
     CandidateAnalysisResult analyze(
             File candidateFile,
             CandidateQualityReport quality,
-            List<CaptureFrameRecord> predictedNeighbors) {
+            List<CaptureFrameRecord> predictedNeighbors,
+            int candidateTargetPitchDegrees) {
         JSONArray predicted = new JSONArray();
         for (CaptureFrameRecord neighbor : predictedNeighbors) {
             predicted.put(neighbor.id);
@@ -64,7 +69,11 @@ final class OpenCvOverlapValidator {
 
         MatchResult best = null;
         for (CaptureFrameRecord neighbor : predictedNeighbors) {
-            MatchResult result = match(candidateFile, new File(neighbor.rawFacts.filePath), neighbor.id);
+            MatchResult result = match(
+                    candidateFile,
+                    new File(neighbor.rawFacts.filePath),
+                    neighbor,
+                    candidateTargetPitchDegrees);
             if (result != null && (best == null || result.confidence > best.confidence)) {
                 best = result;
             }
@@ -130,7 +139,11 @@ final class OpenCvOverlapValidator {
         }
     }
 
-    private MatchResult match(File candidateFile, File neighborFile, String neighborFrameId) {
+    private MatchResult match(
+            File candidateFile,
+            File neighborFile,
+            CaptureFrameRecord neighbor,
+            int candidateTargetPitchDegrees) {
         Bitmap candidateBitmap = decodeSample(candidateFile);
         Bitmap neighborBitmap = decodeSample(neighborFile);
         if (candidateBitmap == null || neighborBitmap == null) {
@@ -142,17 +155,86 @@ final class OpenCvOverlapValidator {
         Mat neighborRgba = new Mat();
         Mat candidateGray = new Mat();
         Mat neighborGray = new Mat();
-        MatOfKeyPoint candidateKeypoints = new MatOfKeyPoint();
-        MatOfKeyPoint neighborKeypoints = new MatOfKeyPoint();
-        Mat candidateDescriptors = new Mat();
-        Mat neighborDescriptors = new Mat();
-        Mat inlierMask = new Mat();
         try {
             Utils.bitmapToMat(candidateBitmap, candidateRgba);
             Utils.bitmapToMat(neighborBitmap, neighborRgba);
             Imgproc.cvtColor(candidateRgba, candidateGray, Imgproc.COLOR_RGBA2GRAY);
             Imgproc.cvtColor(neighborRgba, neighborGray, Imgproc.COLOR_RGBA2GRAY);
 
+            if (isAdjacentRowPitch(candidateTargetPitchDegrees, neighbor.rawFacts.targetPitchDegrees)) {
+                return adjacentRowBandMatch(
+                        candidateGray,
+                        neighborGray,
+                        neighbor,
+                        candidateTargetPitchDegrees);
+            }
+            MatchResult full = matchGray(candidateGray, neighborGray, neighbor.id, 0, 0, 0, 0);
+            MatchResult band = adjacentRowBandMatch(
+                    candidateGray,
+                    neighborGray,
+                    neighbor,
+                    candidateTargetPitchDegrees);
+            if (band != null && (full == null || band.confidence > full.confidence)) {
+                return band;
+            }
+            return full;
+        } catch (JSONException ignored) {
+            return null;
+        } finally {
+            recycle(candidateBitmap);
+            recycle(neighborBitmap);
+            candidateRgba.release();
+            neighborRgba.release();
+            candidateGray.release();
+            neighborGray.release();
+        }
+    }
+
+    private boolean isAdjacentRowPitch(int candidateTargetPitchDegrees, int neighborTargetPitchDegrees) {
+        double absPitchDelta = Math.abs(candidateTargetPitchDegrees - neighborTargetPitchDegrees);
+        return absPitchDelta >= ADJACENT_ROW_MIN_PITCH_DELTA && absPitchDelta <= ADJACENT_ROW_MAX_PITCH_DELTA;
+    }
+
+    private MatchResult adjacentRowBandMatch(
+            Mat candidateGray,
+            Mat neighborGray,
+            CaptureFrameRecord neighbor,
+            int candidateTargetPitchDegrees) throws JSONException {
+        double pitchDelta = candidateTargetPitchDegrees - neighbor.rawFacts.targetPitchDegrees;
+        double absPitchDelta = Math.abs(pitchDelta);
+        if (absPitchDelta < ADJACENT_ROW_MIN_PITCH_DELTA || absPitchDelta > ADJACENT_ROW_MAX_PITCH_DELTA) {
+            return null;
+        }
+        int candidateBandHeight = Math.max(1, (int) Math.round(candidateGray.height() * VERTICAL_OVERLAP_BAND_FRACTION));
+        int neighborBandHeight = Math.max(1, (int) Math.round(neighborGray.height() * VERTICAL_OVERLAP_BAND_FRACTION));
+        int candidateTop = pitchDelta > 0.0 ? candidateGray.height() - candidateBandHeight : 0;
+        int neighborTop = pitchDelta > 0.0 ? 0 : neighborGray.height() - neighborBandHeight;
+        Mat candidateBand = candidateGray.submat(new Rect(0, candidateTop, candidateGray.width(), candidateBandHeight));
+        Mat neighborBand = neighborGray.submat(new Rect(0, neighborTop, neighborGray.width(), neighborBandHeight));
+        try {
+            return matchGray(candidateBand, neighborBand, neighbor.id, 0, candidateTop, 0, neighborTop);
+        } finally {
+            candidateBand.release();
+            neighborBand.release();
+        }
+    }
+
+    private MatchResult matchGray(
+            Mat candidateGray,
+            Mat neighborGray,
+            String neighborFrameId,
+            double candidateOffsetX,
+            double candidateOffsetY,
+            double neighborOffsetX,
+            double neighborOffsetY) throws JSONException {
+        MatOfKeyPoint candidateKeypoints = new MatOfKeyPoint();
+        MatOfKeyPoint neighborKeypoints = new MatOfKeyPoint();
+        Mat candidateDescriptors = new Mat();
+        Mat neighborDescriptors = new Mat();
+        Mat inlierMask = new Mat();
+        MatOfPoint2f candidateMat = new MatOfPoint2f();
+        MatOfPoint2f neighborMat = new MatOfPoint2f();
+        try {
             ORB orb = ORB.create(ORB_FEATURES);
             orb.detectAndCompute(candidateGray, new Mat(), candidateKeypoints, candidateDescriptors);
             orb.detectAndCompute(neighborGray, new Mat(), neighborKeypoints, neighborDescriptors);
@@ -182,8 +264,6 @@ final class OpenCvOverlapValidator {
             if (candidateControl.size() < MIN_MATCHES) {
                 return null;
             }
-            MatOfPoint2f candidateMat = new MatOfPoint2f();
-            MatOfPoint2f neighborMat = new MatOfPoint2f();
             candidateMat.fromList(candidateControl);
             neighborMat.fromList(neighborControl);
             Mat homography = Geometry.findHomography(
@@ -193,8 +273,10 @@ final class OpenCvOverlapValidator {
                     RANSAC_REPROJECTION_THRESHOLD,
                     inlierMask);
             if (homography.empty() || inlierMask.empty()) {
+                homography.release();
                 return null;
             }
+            homography.release();
             byte[] mask = new byte[(int) inlierMask.total()];
             inlierMask.get(0, 0, mask);
             int inliers = 0;
@@ -212,10 +294,10 @@ final class OpenCvOverlapValidator {
                 inliers++;
                 if (controlPoints.length() < 24) {
                     JSONObject point = new JSONObject();
-                    point.put("candidateX", left.x);
-                    point.put("candidateY", left.y);
-                    point.put("neighborX", right.x);
-                    point.put("neighborY", right.y);
+                    point.put("candidateX", left.x + candidateOffsetX);
+                    point.put("candidateY", left.y + candidateOffsetY);
+                    point.put("neighborX", right.x + neighborOffsetX);
+                    point.put("neighborY", right.y + neighborOffsetY);
                     controlPoints.put(point);
                 }
             }
@@ -225,20 +307,14 @@ final class OpenCvOverlapValidator {
             double residual = residualTotal / inliers;
             double confidence = Math.min(1.0, inliers / 48.0) * Math.max(0.1, 1.0 - Math.min(0.8, residual / 80.0));
             return new MatchResult(neighborFrameId, inliers, residual, confidence, controlPoints);
-        } catch (JSONException ignored) {
-            return null;
         } finally {
-            recycle(candidateBitmap);
-            recycle(neighborBitmap);
-            candidateRgba.release();
-            neighborRgba.release();
-            candidateGray.release();
-            neighborGray.release();
             candidateKeypoints.release();
             neighborKeypoints.release();
             candidateDescriptors.release();
             neighborDescriptors.release();
             inlierMask.release();
+            candidateMat.release();
+            neighborMat.release();
         }
     }
 

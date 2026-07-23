@@ -181,7 +181,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.7.4");
+        version.setText("0.4.1");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -1309,7 +1309,7 @@ public class MainActivity extends Activity {
      * stitchDraftSession().
      * Flow: open only the frames that belong to the selected draft session, so
      * draft captures behave like browseable library records instead of loose
-     * files, with a Phase 5 action to generate a first equirectangular master.
+     * files, with a Spherify action to generate a validated OpenCV master.
      */
     private void showDraftSession(LibraryItem item) {
         List<File> drafts = library.listDraftFrames(item.id);
@@ -1370,8 +1370,8 @@ public class MainActivity extends Activity {
      * Calls: showSpherifyingDialog(), SpherifyLibrary.createMasterFromDraftSession()
      * on a background thread, loadCurrentItem(), and showStitchSummary().
      * Flow: close the pending browser, show a verbose non-cancelable processing
-     * dialog, run the experimental Phase 5 stitch, then make the generated
-     * equirectangular master current without deleting the pending capture.
+     * dialog, run the OpenCV stitch, then make the generated master current
+     * without deleting the pending capture.
      */
     private void stitchDraftSession(LibraryItem item, String movementSensitivity, String renderMode) {
         if (activeLibraryDialog != null) {
@@ -1409,8 +1409,8 @@ public class MainActivity extends Activity {
      * selected overlap rejection mode.
      * Calls: AlertDialog.Builder and TextView setters.
      * Flow: present a clear long-running status surface while the background
-     * Phase 5 job reads frames, estimates lens geometry, correlates overlaps,
-     * blends the equirectangular master, and saves the result.
+     * Spherify job reads accepted graph frames, delegates solving/compositing
+     * to OpenCV, validates GPano requirements, and saves the result.
      */
     private void showSpherifyingDialog(LibraryItem item, String movementSensitivity, String renderMode) {
         activeStitchCompletedSteps = new HashSet<>();
@@ -1450,10 +1450,10 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(78)));
 
-        appendSpherifyingDebug("$ spherify --version 0.7.4 --graph-seam-blend --debug verbose");
+        appendSpherifyingDebug("$ spherify --version 0.4.1 --validated-graph --debug concise");
         appendSpherifyingDebug("Preparing " + item.title);
         appendSpherifyingDebug("Graph-readiness gate: strict");
-        appendSpherifyingDebug("Output: optimized 2:1 equirectangular master");
+        appendSpherifyingDebug("Output: OpenCV native panorama with GPano validation");
         appendSpherifyingDebug("Movement sensitivity: " + movementSensitivity);
         appendSpherifyingDebug("Keep Spherify open while this finishes.");
         renderSpherifyingProgress();
@@ -1514,7 +1514,7 @@ public class MainActivity extends Activity {
         activeStitchProgressView.setText(progress.toString());
 
         StringBuilder message = new StringBuilder();
-        message.append("spherify@0.7.4:~$ ./graph-stitch --live\n");
+        message.append("spherify@0.4.1:~$ ./graph-stitch --live\n");
         for (String line : activeStitchDebugLines) {
             message.append(line).append('\n');
         }
@@ -1574,7 +1574,7 @@ public class MainActivity extends Activity {
 
     /*
      * Function: showStitchSummary
-     * Arguments: result contains the new master and Phase 5 quality summary.
+     * Arguments: result contains the new master and public quality summary.
      * Calls: AlertDialog.Builder and StringBuilder.
      * Flow: tell the user what the first-pass pipeline rendered and identify
      * known weak areas instead of treating every generated master as map-ready.
@@ -1587,7 +1587,7 @@ public class MainActivity extends Activity {
                 .append("\nMissing exposure references: ").append(result.stitch.missingExposureFrames)
                 .append("\n\nPublic quality review: ").append(result.stitch.reviewState)
                 .append("\n").append(result.stitch.validationSummary)
-                .append("\n\nPublishing to Google Maps or Google Photos is not enabled from Spherify.");
+                .append("\n\nPublishing to Google Maps is not enabled from Spherify.");
         if (!result.stitch.warnings.isEmpty()) {
             message.append("\n\nWarnings:");
             for (String warning : result.stitch.warnings) {

@@ -431,10 +431,10 @@ final class SpherifyLibrary {
     String describeCaptureSessionDiagnostics(String sessionId) {
         CaptureSessionRecord session = findCaptureSession(sessionId);
         if (session == null) {
-            return "No 0.7.1 capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
+            return "No 0.4.1 guided capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
         }
         StringBuilder message = new StringBuilder();
-        message.append("Format: 0.7.1 capture session")
+        message.append("Format: 0.4.1 guided capture session")
                 .append("\nSession: ").append(session.id)
                 .append("\nMode: ").append(session.captureMode.label)
                 .append("\nStatus: ").append(session.status.storageValue)
@@ -635,7 +635,7 @@ final class SpherifyLibrary {
         }
         CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
         if (captureSession == null) {
-            throw new IOException("Spherify 0.7.3 requires a validated capture graph; this older draft session has no graph record.");
+            throw new IOException("Spherify 0.4.1 requires a validated guided capture graph; this older draft session has no graph record.");
         }
         GraphReadinessReport graphReadiness = validateCaptureGraphReadiness(captureSession);
         if (!graphReadiness.pass) {
@@ -712,8 +712,8 @@ final class SpherifyLibrary {
             }
         }
         ArrayList<String> blockers = new ArrayList<>();
-        if (acceptedFrameIds.size() < 3) {
-            blockers.add("graph needs at least 3 readable accepted frames; found " + acceptedFrameIds.size());
+        if (acceptedFrameIds.size() < 30) {
+            blockers.add("graph needs at least 30 readable accepted guided frames; found " + acceptedFrameIds.size());
         }
         HashMap<String, Integer> componentIndexes = new HashMap<>();
         for (String frameId : acceptedFrameIds) {
@@ -733,7 +733,7 @@ final class SpherifyLibrary {
             acceptedEdges++;
             union(componentIndexes, edge.fromFrameId, edge.toFrameId);
         }
-        if (acceptedEdges < Math.max(2, acceptedFrameIds.size() - 1)) {
+        if (acceptedEdges < Math.max(acceptedFrameIds.size() - 1, 29)) {
             blockers.add("graph is too sparse after filtering; usable edges " + acceptedEdges + "/" + session.graphEdges.size());
         }
         String root = acceptedFrameIds.isEmpty() ? "" : find(componentIndexes, acceptedFrameIds.get(0));
@@ -747,10 +747,10 @@ final class SpherifyLibrary {
     }
 
     private static boolean graphEdgeLooksSolvable(CaptureGraphEdgeRecord edge) {
-        if (edge.confidence < 0.18 || edge.inlierCount < 8 || edge.controlPoints.length() < 4) {
+        if (edge.confidence < 0.28 || edge.inlierCount < 12 || edge.controlPoints.length() < 6) {
             return false;
         }
-        if (edge.residualScore > 80.0) {
+        if (edge.residualScore > 55.0) {
             return false;
         }
         String parallax = edge.parallaxRiskHint.toLowerCase(Locale.US);
@@ -781,7 +781,7 @@ final class SpherifyLibrary {
         int readableFrames = 0;
         int poseFrames = 0;
         int intrinsicsFrames = 0;
-        int movingOrManualFrames = 0;
+        int nonGuidedFrames = 0;
         int horizon = 0;
         int upper30 = 0;
         int lower30 = 0;
@@ -802,10 +802,8 @@ final class SpherifyLibrary {
                     && record.imageIntrinsicsHeight > 0) {
                 intrinsicsFrames++;
             }
-            if (!record.captureMode.contains("auto")
-                    && !record.captureMode.contains("high-ring")
-                    && !record.captureMode.contains("keyframe")) {
-                movingOrManualFrames++;
+            if (!record.captureMode.contains("dot")) {
+                nonGuidedFrames++;
             }
             if ("handheld".equals(record.captureProfile)) {
                 handheld = true;
@@ -825,45 +823,45 @@ final class SpherifyLibrary {
         }
         ArrayList<String> blockers = new ArrayList<>();
         ArrayList<String> warnings = new ArrayList<>();
-        if (readableFrames < 50) {
-            blockers.add("need about 50+ still keyframes; found " + readableFrames);
+        if (readableFrames < 30) {
+            blockers.add("need at least 30 accepted guided stills for an OpenCV sphere solve; found " + readableFrames);
         }
-        if (horizon < 12) {
-            blockers.add("horizon row needs at least 12 held dots; found " + horizon);
+        if (horizon < 8) {
+            blockers.add("horizon row needs 8 accepted guided dots; found " + horizon);
         }
-        if (upper30 < 10) {
-            blockers.add("+30 row needs at least 10 held dots; found " + upper30);
+        if (upper30 < 8) {
+            blockers.add("+35 row needs 8 accepted guided dots; found " + upper30);
         }
-        if (lower30 < 10) {
-            blockers.add("-30 row needs at least 10 held dots; found " + lower30);
+        if (lower30 < 8) {
+            blockers.add("-35 row needs 8 accepted guided dots; found " + lower30);
         }
-        if (upperHigh < 6) {
-            blockers.add("+65 row needs at least 6 held dots; found " + upperHigh);
+        if (upperHigh < 5) {
+            blockers.add("upper high/pole coverage needs 5 accepted guided dots; found " + upperHigh);
         }
-        if (lowerHigh < 6) {
-            blockers.add("-65 row needs at least 6 held dots; found " + lowerHigh);
+        if (lowerHigh < 5) {
+            blockers.add("lower high/pole coverage needs 5 accepted guided dots; found " + lowerHigh);
         }
-        if (poseFrames < Math.round(readableFrames * 0.8f)) {
-            blockers.add("captured ARCore pose is missing on too many frames");
+        if (poseFrames < readableFrames) {
+            blockers.add("rotation-vector pose is missing on " + (readableFrames - poseFrames) + " accepted frames");
         }
-        if (intrinsicsFrames < Math.round(readableFrames * 0.5f)) {
-            blockers.add("camera intrinsics are missing on too many frames");
+        if (intrinsicsFrames < readableFrames) {
+            blockers.add("Camera2/CameraCharacteristics intrinsics are missing on " + (readableFrames - intrinsicsFrames) + " accepted frames");
         }
-        if (movingOrManualFrames > Math.max(3, readableFrames / 5)) {
-            blockers.add("too many frames look like manual/transitional captures; recapture with dot hold");
+        if (nonGuidedFrames > 0) {
+            blockers.add("all production source frames must come from guided dot capture; non-guided frames " + nonGuidedFrames);
         }
         if (handheld && readableFrames > 0) {
             warnings.add("hand-held indoor captures need extra care around furniture and other close objects");
         }
-        if (readableFrames >= 50 && readableFrames < 58) {
-            warnings.add("capture passed, but extra overlap would make OpenCV matching more reliable");
+        if (readableFrames >= 30 && readableFrames < 34) {
+            warnings.add("capture may be solvable, but completing all 34 targets improves OpenCV matching and GPano confidence");
         }
         return new DraftQualityReport(
                 blockers.isEmpty(),
                 readableFrames,
                 poseFrames,
                 intrinsicsFrames,
-                movingOrManualFrames,
+                nonGuidedFrames,
                 horizon,
                 upper30,
                 lower30,
@@ -1047,7 +1045,7 @@ final class SpherifyLibrary {
 
         static GraphReadinessReport missingSession() {
             ArrayList<String> blockers = new ArrayList<>();
-            blockers.add("Spherify 0.7.3 requires a validated capture graph; no capture-session record was found");
+            blockers.add("Spherify 0.4.1 requires a validated guided capture graph; no capture-session record was found");
             return new GraphReadinessReport(false, 0, 0, 0, 0, blockers);
         }
 
@@ -1254,6 +1252,45 @@ final class SpherifyLibrary {
         }
     }
 
+    int frameGuidedHorizontalTargetYawDegrees(
+            String sessionId,
+            int nominalTargetYawDegrees,
+            int targetPitchDegrees,
+            float capturedYawDegrees) {
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        if (session == null) {
+            return Math.round(normalizeHeading(capturedYawDegrees));
+        }
+        CaptureFrameRecord nearest = null;
+        float nearestDelta = Float.MAX_VALUE;
+        for (CaptureFrameRecord frame : session.frames) {
+            if (frame.role != CaptureFrameRole.ACCEPTED || !new File(frame.rawFacts.filePath).exists()) {
+                continue;
+            }
+            float pitchDelta = Math.abs(targetPitchDegrees - frame.rawFacts.targetPitchDegrees);
+            if (pitchDelta > 18f) {
+                continue;
+            }
+            float yawDelta = Math.abs(signedHeadingDelta(capturedYawDegrees, frameCenterYawDegrees(frame)));
+            if (yawDelta < nearestDelta) {
+                nearestDelta = yawDelta;
+                nearest = frame;
+            }
+        }
+        if (nearest == null) {
+            return Math.round(normalizeHeading(capturedYawDegrees));
+        }
+        float nearestYaw = frameCenterYawDegrees(nearest);
+        float capturedDelta = signedHeadingDelta(capturedYawDegrees, nearestYaw);
+        float nominalDelta = signedHeadingDelta(nominalTargetYawDegrees, nearestYaw);
+        float direction = Math.abs(capturedDelta) >= 2f ? Math.signum(capturedDelta) : Math.signum(nominalDelta);
+        if (direction == 0f) {
+            return Math.round(normalizeHeading(capturedYawDegrees));
+        }
+        float step = Math.min(Math.abs(capturedDelta), idealHorizontalStepDegrees(nearest));
+        return Math.round(normalizeHeading(nearestYaw + direction * Math.max(8f, step)));
+    }
+
     List<CaptureFrameRecord> predictedAcceptedNeighbors(String sessionId, int targetYawDegrees, int targetPitchDegrees) {
         ArrayList<CaptureFrameRecord> neighbors = new ArrayList<>();
         CaptureSessionRecord session = findCaptureSession(sessionId);
@@ -1268,21 +1305,21 @@ final class SpherifyLibrary {
             if (!file.exists()) {
                 continue;
             }
-            float yawDelta = Math.abs(signedHeadingDelta(targetYawDegrees, frame.rawFacts.targetYawDegrees));
+            float yawDelta = Math.abs(signedHeadingDelta(targetYawDegrees, frameCenterYawDegrees(frame)));
             float pitchDelta = Math.abs(targetPitchDegrees - frame.rawFacts.targetPitchDegrees);
             if (pitchDelta <= 42f && yawDelta <= 70f) {
                 neighbors.add(frame);
             }
         }
         Collections.sort(neighbors, (left, right) -> {
-            float leftScore = Math.abs(signedHeadingDelta(targetYawDegrees, left.rawFacts.targetYawDegrees))
+            float leftScore = Math.abs(signedHeadingDelta(targetYawDegrees, frameCenterYawDegrees(left)))
                     + Math.abs(targetPitchDegrees - left.rawFacts.targetPitchDegrees) * 1.5f;
-            float rightScore = Math.abs(signedHeadingDelta(targetYawDegrees, right.rawFacts.targetYawDegrees))
+            float rightScore = Math.abs(signedHeadingDelta(targetYawDegrees, frameCenterYawDegrees(right)))
                     + Math.abs(targetPitchDegrees - right.rawFacts.targetPitchDegrees) * 1.5f;
             return Float.compare(leftScore, rightScore);
         });
-        if (neighbors.size() > 4) {
-            return new ArrayList<>(neighbors.subList(0, 4));
+        if (neighbors.size() > 6) {
+            return new ArrayList<>(neighbors.subList(0, 6));
         }
         return neighbors;
     }
@@ -1387,7 +1424,7 @@ final class SpherifyLibrary {
                         captureProfile,
                         exposure,
                         now);
-                session.status = session.countFrames(CaptureFrameRole.ACCEPTED) >= 3
+                session.status = session.countFrames(CaptureFrameRole.ACCEPTED) >= 34
                         ? SessionStatus.CAPTURE_COMPLETE
                         : SessionStatus.CAPTURING;
             } else {
@@ -1479,13 +1516,13 @@ final class SpherifyLibrary {
                 sessionId,
                 CaptureFrameRole.SOURCE,
                 rawFacts,
-                CaptureAnalysisFacts.placeholder()));
+                CaptureAnalysisFacts.empty()));
         target.frames.add(new CaptureFrameRecord(
                 frameId + "-candidate",
                 sessionId,
                 CaptureFrameRole.CANDIDATE,
                 rawFacts,
-                CaptureAnalysisFacts.placeholder()));
+                CaptureAnalysisFacts.empty()));
         target.status = SessionStatus.CANDIDATE_PENDING_ANALYSIS;
         target.updatedAt = now;
         writeCaptureSessions(sessions);
@@ -1722,7 +1759,8 @@ final class SpherifyLibrary {
     private static boolean readinessPasses(JSONObject readiness) {
         return readiness != null
                 && readiness.optBoolean("cameraPermission", false)
-                && readiness.optBoolean("arCoreTracking", false)
+                && (readiness.optBoolean("arCoreTracking", false)
+                || readiness.optBoolean("rotationVectorAvailable", false))
                 && readiness.optBoolean("gyroRotationVectorStable", false)
                 && readiness.optBoolean("cameraIntrinsicsAvailable", false)
                 && readiness.optBoolean("storageAvailable", false);
@@ -1759,6 +1797,44 @@ final class SpherifyLibrary {
     private static float signedHeadingDelta(float target, float current) {
         float delta = (target - current + 540f) % 360f - 180f;
         return delta < -180f ? delta + 360f : delta;
+    }
+
+    private static float normalizeHeading(float degrees) {
+        float normalized = degrees % 360f;
+        return normalized < 0f ? normalized + 360f : normalized;
+    }
+
+    private static float frameCenterYawDegrees(CaptureFrameRecord frame) {
+        return frame.rawFacts.capturedPoseAvailable
+                ? normalizeHeading(frame.rawFacts.capturedYawDegrees)
+                : normalizeHeading(frame.rawFacts.targetYawDegrees);
+    }
+
+    private static float idealHorizontalStepDegrees(CaptureFrameRecord frame) {
+        JSONObject intrinsics = frame.rawFacts.intrinsics;
+        double fx = firstPositive(
+                intrinsics.optDouble("imageFocalLengthXPixels", 0.0),
+                intrinsics.optDouble("focalLengthXPixels", 0.0),
+                intrinsics.optDouble("fx", 0.0));
+        double width = firstPositive(
+                intrinsics.optDouble("imageIntrinsicsWidth", 0.0),
+                intrinsics.optDouble("width", 0.0));
+        if (fx > 0.0 && width > 0.0) {
+            double horizontalFov = Math.toDegrees(2.0 * Math.atan(width / (2.0 * fx)));
+            return Math.max(10f, Math.min(18f, (float) horizontalFov * 0.28f));
+        }
+        return 14f;
+    }
+
+    private static double firstPositive(double first, double second) {
+        return first > 0.0 ? first : second;
+    }
+
+    private static double firstPositive(double first, double second, double third) {
+        if (first > 0.0) {
+            return first;
+        }
+        return second > 0.0 ? second : third;
     }
 
     private static String normalizeCaptureProfile(String captureProfile) {

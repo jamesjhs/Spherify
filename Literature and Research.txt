@@ -1,0 +1,983 @@
+Codex-
+
+The first important correction is that the best handheld Photo Sphere capture experience was not primarily born inside Google Maps itself. It lived across Google’s camera stack: Android 4.2’s Camera app introduced Photo Sphere in 2012, Google Camera carried it on many Nexus and Pixel devices, Google released Photo Sphere Camera for iOS in 2014, and the standalone Street View app later became the main public capture-and-publish path. Google Maps was often the destination and publishing surface. After the Street View app shutdown around March 2023, Maps continued accepting 360 imagery in some flows, but Google did not preserve the same phone-based guided capture workflow in Maps itself. That distinction matters because the magic was in the capture UI and stitching pipeline, not merely in Maps upload.
+
+The core idea was deceptively simple: instead of asking the user to “paint” the world with an uncontrolled video sweep, Google asked them to collect a structured set of still images from known viewing directions. The interface showed target dots on a virtual sphere around the user. The user moved the phone until the live reticle aligned with a target; when alignment and steadiness were good enough, the app captured a frame, turned that target into a completed state, then presented the next target. Contemporary user guides describe this as lining up a circle with white or blue dots until each dot disappears or changes state, while hands-on reviews from the Android 4.2 era show the app progressively building the sphere from these guided captures. Sources: https://www.dpreview.com/articles/4623343664/hand-on-with-the-android-photosphere-camera/ and https://www.lifewire.com/what-is-android-photo-sphere-1616136.
+
+That target-dot model solved several product and computer-vision problems at once. It made coverage legible to non-experts: the user was not thinking about yaw, pitch, roll, field of view, overlap percentage, or spherical projection. They were just “catching dots.” But under the hood, those dots represented a sampling pattern over a sphere. The app was telling the user where the camera needed to point so the final set of images would cover 360 degrees horizontally and roughly 180 degrees vertically, with enough overlap between adjacent views for robust stitching. This is why the experience felt slower than a sweep panorama but often produced better high-resolution results: it gathered deliberate still frames rather than extracting frames from a moving video stream.
+
+The phone’s inertial sensors were central to the interaction. Gyroscope and accelerometer data gave the app a live estimate of camera orientation; the magnetometer could contribute compass heading, though magnetic heading is noisy indoors and near metal. Sensor fusion let the app place the target constellation in device orientation space and decide when the phone was pointed close enough to a required capture direction. This did not mean the final image relied only on sensors. IMU pose is good enough to guide the human and initialize the layout, but image alignment still has to correct drift, lens behavior, and small hand movements. The clean design decision was to use sensors for capture discipline and use vision algorithms for final registration.
+
+The best part of the old interaction was that it treated the human as part of the stabilizer. It slowed the user down, made them pause on each view, and implicitly encouraged them to rotate from a single standing position. This is exactly what spherical panorama capture needs. A seamless photo sphere assumes the camera rotates around a near-fixed optical center. A handheld phone does not actually rotate around its entrance pupil; the user’s arms swing, the lens translates, and nearby objects shift relative to far objects. That parallax is the enemy of seamless stitching. Google could not eliminate it with UI, but the dot capture method reduced it by discouraging wandering, reducing motion blur, increasing overlap, and letting the stitcher choose better seams.
+
+The stitching pipeline almost certainly followed the classical panorama architecture, adapted for mobile and initialized by orientation sensors. Each captured image has an approximate direction on the sphere. The images are projected into a common spherical coordinate system, local visual features are detected and matched between overlapping frames, geometric transforms are refined, exposure and color are normalized, seams are selected through lower-error regions, and overlapping content is blended. Google has public research around robust image stitching using multiple registrations, graph-based seam reasoning, and avoiding tearing or duplication artifacts; while that paper is not a Photo Sphere product spec, it describes the class of problems Google’s panorama products had to solve. Source: https://research.google/pubs/robust-image-stitching-using-multiple-registrations/.
+
+The reason Photo Sphere could feel “accurate” despite handheld capture was the combination of constrained acquisition and forgiving output geometry. A normal flat panorama often exposes misalignment because straight architectural lines and near-field parallax are obvious. A spherical photo sphere, viewed interactively from the center, can hide some local distortion because the viewer sees only a viewport at a time. Google’s viewer was not presenting a giant stitched poster; it was presenting an immersive projection. Small local warps, blended seams, and cropped missing regions were less visible when rendered as a navigable sphere.
+
+The output format was also part of the system. Google documented Photo Sphere metadata using the GPano XMP schema, including projection type, pose heading, pitch, roll, cropped image dimensions, and full panorama dimensions. That metadata tells viewers such as Google Photos, Street View, or Maps how to interpret a JPEG as an equirectangular or partially cropped spherical panorama instead of a normal flat image. This was crucial: the same pixels without the right metadata could display as a stretched rectangle rather than an immersive sphere. Source: https://developers.google.com/streetview/spherical-metadata. Google’s Android Photo Sphere support page also notes that these features were introduced with Android 4.2’s Photo Sphere camera: https://developers.google.com/streetview/android/panorama.
+
+The capture UI also managed completion and failure states very elegantly. Early Photo Sphere did not require the user to perfectly fill every part of the sphere. The user could stop early and still get a partial panorama, with metadata describing the crop or field coverage. This was a major product choice. Full 360-by-180 capture requires overhead and downward shots, which are awkward on a phone and especially messy at the nadir because the user’s body, feet, and ground parallax dominate. By letting users complete “enough” of the sphere, Google traded mathematical purity for successful everyday captures.
+
+Compared with later fast panorama modes, the old Photo Sphere approach had a different quality philosophy. Sweep panoramas optimize speed and casualness; they capture a continuous motion and build a strip. Photo Sphere optimized spatial completeness and resolution; it asked for many still images at discrete orientations. For landscapes, plazas, trails, interiors with distant walls, and scenes without much movement, this could look surprisingly good. For crowds, trees blowing in the wind, cars, waves, pets, or rooms with nearby furniture, it could fail in predictable ways: duplicated people, broken railings, warped ceilings, smeared seams, or discontinuities where foreground objects shifted between frames.
+
+From a senior product design perspective, the genius was not only the stitching. It was that the UI created the data the algorithm needed. The app did not expose expert controls; it shaped user behavior. It converted “rotate carefully around one point with 30 to 50 percent overlap across a spherical sampling lattice” into “move the phone until the dot is centered.” That is excellent computational photography design: the interface is not decoration over the algorithm, it is the algorithm’s data collection instrument.
+
+The Street View-era publishing layer added another constraint: orientation and geospatial meaning. A photo sphere is not just a pretty image; on Maps it needs a location and a heading. GPano metadata such as pose heading and GPS coordinates let Maps place and orient the sphere. Older Google Views and Street View workflows let users contribute and connect photo spheres into Maps-like experiences; Google’s 2013 Maps blog introduced Views as a way to contribute 360 photo spheres to Google Maps. Source: https://maps.googleblog.com/2013/07/introducing-views-new-way-to-contribute.html. Wired’s 2013 coverage also described users uploading spheres and connecting them into Street View-style paths: https://www.wired.com/story/make-your-own-google-street-view/.
+
+The practical takeaway is that Google’s old handheld Photo Sphere method succeeded because it combined five things: discrete still capture, sensor-guided spherical targeting, overlap-rich coverage, post-capture computer-vision stitching, and metadata-aware spherical display. None of those pieces alone is enough. The dot UI without robust stitching would be brittle. Stitching without guided capture would lack coverage and orientation priors. A good equirectangular image without GPano metadata would not behave correctly in Maps. The old experience worked because product design, sensors, projection geometry, and image stitching were designed as one loop.
+
+Google Gemini-
+Creating a seamless spherical panorama from a handheld device is a fundamentally hostile engineering problem. Unlike a professional capture rig where the camera rotates perfectly around the lens's entrance pupil, a handheld smartphone introduces constant, erratic translational movement. This movement creates severe parallax error, where foreground objects shift independently of the background across overlapping frames. To solve this in previous renditions of the Google Maps and Google Camera apps, the engineering teams had to build a robust pipeline that fused inertial hardware data with advanced computational photography techniques.
+
+## Hardware Integration and Guided Acquisition
+
+The process begins before a single pixel is permanently recorded. To ensure the user captures sufficient overlap to map a full 360-degree sphere, the application relies on low-latency sensor fusion. By sampling the device's Inertial Measurement Unit, specifically integrating the high-frequency rotation data from the gyroscope with the gravity vector from the accelerometer, the software maintains a continuous estimate of the phone's orientation in three-dimensional space.
+
+This tracking drives the augmented reality interface—the familiar blue dots. These targets force the user to capture a structured grid of images rather than a random scattering. As the phone's optical axis aligns with a target vector, the camera automatically fires. The inertial data captured at that exact microsecond is tagged to the image metadata, providing the algorithm with a mathematical initial guess of where that specific frame belongs on the surface of a virtual sphere.
+
+## Feature Extraction and Global Optimization
+
+Inertial data drifts over time and cannot account for the user's arms swaying or the camera translating through space. Therefore, the application hands the initial coordinate map over to a computer vision pipeline. As frames are ingested, the system analyzes the image data to extract scale-invariant keypoints—distinctive corners, textures, and high-contrast edges that look identical regardless of slight changes in viewing angle or lighting.
+
+The algorithm maps these keypoints between overlapping images to establish corresponding pairs. Because a user might take dozens of photos to cover a full sphere, stitching them sequentially would be disastrous; microscopic alignment errors would accumulate, resulting in a massive structural tear when the final image attempts to connect with the first. To prevent this, the system performs a mathematical process called **bundle adjustment**. This algorithm takes all the matched keypoints across all the images and simultaneously solves for the optimal camera rotation and lens distortion parameters for every single frame. It globally distributes the alignment errors across the entire sphere, forcing the geometric puzzle pieces to fit together without a terminal gap.
+
+## Dynamic Seam Finding
+
+Once the images are mathematically aligned and back-projected onto a two-dimensional equirectangular map, the system must decide which pixels to keep in the overlapping zones. Because handheld parallax guarantees that overlapping images will never align perfectly, simply fading one image into another would create ghosting artifacts—transparent, duplicated objects.
+
+Instead, the software executes an optimal seam-finding algorithm, typically relying on **graph-cut optimization**. The system treats the overlapping region as a network and calculates the path of least resistance between the two images. It actively routes the cut boundary through areas of low structural detail, like blank walls or clear skies, and penalizes cuts that intersect with salient features like human faces, sharp architectural lines, or objects that moved between exposures. This ensures that the final transition between two photographs is hidden in the visual noise.
+
+## Frequency-Separated Blending
+
+The final hurdle is lighting. A user creating a photo sphere will inevitably point the camera directly at the sun and then into a dark shadow, causing the camera's auto-exposure and white balance to fluctuate wildly between frames.
+
+To prevent harsh, visible lines where a bright frame meets a dark one, the application employs **multi-band Laplacian pyramid blending**. This technique decomposes the stitched panorama into different spatial frequency layers. The low-frequency data, which contains broad color and brightness information, is blended over a very wide physical gradient to smoothly transition the exposure differences. Conversely, the high-frequency data, which contains the sharp edges and fine textures, is blended over an extremely narrow margin to preserve crisp focus. When these frequency layers are collapsed back together, the result is a continuously illuminated, photorealistic spherical environment synthesized entirely from uncalibrated, handheld data.
+
+ChatGPT Sol-
+The first point to clarify is that the handheld Photo Sphere function was not, for most of its life, actually a capture feature inside Google Maps itself. Google introduced Photo Sphere in the Android 4.2 camera application in October 2012. Google Maps acted as a destination and viewer: Android identified completed spheres with a special panorama MIME type, and Maps accepted geotagged spheres for publication. Google later moved the public contribution workflow into the standalone Street View app, launched in 2015, where users could capture, geolocate and publish a sphere from an Android or iOS phone. The distinction matters because the capture and stitching subsystem belonged to the camera or Street View software, while Maps supplied publication, geographic indexing and spherical viewing. ([blog.google][1])
+
+Google’s internal name for the original subsystem was LightCycle. Parts of Android’s open-source camera rendering interfaces explicitly refer to restoring OpenGL state after LightCycle has made rendering calls, while the computational core was distributed as a native library rather than as ordinary open Android source. Consequently, there is no complete authoritative public listing of the exact feature detector, optimisation constants, seam cost function or blending parameters used by each release. What can be reconstructed with confidence comes from the observable capture interface, Android integration code, Google’s Photo Sphere file specification and the established geometry of panoramic stitching. Some lower-level details must therefore be described as engineering reconstruction rather than confirmed source-code fact. ([Android Git Repositories][2])
+
+The fundamental product-design insight was to turn an unconstrained photographic task into a guided measurement process. A novice user was not asked to understand lens overlap, pitch increments, spherical coordinates or nodal rotation. The application displayed a central aiming ring and a collection of targets positioned around an apparently three-dimensional sphere. In the original Android implementation these were commonly blue dots; the later Street View app used an orange target and an empty circular reticle. When the user moved the phone until the target and reticle coincided, the application automatically captured a frame. New nearby targets then appeared until the horizontal band, upper bands, lower bands, zenith and nadir had been covered. Contemporary descriptions consistently show that the photograph was triggered by alignment rather than by repeatedly pressing a shutter button. ([WIRED][3])
+
+Viewed as a control system, the interface was a closed feedback loop. The desired camera orientation was the target dot. The measured orientation came from the phone’s motion sensors. The error signal was the angular displacement between the target and the centre reticle. The human supplied the actuator by rotating the phone. The automatic shutter closed the loop once angular error and, almost certainly, short-term motion fell below tolerances. This was much more than a friendly overlay. It regulated the angular spacing of the source photographs, enforced useful overlap, discouraged exposures during rapid motion and prevented users from accidentally leaving large holes in the sphere.
+
+The application first needed an orientation estimate for the phone. A gyroscope is well suited to this because it measures rapid angular velocity with low latency; integrating it gives relative orientation. An accelerometer provides a gravity vector that can stabilise pitch and roll over longer periods. A magnetometer can provide an approximate absolute heading, although indoor magnetic distortion makes it unsuitable as the sole source of yaw. A practical implementation fuses these signals into an orientation quaternion or rotation matrix. Google has not published the precise LightCycle fusion filter, but the screen-space target behaviour requires such an orientation estimate, and Google’s wider spherical-camera specification explicitly accommodates gyroscope operation. ([Google for Developers][4])
+
+Sensor orientation alone would not have been accurate enough to produce a high-resolution seamless result. Consumer gyroscopes drift, sensor timestamps do not coincide perfectly with image exposure, the camera module may be mounted a fraction of a degree away from the phone’s nominal axes, and the user moves the lens through space while turning. The inertial estimate was therefore most valuable as an initial pose and as a way to drive the interface. Pixel correspondences in the actual photographs could subsequently refine the geometry.
+
+The target pattern was effectively a sampling lattice on a sphere. Its angular separation had to be smaller than the usable horizontal and vertical field of view of the camera, leaving a generous overlap between adjacent frames. If the usable field of view were, for example, roughly 55 degrees across, targets might be separated by substantially less than 55 degrees so that perhaps a third or more of each frame overlapped its neighbours. The exact pattern could be adjusted by latitude because a ring near the zenith has a smaller circumference than one at the equator. Fewer exposures are therefore required near the poles. Android test material from the period contains explicit references to a LightCycle calibration application and a measured field-of-view value, supporting the conclusion that device-specific optical calibration was important to the capture layout. ([Android Git Repositories][5])
+
+The application also needed camera intrinsics: focal length expressed in pixels, the optical centre of the image, sensor orientation and lens-distortion coefficients. These parameters convert a pixel coordinate into a ray leaving the camera. An inaccurate focal length causes overlap to expand or contract incorrectly as images are combined. An inaccurate principal point causes asymmetric drift. Uncorrected barrel distortion makes straight structures curve differently in neighbouring frames and prevents one rotation from aligning the entire overlap. High-quality panoramic stitching therefore normally corrects radial distortion before or during global optimisation. The standard panoramic literature specifically identifies radial distortion and optical-centre translation as major causes of visible errors. 
+
+The old Photo Sphere mode captured a sequence of still photographs rather than asking the user to perform one uninterrupted video sweep. Google’s own example XMP metadata shows a sphere whose first and last source photographs were taken about 57 seconds apart and whose source count was 50. That should not be interpreted as a fixed requirement for every phone or every sphere, but it demonstrates the intended multi-still architecture and the fairly large number of overlapping views that might be involved. The same metadata example records that exposure lock was not used, showing that at least some Photo Sphere captures allowed exposure to vary during the sequence. ([Google for Developers][6])
+
+Using discrete stills gave Google several advantages over a simple video panorama. Each source frame could use more sensor resolution and a less aggressive compression path than a video frame. The application could wait briefly at each target for angular motion to settle. It could reject a blurred or poorly positioned frame and request another. It also knew a reasonably accurate orientation for every exposure. The disadvantage was elapsed time: people, leaves, waves, vehicles and shadows could move significantly between the first and final frames. The 2025 Pixel panorama team contrasted older video-scanning panorama methods with a newer still-photo pipeline, noting that still photographs provide more image data for alignment and stacking. That modern account is not a specification of the original LightCycle implementation, but it explains the same underlying trade-off. ([blog.google][7])
+
+At capture time, each image could be stored with a timestamp and an estimated orientation. Let K represent the camera’s intrinsic calibration and R_i the estimated rotation for source frame i. For an ideal camera rotating around its optical centre, the transform from image i to image j is governed by a rotational homography of the form H_ij = K R_j R_i inverse K inverse. This is an unusually convenient case: no scene depth is needed because a ray leaving a fixed centre remains the same ray when the camera rotates. The panoramic-stitching literature uses precisely this pure-rotation model as the basis for estimating camera orientation and focal length. 
+
+The inertial pose would allow LightCycle to predict which images overlapped and approximately where their shared content should appear. That drastically reduces the search problem. Instead of comparing every image against every other image across every possible transformation, the system can preferentially compare photographs that were captured at adjacent target positions and search only near the predicted transform. This was especially important on 2012-era mobile processors with limited memory and thermal capacity.
+
+Within each predicted overlap, the stitcher would identify stable visual structures such as corners, textured patches or local gradient patterns and match them between images. Google has not disclosed which detector and descriptor LightCycle used in each version, so it would be unjustified to claim definitively that it used SIFT, SURF, ORB or any one named algorithm. The conventional process, however, is clear: detect repeatable features, construct descriptors, find likely correspondences, and use a robust estimator such as RANSAC to discard false matches. The influential Brown and Lowe panorama system used invariant features, nearest-neighbour matching and RANSAC to estimate pairwise homographies, followed by global bundle adjustment. 
+
+The result of pairwise matching is not yet a sphere. It is a graph in which each photograph is a node and reliable overlaps are edges. The application then needs to solve for a mutually consistent orientation for every node. This is a bundle-adjustment problem: change the rotations, and potentially focal length and distortion parameters, to minimise the total reprojection error of matched features across all overlaps. Optimising all frames together prevents small pairwise errors from accumulating into a large gap when the final horizontal image is connected back to the first one.
+
+Loop closure was particularly valuable. Once the user completed a ring around the horizon, the last images overlapped the first images. That closed loop allowed the optimiser to distribute residual yaw error around the entire ring instead of leaving one conspicuous discontinuity. Additional upper and lower rings created cross-links that constrained pitch and roll. The zenith and nadir frames connected several radial neighbours and further strengthened the graph. The dot-guided capture pattern was therefore simultaneously a user-interface device and a deliberate way of constructing a well-conditioned registration graph.
+
+The accelerometer-derived gravity direction also supplied a natural “up” vector. Without that constraint, a mathematically valid panorama might finish with a wavy horizon or with the whole sphere tilted. Panorama algorithms commonly apply an automatic straightening step after solving the camera rotations. Google’s Photo Sphere metadata similarly defines pose pitch and roll relative to a local world frame whose vertical axis points upward. 
+
+After pose optimisation, every source pixel could be converted into a ray and mapped to a common spherical surface. Internally the implementation could use a spherical mesh, one or more cube faces, or tiled perspective surfaces; the exact LightCycle working representation is not public. The final interchange representation, however, was normally equirectangular, also called Plate Carrée. Longitude maps linearly to horizontal image position and latitude maps linearly to vertical image position. A complete sphere therefore covers 360 degrees horizontally and 180 degrees vertically and normally has a 2:1 aspect ratio. ([Google for Developers][8])
+
+Equirectangular projection is convenient for storage but not uniform in sampling. Pixels near the top and bottom are stretched horizontally because all longitudes converge at the poles on a sphere but occupy the full image width in the rectangular file. That means zenith and nadir regions can look severely distorted when the JPEG is viewed flat, even though they appear normal when rendered through a perspective viewer. It also means that small pose errors near a pole can affect a surprisingly broad strip of the equirectangular output.
+
+Geometric registration is only half the seam problem. Adjacent photographs can have different brightness, colour temperature, vignetting and local contrast. If each frame’s automatic exposure changes independently while the phone passes from a dark room towards a bright window, two geometrically aligned images can still meet at an obvious rectangular boundary. A panorama pipeline therefore estimates photometric relationships from overlapping pixels. At minimum this can involve per-frame gain compensation. More sophisticated processing can estimate colour-channel gains, low-frequency illumination differences and lens shading. Brown and Lowe’s standard pipeline explicitly included gain compensation before multi-band blending, and Google’s metadata allowed the capture software to report whether exposure had been locked. 
+
+The stitcher also had to decide which source photograph should supply each output region. A naïve average of overlapping images produces ghosts whenever registration is imperfect or an object has moved. A better compositor searches for a seam through a region where the source images already look similar, ideally avoiding faces, moving objects and strong edges. The older LightCycle implementation’s precise seam optimiser is not documented. In general panorama systems this stage may use dynamic programming, graph cuts or another minimum-cost labelling method.
+
+Once source ownership has been chosen, the boundary is softened with blending. Simple linear feathering averages images across a fixed-width strip, but this visibly blurs double edges. Multi-band blending separates images into spatial-frequency bands. Low-frequency illumination changes are blended over a broad area, while fine details are blended over a much narrower area. This can conceal exposure transitions without smearing every brick, leaf or letter across a wide seam. Multi-band blending is a long-established technique for image mosaics and is one of the standard explanations for why a stitched panorama can appear continuous even when its source photographs differ slightly. ([persci.mit.edu][9])
+
+The crucial limitation is that the pure-rotation model is only correct when the optical centre remains fixed. A handheld user normally rotates their torso and arms, causing the phone camera to travel along an arc perhaps tens of centimetres across. Near objects then shift relative to distant objects. No single homography can align both depths simultaneously. If the doorway edge is aligned, a nearby chair may split; if the chair is aligned, the doorway may double. Google’s current panorama guidance still tells users to rotate the phone rather than their whole body to minimise perspective shift. ([blog.google][7])
+
+This explains the unintuitive best capture technique. The user should try to rotate the phone around the camera lens’s entrance pupil rather than holding the phone at arm’s length and walking in a circle. With a handset, this means keeping the lens approximately over one fixed point in space and moving the body around it. The interface could encourage steady angular movement, but without depth sensing it could not directly tell whether the lens had translated. It could only detect the consequences later when feature matches failed to agree.
+
+Modern research can cope with parallax by estimating multiple local registrations, depth layers, optical flow or an explicit three-dimensional scene. Google Research has described panorama stitching as three stages—registration, seam finding and blending—and has demonstrated that using multiple registrations for regions at different depths reduces tearing and duplication. That work postdates the original Android 4.2 release and should not be retroactively attributed to the first LightCycle version, but it clearly identifies the problem that the old system was attempting to conceal with overlap, seam placement and blending. ([Google Research][10])
+
+Moving subjects create a related but temporally different problem. A person may appear in one frame, move into an overlap, and then appear again in another frame. A seam optimiser may preserve only one copy, but it can also create a bisected person, a duplicated person or a translucent ghost. Multi-band blending can hide small motion but often makes large motion worse by blending two inconsistent states. This is why the old Photo Sphere instructions worked best in static scenes and why a capture could look excellent in an empty landscape but fail in a crowded room. The standard stitching literature explicitly identifies scene motion as a case that ordinary blending cannot fully resolve. 
+
+Rolling-shutter distortion was another likely source of residual errors. Most phone sensors read the image progressively rather than exposing every row at precisely the same instant. If the phone rotates during readout, the top and bottom of the frame represent slightly different orientations. A single rigid transform can no longer align the complete image. The target-and-pause design indirectly reduced this by encouraging the user to stop before capture. Automatic triggering after alignment also avoided the extra jerk caused by tapping a shutter button.
+
+Textureless and repetitive areas presented opposite matching failures. A blank sky or white wall contains too few stable features, so visual alignment becomes underconstrained and must rely more heavily on the inertial pose. Repetitive windows, tiles or railings produce many plausible but incorrect correspondences. The known capture order, sensor-derived orientation and overlap prediction strongly reduce both problems by restricting which photographs may match and where corresponding features are expected.
+
+The zenith and nadir were the most awkward capture zones. Pointing straight upward is mechanically uncomfortable but usually geometrically clean because the photographer is not in view. Pointing downward reveals the photographer’s feet, legs, shadow and sometimes the phone or hands. It also tends to translate the camera away from the original optical centre. Early Photo Sphere systems did not possess today’s generative object removal. They had to use whatever downward images were captured, choose seams around the photographer where possible, or tolerate a distorted patch at the nadir. This is why many otherwise convincing historical spheres contain their most obvious stitching defect directly beneath the viewer.
+
+After rendering, Google stored the result as an ordinary JPEG augmented with XMP metadata in the GPano namespace. The metadata could state that the file should open in a panorama viewer, identify the capture and stitching software, record the full panorama dimensions, describe a cropped or incomplete sphere, state the source photograph count, record the first and last capture times, and supply pose, heading and exposure-lock information. The format allowed a normal image application to show the equirectangular JPEG while a compatible viewer interpreted it as a sphere. ([Google for Developers][6])
+
+The viewing stage created the impression of three-dimensional projection, but it was not a true three-dimensional reconstruction. The equirectangular image was treated as a texture on the inside of a sphere surrounding a virtual camera. When the user dragged the view or turned the phone, the renderer changed the virtual camera’s yaw, pitch and field of view, projected the relevant rays onto the sphere and sampled the texture. The viewer offered three rotational degrees of freedom, sometimes called 3DoF, but no valid positional movement. If the virtual camera were translated away from the sphere’s centre, nearby objects would not exhibit correct parallax because the file contains colour as a function of direction, not depth or geometry. Google’s Street View documentation describes this explicitly as an equirectangular image wrapped onto a sphere. ([Google for Developers][8])
+
+The perceived seamlessness therefore came from several layers of error control rather than from one miraculous stitching algorithm. The interface prevented missing coverage and enforced overlap. Motion sensors provided immediate orientation and a strong initial estimate. Visual feature matching corrected sensor drift. Global optimisation distributed error across the full capture. Photometric compensation reduced brightness changes. Seam selection avoided the worst disagreement regions. Multi-scale blending concealed low-level boundaries. Spherical viewing then displayed only a perspective window into the large image, making residual distortions less conspicuous than they appear in the flattened equirectangular JPEG.
+
+The transition from the original Android Camera Photo Sphere to Google Camera and then to the Street View app largely preserved this interaction model because it solved the central product problem exceptionally well. The later app changed visual styling, contribution controls, geolocation and publishing, but the orange-dot workflow remained fundamentally the same human-guided spherical sampling process. Google retired the standalone Street View app in March 2023, and its current Maps guidance directs users towards dedicated 360 cameras, third-party capture and stitching software, or developer publishing interfaces rather than providing the old handheld dot-capture workflow inside Maps. ([Google Help][11])
+
+From a senior product-engineering perspective, the most important lesson is that Google did not try to make arbitrary handheld photographs stitch perfectly after the event. It designed the acquisition experience so that the downstream vision problem was constrained before the first frame was processed. The application selected the poses, controlled overlap, captured only near those poses, preserved adjacency and provided a completion map. That reduced an open-ended computer-vision problem to a structured optimisation problem with powerful priors.
+
+A faithful modern reimplementation would follow the same principle but could improve it substantially. It would synchronise camera and inertial timestamps precisely, estimate lens translation using visual-inertial odometry, warn the user when the optical centre moves too far, measure blur before accepting a frame, use depth or multi-plane warps for close objects, detect moving subjects, optimise exposure across the whole sphere, and present a live confidence map rather than merely marking areas as captured. The original method’s enduring strength was the dot-guided, sensor-controlled acquisition model. Its enduring weakness was that it attempted to represent a scene containing depth and motion as though every photograph had been taken from one perfectly fixed point.
+
+[1]: https://blog.google/products-and-platforms/products/nexus/nexus-best-of-google-now-in-three-sizes/ "Nexus: The best of Google, now in three sizes"
+[2]: https://android.googlesource.com/platform/packages/apps/Camera2/%2B/8e963a5/src/com/android/camera/support/glrenderer/GLCanvas.java "src/com/android/camera/support/glrenderer/GLCanvas.java - platform/packages/apps/Camera2 - Git at Google"
+[3]: https://www.wired.com/2012/11/whats-new-in-android-4-2-jelly-bean?utm_source=chatgpt.com "What's New in Android 4.2 Jelly Bean"
+[4]: https://developers.google.com/streetview/open-spherical-camera/reference/options "Options  |  Open Spherical Camera API  |  Google for Developers"
+[5]: https://android.googlesource.com/platform/cts/%2B/jb-mr1-dev%5E1%5E2..jb-mr1-dev%5E1/?utm_source=chatgpt.com "Diff - jb-mr1-dev^1^2..jb-mr1-dev^1 - platform/cts"
+[6]: https://developers.google.com/streetview/spherical-metadata "Photo Sphere XMP Metadata  |  Street View  |  Google for Developers"
+[7]: https://blog.google/products-and-platforms/devices/pixel/tips-how-to-use-pixel-new-panorama-mode/ "4 tips on using Pixel’s upgraded panorama mode"
+[8]: https://developers.google.com/streetview/android "Street View for Mobile  |  Google for Developers"
+[9]: https://persci.mit.edu/pub_abstracts/spline83_abs.html?utm_source=chatgpt.com "A Multiresolution Spline with Application to Image Mosaics"
+[10]: https://research.google/pubs/robust-image-stitching-using-multiple-registrations/ "Robust image stitching using multiple registrations"
+[11]: https://support.google.com/maps/thread/200255151/why-is-google-removing-their-streetview-app?hl=en&utm_source=chatgpt.com "Why is Google removing their StreetView App?"
+
+Google Gemini (academic result)
+## Sensor Fusion and Intuitive Acquisition
+
+Creating a visually appealing photosphere begins with ensuring the raw data is captured with sufficient overlap and minimal motion blur. Relying on a user to manually guess the required overlap usually results in failed stitches. To solve this while maintaining an intuitive interface, we leverage Google ARCore. ARCore's concurrent odometry and mapping handles the complex mathematical processing of sensor fusion, continuously integrating high-frequency gyroscope and accelerometer data with visual feature tracking. This provides a real-time, six-degree-of-freedom pose estimate of the smartphone. By projecting virtual targets, such as floating dots or a wireframe sphere, into the camera preview, the application creates an ergonomic, gamified interface. The user simply moves the phone to align with these targets, and the application automatically triggers the camera shutter when the physical device orientation matches the calculated optimal vector. This abstracts the complexity entirely away from the user while guaranteeing the backend receives a structured grid of images with mathematically known initial spatial relationships.
+
+## Feature Extraction and Geometric Alignment
+
+Once the spatial grid of images is acquired, the system must mathematically correlate them. Relying solely on the inertial data from ARCore is insufficient for pixel-perfect alignment due to microscopic tracking drift and the varying entrance pupil of the handheld device. The computer vision pipeline, typically built upon the OpenCV library, takes over to analyze the pixel data. The system executes feature detection algorithms, such as the Scale-Invariant Feature Transform or Oriented FAST and Rotated BRIEF, to identify distinctive local structures like sharp corners and high-contrast edges across all frames. Because these keypoints are scale and rotation invariant, they remain mathematically recognizable even if the user slightly twisted the phone between shots. The logic then applies a nearest-neighbor search paired with Lowe's ratio test to match these keypoints between overlapping adjacent frames, filtering out ambiguous or false matches. With a clean set of paired coordinates, the Random Sample Consensus algorithm estimates a homography matrix for each image pair, which defines the precise two-dimensional projective transformation required to map the geometry of one image onto another.
+
+## Global Optimization and Bundle Adjustment
+
+A critical failure point in naive mobile stitching pipelines is sequential drift. If the logic simply stitches frame one to frame two, then frame two to frame three, the microscopic alignment errors compound. By the time the user completes a full rotation, the final image will not geometrically align with the first image, resulting in a tearing artifact. To resolve this, the system relies on a mathematical process known as bundle adjustment, frequently implemented using the open-source Ceres Solver library. Ceres Solver formulates the alignment of the entire sphere as a massive non-linear least-squares optimization problem. It takes the tracked keypoints across all overlapping images and simultaneously refines both the three-dimensional coordinates of the scene features and the specific camera pose and lens distortion parameters for every single frame. By globally distributing the geometric error across the entire dataset rather than sequentially accumulating it, bundle adjustment ensures the structural puzzle pieces lock together cohesively.
+
+## Spherical Projection and Frequency Blending
+
+The final mathematical hurdle is translating these aligned images into a seamless, flattened output and normalizing the inevitable exposure fluctuations. The optimized camera poses are used to warp the flat, rectilinear source images onto the inside of a virtual sphere, which is then unrolled into a two-dimensional equirectangular projection. Because the user will inevitably capture images pointing directly into bright light and into dark shadows, the auto-exposure of the Android camera hardware will cause adjacent frames to have drastically different brightness levels. A simple average blend would create a hazy, ghosted transition. Instead, the logic utilizes multi-band Laplacian pyramid blending. This technique computationally decomposes the images into distinct spatial frequency layers. The low-frequency color and brightness data are blended across a wide gradient to smoothly mask the exposure shifts, while the high-frequency structural details and sharp edges are blended across an incredibly narrow margin to maintain crisp focus. Recombining these layers yields a continuous, photorealistic photosphere captured entirely from a handheld mobile device.
+
+Codex (Academic Result)
+**Short answer:** build the capture experience around `CameraX` for broad Android reach, use ARCore only as an optional high-quality pose/depth layer, and use a classic panorama pipeline: guided overlapping capture, camera/lens calibration, feature matching, robust pose estimation, global bundle adjustment, spherical/equirectangular projection, seam finding, exposure compensation, deghosting, and multiband blending.
+
+**Core Literature**
+The most relevant foundational work is still the classic stitching literature, not generative AI.
+
+Brown and Lowe’s automatic panorama method is the key reference: unordered images are matched using invariant local features, false matches are rejected, camera parameters are optimized globally, then gain compensation and straightening improve the result. Their point that multi-row panoramas are harder than single-axis sweeps maps directly to photo spheres. Source: Brown & Lowe, *Automatic Panoramic Image Stitching using Invariant Features*.
+
+Szeliski’s tutorial is the best survey-level foundation. It frames stitching as image registration plus blending, and highlights the practical enemies: parallax, moving objects, exposure variation, blur, ghosting, and seam visibility.
+
+For blending, Burt and Adelson’s multiresolution spline is still the root of modern multiband blending: blend low frequencies over wide regions and high frequencies over narrow regions so seams are less visible.
+
+For global consistency, bundle adjustment is the mathematical backbone: jointly refine camera poses, focal length/intrinsics, and sometimes 3D feature positions by minimizing reprojection error. Triggs et al. remains the standard survey.
+
+**Recommended Architecture**
+Use a tiered pipeline:
+
+1. **Base path, broadest compatibility:** `CameraX` + Android sensors + OpenCV.
+   CameraX supports Android 5.0/API 21+ and Google says this represents over 98% of existing Android devices. This should be the default capture layer.
+
+2. **Enhanced path:** `CameraX` with Camera2 interop.
+   CameraX is built on Camera2 and exposes Camera2 read/write interop for lower-level controls. Use this for AE/AWB locks, sensor timestamps, focal length, stream characteristics, and finer capture control where available.
+
+3. **Premium path:** ARCore optional.
+   ARCore provides motion tracking, environmental understanding, and light estimation, but only on qualified devices. Google lists supported ARCore devices and notes Android/Google Play requirements. So: do not make ARCore mandatory.
+
+4. **Depth path:** ARCore Depth API optional only.
+   Depth is supported only on a subset of ARCore-capable devices. Use it for parallax warnings, foreground masking, and improved deghosting, not as a hard requirement.
+
+**Key Mathematical Logic**
+A reliable photo sphere needs these processing stages:
+
+- **Spherical capture model:** map every image ray onto a unit sphere using camera intrinsics.
+  For pixel `(u, v)`, normalize by intrinsics:
+  `x = (u - cx) / fx`, `y = (v - cy) / fy`, ray = normalize `(x, y, 1)`.
+  Rotate that ray by estimated camera pose, then project to equirectangular:
+  `longitude = atan2(ray.x, ray.z)`, `latitude = asin(ray.y)`.
+
+- **Lens correction:** estimate or read focal length/principal point; correct radial distortion if possible. Wide phone lenses need this.
+
+- **Feature detection and matching:** use SIFT/AKAZE/ORB depending on license/performance needs. Match with ratio test and mutual checks.
+
+- **Robust transform estimation:** use RANSAC to reject bad matches. For pure rotation around the camera center, estimate rotational homographies. For real handheld use, also model small translation/parallax and penalize it.
+
+- **Pose graph:** each captured image is a node; overlaps are edges weighted by feature confidence, ARCore/sensor confidence, blur, and exposure stability.
+
+- **Bundle adjustment:** globally optimize all camera rotations and lens parameters to reduce accumulated drift. This is essential for closing the full 360 loop.
+
+- **Photometric compensation:** solve per-image gain/offset/vignetting correction so brightness does not jump between tiles.
+
+- **Seam finding:** use graph-cut/dynamic programming seams that avoid faces, moving objects, high-frequency edges, and low-confidence overlaps.
+
+- **Multiband blending:** blend Laplacian pyramid bands to hide seams without excessive blur.
+
+- **Deghosting:** detect inconsistent moving objects across overlaps; prefer the sharper, more central, less occluded image, or mask moving regions.
+
+- **Horizon leveling:** use gravity vector/IMU or ARCore pose to align roll/pitch. This is a huge perceptual quality win.
+
+- **Metadata:** export JPEG/WebP plus GPano XMP metadata so viewers recognize it as an equirectangular photo sphere. Google’s Photo Sphere metadata spec covers projection, heading, pitch/roll, crop dimensions, and full panorama dimensions.
+
+**Open Source Libraries**
+Most useful:
+
+- **OpenCV:** best practical on-device CV base. Its stitching module exposes the pipeline pieces and follows the Brown/Lowe-style approach.
+- **Hugin / libpano13:** excellent reference implementation for panorama workflows, projections, control points, and calibration. Hugin is a mature open-source panoramic imaging toolchain.
+- **Enblend / Enfuse:** useful reference/tools for seam blending and exposure fusion; Hugin uses them for seam blending and exposure fusion.
+- **Ceres Solver or g2o:** strong candidates for bundle adjustment if you implement native optimization in C++ via NDK.
+- **Exiv2 or ExifTool-compatible logic:** for writing GPano XMP metadata.
+- **OpenGL ES / Vulkan / RenderScript alternatives:** use GPU shaders for warping, preview, and blending. RenderScript is obsolete, so prefer GPU shaders or native SIMD.
+
+**Android APIs**
+Use:
+
+- `CameraX Preview` for live guided capture.
+- `CameraX ImageCapture` for final stills.
+- `CameraX ImageAnalysis` for real-time blur, exposure, feature, and overlap checks.
+- `camera.cameraControl.setExposureCompensationIndex(...)` where needed; CameraX documents exposure compensation and supported-range querying.
+- `FocusMeteringAction` for tap or automatic metering; CameraX handles AF/AE/AWB regions best-effort across devices.
+- Camera2 interop for `CONTROL_AE_LOCK`, `CONTROL_AWB_LOCK`, sensor timestamp, focal length, hardware level, and stream capabilities.
+- `SensorManager` rotation vector, accelerometer, gyroscope, and magnetometer for non-ARCore pose guidance.
+- ARCore `Session`, `Frame`, `Camera.getPose()`, `Camera.getTrackingState()`, `Camera.getImageIntrinsics()`, `Camera.getTextureIntrinsics()`, `LightEstimate`, and optionally `acquireDepthImage`.
+- ARCore Recording/Playback API for test capture reproducibility; it records camera stream, IMU data, and custom metadata into MP4 for replay.
+
+**Interface Design**
+The UI should hide the math entirely.
+
+Best model: a “follow the dots” sphere.
+
+- Show a live camera view with ghosted target circles on a sphere.
+- Auto-capture when the phone is stable, target is centered, exposure is settled, and overlap is sufficient.
+- Use haptics/audio confirmation per capture.
+- Show progress as a tiny globe, not as a grid of technical tiles.
+- Warn with plain cues: “Move slower”, “Too dark”, “Step back”, “Turn from one spot”.
+- Do not require manual feature points, focal length, exposure, or stitching choices.
+- Let the user retake only bad spots, highlighted on the mini-globe.
+- Keep capture count adaptive: fewer shots for ultra-wide cameras, more for narrow FOV or weak features.
+- Use ARCore pose when present, but gracefully fall back to IMU plus visual overlap.
+
+**Practical Recommendation**
+For a production Android photosphere app in 2026, I’d build:
+
+- `CameraX` first.
+- OpenCV native module for feature detection, matching, warping, seam masks, and blending.
+- A small C++ optimizer using Ceres/g2o or OpenCV bundle adjustment pieces.
+- Optional ARCore layer for pose priors, intrinsics, light estimation, and depth-based quality checks.
+- GPano XMP export.
+- A capture UX that behaves like “paint the inside of a sphere,” with automatic capture and automatic repair suggestions.
+
+The central product principle: the user should feel like they are slowly turning in place, not operating photogrammetry software.
+
+ChatGPT Sol (Academic)
+# Literature synthesis and recommended architecture
+
+The most defensible design is a hybrid system: a guided sequence of still photographs, inertial or AR-derived orientation estimates to control the user interface and initialise alignment, image-based feature matching to correct those estimates, global optimisation across all photographs, spherical warping, exposure compensation, seam selection and multi-resolution blending.
+
+Neither ARCore nor a general-purpose stitching library is sufficient by itself. ARCore can provide a strong camera-pose estimate, calibrated intrinsics and, on some devices, depth information. It should nevertheless be treated as a prior rather than as final geometric truth. Conversely, conventional image stitching can refine alignment very accurately, but without capture guidance it receives poorly spaced images, inadequate overlap, excessive blur and large parallax that no later algorithm can reliably repair.
+
+The central product principle is therefore to constrain the photography before attempting to solve it. A successful consumer interface should prevent bad input rather than expose stitching parameters to the user.
+
+## What makes a smartphone photosphere difficult
+
+A photosphere is usually represented as one equirectangular image covering 360 degrees horizontally and 180 degrees vertically. Its photographs are expected to behave as though they were all taken from one fixed optical centre.
+
+That assumption is approximately valid when a camera rotates about the entrance pupil of its lens. It is violated when a user turns their body, moves the phone at arm’s length, steps around or points the phone down by swinging it in an arc. Nearby objects then move relative to distant objects. This is parallax, and it means that no single rotational transform can align all depths simultaneously.
+
+Other major failure sources are gyroscope drift, uncertain camera calibration, rolling-shutter deformation, changing autofocus, automatic lens switching, exposure and white-balance changes, moving people, low-texture regions such as sky and repetitive patterns such as windows or tiles. The panoramic-stitching literature consistently treats geometric registration, photometric correction, seam selection and blending as separate but interdependent problems. Brown and Lowe’s classical automatic panorama pipeline combines invariant features, robust matching, bundle adjustment, straightening, gain compensation and multi-band blending; Szeliski’s survey additionally emphasises motion models, global registration, compositing, parallax and scene movement. 
+
+A smartphone product should not attempt to solve every arbitrary capture. It should make the user unknowingly produce data that closely satisfies the fixed-centre model.
+
+# The capture experience
+
+## A target-guided spherical capture
+
+The most ergonomic interface is a live camera preview with a central reticle and one visible target positioned on an invisible sphere around the user. The user moves the phone until the reticle covers the target. The application automatically captures when the phone is correctly oriented, sufficiently still and producing an acceptable image.
+
+The user should not press a shutter for every frame, select overlap, understand camera calibration or choose rows and columns. After each accepted exposure, the target advances to the next orientation. A small spherical coverage indicator can show progress, but it should not compete with the immediate task.
+
+A good target acceptance test is not merely:
+
+[
+\text{angular error}<\epsilon
+]
+
+It should combine several signals:
+
+[
+A =
+(\theta < \epsilon_\theta)
+\land
+(|\omega| < \epsilon_\omega)
+\land
+(B > B_{\min})
+\land
+(T = \text{reliable})
+\land
+(O > O_{\min})
+]
+
+Here, (\theta) is angular distance from the target, (\omega) is angular velocity, (B) is a sharpness or blur score, (T) is tracking confidence and (O) is expected or measured overlap with existing frames.
+
+Reasonable initial tuning values might be an angular tolerance of approximately three to five degrees and a short stable period of roughly 150–300 milliseconds. These are engineering starting points, not universal constants; they should be tuned using real captures across low-end, mid-range and high-end phones.
+
+The visible feedback can remain extremely simple:
+
+“Move to the dot.”
+
+“Hold still.”
+
+“Move more slowly.”
+
+“Keep the phone over the same spot.”
+
+“Too dark—turn towards more light.”
+
+“Move back to the previous dot.”
+
+The application should use a visual flash or quiet shutter sound when a frame is accepted. ARCore documentation advises against vibration during AR tracking because device vibration can temporarily interfere with pose estimation, so repeated haptic feedback should be avoided while the capture session remains active. ([Google for Developers][1])
+
+## Adaptive target spacing
+
+Targets should be calculated from the actual camera field of view, rather than using one fixed pattern for every device.
+
+For horizontal field of view (F_h), vertical field of view (F_v), and desired fractional overlap (o), approximate maximum target spacing is:
+
+[
+\Delta\lambda \leq F_h(1-o)
+]
+
+[
+\Delta\phi \leq F_v(1-o)
+]
+
+An overlap around 30–45 per cent is a practical starting range. More overlap improves robustness in low-texture scenes and gives the seam finder greater freedom, but increases capture time and processing cost.
+
+At spherical latitude (\phi), the circumference of a target ring decreases with (\cos\phi). A suitable number of targets around that ring is therefore approximately:
+
+[
+N(\phi)=
+\left\lceil
+\frac{2\pi\cos\phi}{\Delta\lambda}
+\right\rceil
+]
+
+The equatorial ring contains the most targets. Upper and lower rings contain progressively fewer, followed by one or a small number of zenith and nadir views.
+
+The capture scheduler should adapt further when conditions are difficult. If the scene contains blank walls, sky or repeated structures, it can reduce the angular step to generate more overlap. Where images contain abundant stable texture, it may permit slightly larger steps.
+
+## Teach fixed-centre rotation without teaching optics
+
+The one onboarding concept that matters is keeping the camera lens in approximately one place. A brief animation should show the user rotating the phone around its camera, rather than turning with the phone at arm’s length.
+
+The software should reinforce this automatically. On ARCore devices, camera translation between adjacent targets can be measured. When translation exceeds a tuned threshold, the target should pause and a simple instruction should appear. The threshold should vary with estimated scene depth: five centimetres may be harmless in an open landscape but destructive when an object is half a metre away.
+
+On non-ARCore devices, accelerometer integration should not be used to estimate translation. Double integration accumulates error too rapidly. Translation can instead be inferred indirectly from inconsistent feature motion: if foreground and background matches require materially different transforms, the capture probably contains parallax.
+
+# Camera geometry and calibration
+
+## The pinhole model
+
+For a source image pixel in homogeneous coordinates
+
+[
+\mathbf p =
+\begin{bmatrix}
+u\v\1
+\end{bmatrix},
+]
+
+the corresponding camera-space ray is approximately
+
+[
+\mathbf r_c =
+K^{-1}\mathbf p,
+]
+
+where the intrinsic matrix is
+
+[
+K =
+\begin{bmatrix}
+f_x & s & c_x\
+0 & f_y & c_y\
+0 & 0 & 1
+\end{bmatrix}.
+]
+
+The parameters (f_x) and (f_y) are focal lengths in pixels, (c_x,c_y) are the principal point and (s) is usually close to zero.
+
+Real phone lenses require a distortion model. A Brown–Conrady representation is normally sufficient for a standard rear wide camera:
+
+[
+x_d=x(1+k_1r^2+k_2r^4+k_3r^6)
++2p_1xy+p_2(r^2+2x^2)
+]
+
+[
+y_d=y(1+k_1r^2+k_2r^4+k_3r^6)
++p_1(r^2+2y^2)+2p_2xy.
+]
+
+Incorrect focal length causes images to expand or contract relative to one another. Incorrect radial distortion produces alignment that is acceptable near the image centre but increasingly wrong towards the edges.
+
+Android exposes `CameraCharacteristics.LENS_INTRINSIC_CALIBRATION` and lens-distortion information on devices that provide it, but these values are optional and may be `null`. ARCore’s `CameraIntrinsics` supplies focal length, principal point and image dimensions for its CPU and GPU camera streams. ([Android Developers][2])
+
+The implementation should use calibration sources in this order:
+
+ARCore intrinsics for the corresponding ARCore image stream;
+
+Camera2 intrinsic and distortion metadata when available;
+
+an initial focal estimate derived from focal length, sensor dimensions and crop region;
+
+self-calibration during bundle adjustment.
+
+Self-calibration should be conservative. Allowing focal length, principal point and several distortion coefficients to vary freely can let the optimiser explain bad correspondences with physically implausible cameras. A sensible mobile model shares focal length and distortion across all frames from the same session, keeps the principal point near the image centre and uses regularisation around the device-provided initial values.
+
+Digital zoom must remain fixed. The app should also select one physical rear camera and prevent automatic transitions between wide and ultrawide modules. A lens switch changes intrinsics, distortion, optical centre and often colour response, invalidating the assumption of one stable camera.
+
+# Pose estimation
+
+## Inertial fallback path
+
+For broad Android support, the preferred non-ARCore orientation source is `Sensor.TYPE_GAME_ROTATION_VECTOR`. It combines gyroscope and accelerometer information without relying on the magnetic field. Its yaw may slowly drift, but the drift is smooth and can later be corrected by image matching and loop closure.
+
+`Sensor.TYPE_ROTATION_VECTOR` can supply gravity-aligned orientation and an approximate absolute heading, but its magnetometer correction may jump or become distorted indoors. It is useful for initialisation, not as unquestionable geometric truth.
+
+Where no gyroscope-derived rotation vector is available, `TYPE_GEOMAGNETIC_ROTATION_VECTOR` provides a lower-quality fallback based on accelerometer and magnetometer. Such devices should use closer target spacing, longer stability periods and stricter visual verification. The older orientation sensor is deprecated and should not be used. Android’s sensor definitions explicitly distinguish the gyroscope-and-accelerometer game rotation vector from the magnetometer-inclusive rotation vector and the no-gyroscope geomagnetic fallback. ([Android Open Source Project][3])
+
+The Android functions most relevant here are:
+
+`SensorManager.getDefaultSensor()`
+
+`SensorManager.registerListener()`
+
+`SensorManager.getRotationMatrixFromVector()`
+
+`SensorManager.remapCoordinateSystem()`
+
+`SensorManager.getQuaternionFromVector()`
+
+The coordinate transform must account for display rotation, camera sensor orientation and the relationship between Android device axes and camera optical axes. A surprisingly large class of panorama errors comes from getting one of these 90-degree transformations or handedness conventions wrong.
+
+## Gravity as a strong prior
+
+Gravity is especially valuable because it stabilises pitch and roll and establishes a level horizon. Once two cameras have been aligned to gravity, much of their relative orientation is reduced to rotation around the vertical axis. Research on gravity-constrained panoramic stitching shows that this prior can reduce the size of the minimal pose-estimation problem and improve robustness and speed, including cases involving unknown focal length and radial distortion. ([arXiv][4])
+
+This makes the division of responsibility particularly effective:
+
+The inertial subsystem supplies smooth short-term orientation and gravity.
+
+Visual registration corrects yaw drift and small sensor-to-camera calibration errors.
+
+Global optimisation distributes remaining error around the complete sphere.
+
+## ARCore pose
+
+When available, ARCore provides a stronger initial estimate than a standalone rotation vector because it fuses camera observations with inertial measurements. `Camera.getPose()` returns the physical camera pose for the latest frame, while `Camera.getImageIntrinsics()` returns the corresponding CPU-stream intrinsics. ARCore documents the returned physical-camera pose as corresponding to the centre of exposure of the centre image row. ([Google for Developers][5])
+
+Useful ARCore calls include:
+
+`Session.update()`
+
+`Frame.getCamera()`
+
+`Camera.getPose()`
+
+`Camera.getTrackingState()`
+
+`Camera.getImageIntrinsics()`
+
+`Frame.acquireCameraImage()`
+
+`Frame.getAndroidCameraTimestamp()`
+
+`Frame.getImageMetadata()`
+
+`Frame.acquireDepthImage16Bits()`
+
+The pose should be recorded whenever a candidate source image is accepted. It should initialise image registration and power the capture UI, but it should not replace visual bundle adjustment. Visual-inertial pose can drift or adjust as tracking improves, and the timestamp or exposure convention may not exactly match a separately captured high-resolution still.
+
+# Camera and sensor timestamp synchronisation
+
+Timestamp handling is a critical engineering area that is often overlooked.
+
+Camera2’s `CaptureResult.SENSOR_TIMESTAMP` refers to the beginning of exposure of the first sensor row. ARCore’s physical camera pose is specified at the centre of exposure of the centre row. Rolling-shutter skew and exposure duration mean those are not precisely the same instant. Camera2 also exposes `SENSOR_ROLLING_SHUTTER_SKEW` on supporting devices. When the camera timestamp source is `REALTIME`, it can be compared with timestamps in the `elapsedRealtimeNanos()` timebase; when the timestamp source is `UNKNOWN`, cross-subsystem comparison is not guaranteed to be accurate. ([Android Developers][6])
+
+For each accepted frame, store at least:
+
+the image timestamp;
+
+exposure time and ISO;
+
+rolling-shutter skew where available;
+
+camera pose interpolated to the image’s effective centre-of-exposure time;
+
+intrinsic matrix and crop region;
+
+focus distance if available;
+
+AE, AF and AWB states;
+
+sensor orientation;
+
+ARCore tracking state or rotation-vector accuracy.
+
+Maintain a short ring buffer of timestamped orientation samples and interpolate using quaternions. Linear interpolation of Euler angles is unsuitable near angle wrapping and can introduce discontinuities. Spherical linear interpolation, or a normalised quaternion interpolation for very short intervals, is more appropriate.
+
+For normal guided capture, the best rolling-shutter mitigation is preventive: only expose once angular velocity has fallen below a threshold. A sophisticated later version can model row-dependent orientation, but avoiding motion during readout gives a much larger quality improvement per unit of development effort.
+
+Research on handheld stitching has proposed scanline-dependent or differential homographies to address rolling-shutter camera motion, but this is better treated as an advanced correction path rather than an MVP dependency. ([arXiv][7])
+
+# Visual registration
+
+## Restrict the search using the planned capture graph
+
+A conventional automatic stitcher often compares many images to discover which ones overlap. Your application already knows the intended capture order and target orientations, so it can construct a sparse image graph in advance.
+
+Each frame should be matched against:
+
+the previous and next frame in its target ring;
+
+nearby frames in adjacent rings;
+
+the first frame when closing a horizontal ring;
+
+neighbours around the zenith or nadir;
+
+any additional frame whose predicted fields of view intersect.
+
+This substantially reduces computation and false matches. It also allows immediate validation after each capture. A bad photograph can be recaptured while the user is still pointing in the relevant direction.
+
+## Features and correspondence
+
+For a broadly compatible on-device implementation, ORB is a sensible first feature detector and descriptor. It is fast, binary and well supported by OpenCV. SIFT is generally more robust in difficult scale and illumination changes but consumes more CPU and memory. Because guided sphere photographs have predictable scale and orientation, ORB is often adequate if sufficient overlap is enforced.
+
+A practical sequence is:
+
+detect features in a downscaled, distortion-corrected image;
+
+mask low-information or unreliable borders;
+
+predict the overlap using the inertial or AR pose;
+
+retain features only in the predicted overlap;
+
+match descriptors in both directions;
+
+apply ratio and mutual-consistency tests;
+
+estimate a rotational homography with RANSAC or USAC;
+
+check inlier count, spatial distribution and residual error.
+
+Do not accept a match merely because it has many inliers. Fifty inliers clustered around one small poster do not constrain the whole overlap as well as thirty inliers distributed across its width and height.
+
+For camera-to-world rotations (R_i) and (R_j), the pure-rotation mapping from image (i) to image (j) is:
+
+[
+H_{i\rightarrow j}
+==================
+
+K_jR_j^\mathsf{T}R_iK_i^{-1}.
+]
+
+This model is preferable to fitting an arbitrary eight-degree-of-freedom homography when the intended motion is rotation about one centre. An unrestricted homography may produce a lower local residual while introducing non-physical shear and perspective distortion across the complete sphere. The rotational camera model and subsequent global bundle adjustment are central to established panorama methods. 
+
+## Global rotation optimisation
+
+Pairwise transforms accumulate error. If every frame is placed only relative to its predecessor, a one-degree error repeated around a ring produces a major discontinuity where the final image meets the first.
+
+All camera poses must therefore be optimised jointly. A useful objective is:
+
+[
+E =
+\sum_{(i,j,k)}
+\rho
+\left(
+\left|
+\mathbf p_{jk}
+--------------
+
+\pi\left(
+K_jR_j^\mathsf{T}R_i
+K_i^{-1}\mathbf p_{ik}
+\right)
+\right|^2
+\right)
++
+\lambda_p
+\sum_i
+d(R_i,\hat R_i)^2
++
+\lambda_gE_g.
+]
+
+The first term is visual reprojection error for feature correspondence (k). The robust loss (\rho), such as Huber or Cauchy, reduces the influence of remaining mismatches. The second term is a soft prior around the inertial or ARCore orientation (\hat R_i). The gravity term (E_g) keeps the reconstructed vertical direction consistent.
+
+The prior weight should not be fixed blindly. It can increase when ARCore reports stable tracking and decrease when tracking is paused or visual correspondences strongly disagree with the pose.
+
+A closed horizon ring is extremely valuable because the final images overlap the first images. The optimiser can distribute loop-closure error around the ring rather than creating one abrupt seam.
+
+Ceres Solver is suitable when implementing a custom objective. Its standard bundle-adjustment model minimises reprojection error across camera and observation parameters and supports robust loss functions and multiple linear solvers. For a modest photosphere containing perhaps a few dozen frames, a specialised rotation-only problem is far smaller than general structure-from-motion bundle adjustment. ([GitHub][8])
+
+# Spherical projection
+
+Once the camera orientations have been optimised, each source pixel represents a world-space direction:
+
+[
+\mathbf d =
+\frac{R_iK_i^{-1}\mathbf p}
+{|R_iK_i^{-1}\mathbf p|}.
+]
+
+For direction (\mathbf d=(d_x,d_y,d_z)), equirectangular coordinates are:
+
+[
+\lambda=\operatorname{atan2}(d_x,d_z),
+]
+
+[
+\phi=\arcsin(d_y),
+]
+
+[
+u=W\left(\frac{\lambda}{2\pi}+\frac12\right),
+]
+
+[
+v=H\left(\frac12-\frac{\phi}{\pi}\right).
+]
+
+A complete equirectangular sphere normally has a 2:1 aspect ratio.
+
+Rendering should use inverse mapping: for each destination pixel, compute its spherical direction, transform that direction into each candidate source camera and sample the source image. Forward mapping source pixels into the panorama tends to leave holes and uneven sampling.
+
+Internally, a cube map can be easier to manage near the poles because it avoids the severe horizontal stretching of equirectangular coordinates at the zenith and nadir. The final cube faces can then be converted to a 2:1 equirectangular image for export. Szeliski’s treatment describes the relationship between camera rays and spherical or cylindrical coordinates and the role of these projections in panoramic composition. 
+
+# Exposure, colour and seam processing
+
+## Exposure and white-balance consistency
+
+Allowing completely independent automatic exposure and local HDR processing for each frame can create strong brightness transitions. Fully locking exposure avoids transitions but may produce severely underexposed and overexposed areas as the user turns from a dark interior towards a window.
+
+A practical compromise is to stabilise AE and AWB before each exposure, limit sudden changes and record all capture metadata. After alignment, solve photometric corrections from overlapping pixels.
+
+For per-channel gains (a_i) and offsets (b_i), a basic optimisation is:
+
+[
+E_{\mathrm{photo}}=
+\sum_{i,j}
+\sum_{x\in\Omega_{ij}}
+w(x)
+\left|
+a_iI_i(x)+b_i
+-------------
+
+a_jI_j(T_{ij}x)-b_j
+\right|^2.
+]
+
+Robust weighting should suppress moving objects, saturated pixels, deep shadows and areas near geometric misalignment. In many cases gain correction alone is safer than unconstrained offsets because it is less likely to flatten blacks or create colour casts.
+
+## Seam selection
+
+Even well-registered photographs rarely agree perfectly. The seam finder chooses which source supplies each part of an overlap.
+
+A useful seam cost can combine:
+
+[
+C =
+w_cC_{\mathrm{colour}}
++
+w_gC_{\mathrm{gradient}}
++
+w_mC_{\mathrm{motion}}
++
+w_sC_{\mathrm{saliency}}
++
+w_dC_{\mathrm{depth}}.
+]
+
+The seam should avoid strong edges, faces, text, moving people and depth discontinuities. It should favour low-contrast, visually unimportant regions where a small discrepancy is unlikely to be noticed.
+
+Graph-cut seam selection is a strong general-purpose choice. Dynamic-programming seam finders can be faster, but are less flexible when overlaps are irregular.
+
+## Multi-band blending
+
+Simple feathering averages images across a fixed-width boundary. It works for very small brightness differences but causes doubled or blurred edges when alignment is imperfect.
+
+Multi-band blending decomposes images into frequency bands. Low-frequency illumination differences are blended across a broad region, while high-frequency detail is blended only close to the seam. This preserves texture while hiding gradual colour and exposure differences. Multi-band blending is a standard component of the Brown–Lowe pipeline and is directly available in OpenCV. 
+
+For mobile memory control, seam finding and exposure estimation can operate on reduced-resolution images. Full-resolution images are then decoded, warped and blended in tiles rather than all being held simultaneously.
+
+# Parallax and movement
+
+## Detect rather than blindly blend
+
+A pure rotational panorama should produce residual feature errors without a strong relationship to scene depth. With parallax, matches on nearby objects systematically disagree with matches on the background.
+
+A useful parallax score can be derived by fitting the global rotational model and then examining whether residual vectors form coherent spatial clusters. ARCore depth, where available, can make this test stronger: if residual magnitude correlates with inverse depth, translation is likely.
+
+When severe parallax is detected during capture, the best solution is immediate recapture with better fixed-centre rotation. That is more reliable than trying to repair it later.
+
+## Local warping
+
+For moderate parallax, one global homography can be replaced or supplemented by smoothly varying local transformations. As-Projective-As-Possible and Adaptive As-Natural-As-Possible approaches use local homographies or smoothly varying stitching fields to improve local alignment while limiting unnatural perspective distortion away from overlaps. ([IBM Research][9])
+
+Google Research has also demonstrated that multiple registrations or layer-like treatments can substantially improve panoramas containing motion or parallax. ([Google Research][10])
+
+These methods should be applied cautiously to a sphere. A highly flexible two-dimensional warp can make one overlap look good while breaking spherical consistency elsewhere. The recommended order is:
+
+optimise one physically meaningful spherical camera model;
+
+identify only the overlaps with structured residuals;
+
+apply a regularised local correction inside those overlaps;
+
+constrain the correction to fade towards zero away from the seam.
+
+## Moving subjects
+
+Moving people or vehicles should generally not be averaged. Estimate motion masks by comparing aligned overlap images and choose one temporal source for each moving region. The seam cost should strongly discourage cutting through a face or body.
+
+A consumer interface can also prevent many failures: when a moving person occupies a target region, wait briefly before auto-capture or suggest continuing and later returning to that target.
+
+# The proper role of ARCore
+
+ARCore is highly useful, but making it mandatory would unnecessarily restrict device coverage. Google explicitly supports an AR Optional application mode in which the application runs on non-ARCore devices and activates AR features only where supported. ARCore certification itself evaluates camera, sensors, device design and processing performance, so it represents a capable but not universal subset of Android hardware. ([Google for Developers][11])
+
+On a supported device, ARCore should contribute:
+
+a stable live target orientation;
+
+camera-to-world rotation;
+
+camera translation for fixed-centre warnings;
+
+camera intrinsics;
+
+tracking confidence;
+
+accurately associated camera timestamps;
+
+optional depth and depth confidence;
+
+a sparse point cloud for scene-quality assessment.
+
+It should not be the sole source of final alignment.
+
+## Shared Camera
+
+ARCore Shared Camera allows an application to use Camera2 alongside ARCore. This is the most coherent route when high-quality source images and AR poses must come from one camera session. The app creates an ARCore session supporting camera sharing, opens the camera through ARCore-wrapped Camera2 callbacks and adds its own compatible output surfaces. ([Google for Developers][12])
+
+However, output-stream combinations must be negotiated at runtime. Camera2 defines supported combinations, but available resolution and throughput are constrained by hardware level, memory, CPU load and thermal conditions. Even Camera2-compatible devices cannot be assumed to sustain an arbitrary preview, AR tracking stream, analysis stream and full-resolution JPEG stream simultaneously. ([Android Developers][13])
+
+A sensible shared-camera configuration is:
+
+an ARCore-required tracking stream;
+
+a display preview;
+
+one moderate-resolution YUV analysis or capture stream;
+
+occasional JPEG capture only where the configuration is confirmed to work reliably.
+
+For product consistency, a moderate two-to-four-megapixel source image may produce a better sphere than maximum-resolution photographs that cause long pauses, thermal throttling or memory failures. High-resolution export can be a separate capability tier.
+
+## Depth API
+
+ARCore Depth can identify nearby geometry, estimate parallax risk and help select seams. It does not require a time-of-flight sensor because depth can be estimated from camera motion and optionally combined with hardware depth sensing. It must be checked and enabled at runtime, and not all ARCore devices support it. ([Google for Developers][14])
+
+Depth should remain an enhancement rather than a baseline requirement. ARCore depth images are substantially lower resolution than source photographs, can be unavailable in poor lighting or with insufficient motion, and may represent a previous estimate reprojected to the current pose. ([Google for Developers][15])
+
+The most reliable uses are therefore:
+
+warning about nearby objects and camera translation;
+
+penalising seams across depth edges;
+
+dividing an overlap into approximate foreground and background layers;
+
+supporting local depth-aware warping.
+
+Attempting to reconstruct a metrically perfect dense 3D scene from every capture would add complexity without guaranteeing a visibly better sphere on ordinary devices.
+
+# Android implementation strategy
+
+## Broad compatibility path
+
+The application should perform a capability probe at launch rather than maintain a hard-coded list of phone models.
+
+Record:
+
+Camera2 hardware level and supported stream combinations;
+
+available rear physical cameras;
+
+gyroscope and rotation-vector support;
+
+Camera2 intrinsic and distortion metadata availability;
+
+timestamp source;
+
+ARCore availability and installation status;
+
+ARCore Depth support;
+
+memory class and available storage;
+
+OpenGL ES capability;
+
+tested output resolutions.
+
+A practical single-codebase minimum is Android API 24, matching the current baseline for actual ARCore functionality. If pre-24 support is commercially important, ARCore can be isolated behind an optional module while the CameraX and sensor path remains available on older devices. ([Google for Developers][16])
+
+## CameraX fallback
+
+For devices not using ARCore Shared Camera, CameraX offers the broadest maintainable camera abstraction.
+
+Use:
+
+`Preview` for the live user interface;
+
+`ImageAnalysis` for blur, brightness, overlap and feature checks;
+
+`ImageCapture` for accepted source frames;
+
+`Camera2Interop` or Camera2 metadata callbacks where exact controls or metadata are needed.
+
+CameraX explicitly separates preview, analysis and image-capture use cases and handles much of the device-specific output configuration. Images supplied to analysis commonly remain in sensor orientation, so rotation and crop transforms must be applied consistently before geometry is computed. ([Android Developers][17])
+
+CameraX is preferable for the general fallback path. Direct Camera2 is preferable where ARCore Shared Camera, exact stream selection, physical-camera selection or detailed sensor metadata is essential.
+
+# Open-source libraries
+
+## OpenCV
+
+OpenCV should be the principal native computer-vision dependency. Its high-level `cv::Stitcher` can produce ordinary panoramas, but a production photosphere should use the lower-level `cv::detail` pipeline so that sensor priors, the known capture graph and custom quality decisions can be injected.
+
+Relevant components include:
+
+`cv::ORB`, `cv::SIFT` and `cv::AKAZE`;
+
+`cv::BFMatcher` and `cv::FlannBasedMatcher`;
+
+`cv::findHomography` with RANSAC or USAC;
+
+`cv::detail::BestOf2NearestMatcher`;
+
+`cv::detail::HomographyBasedEstimator`;
+
+`cv::detail::BundleAdjusterRay`;
+
+`cv::detail::SphericalWarper`;
+
+`cv::detail::ExposureCompensator`;
+
+`cv::detail::GraphCutSeamFinder`;
+
+`cv::detail::MultiBandBlender`;
+
+`cv::detail::waveCorrect`.
+
+OpenCV’s stitching module exposes panorama-mode homography estimation, seam finders including graph-cut and dynamic-programming variants, and feather or multi-band blenders. Its detailed sample is more relevant than the one-call stitcher because it demonstrates control over matching, bundle adjustment, warping, exposure compensation, seam estimation and blending. ([docs.opencv.org][18])
+
+Use OpenCV through the Android NDK. Keep Kotlin responsible for UI, camera lifecycle and state, while C++ handles feature extraction, optimisation, warping and blending.
+
+## Ceres Solver
+
+Ceres becomes valuable when OpenCV’s built-in bundle adjusters are insufficient. It allows a custom rotation-only objective containing visual residuals, AR or sensor pose priors, gravity constraints, shared focal length and radial-distortion terms.
+
+It adds binary size and build complexity, so it need not be part of the first prototype. A sensible progression is to validate the capture and compositing pipeline with OpenCV’s `BundleAdjusterRay`, then introduce Ceres only when measured failure cases justify it.
+
+## Eigen
+
+Eigen is appropriate for small matrix operations, quaternions, Lie-algebra pose updates and calibration calculations. OpenCV matrices can remain at API boundaries while the mathematical core uses strongly typed Eigen vectors and matrices.
+
+## libyuv
+
+libyuv is useful for efficient Android `YUV_420_888` conversion, scaling, rotation and plane handling. It avoids repeatedly converting full-resolution images through Kotlin or Java bitmaps.
+
+## Hugin, libpano13 and Enblend
+
+The Hugin ecosystem is valuable as a desktop reference implementation and validation oracle. It can be used during development to establish whether a difficult image set is fundamentally stitchable and to compare control points, camera calibration, exposure correction and blending.
+
+It is less attractive as the embedded mobile pipeline because its architecture, command-line assumptions, dependency footprint and licensing considerations are not designed around an ergonomic Android capture session.
+
+## Libraries not recommended as the primary solution
+
+openMVG, COLMAP and similar structure-from-motion systems are excellent research and offline reconstruction tools but solve a more general problem than necessary. They typically estimate camera translation and three-dimensional points, whereas a well-captured photosphere should be dominated by rotation.
+
+ORB-SLAM and VINS systems are likewise unnecessary as the main production dependency when ARCore already supplies visual-inertial tracking on supported phones. They remain useful for research experiments or devices outside the Google ecosystem, but add substantial calibration, lifecycle and device-testing burdens.
+
+# Recommended production pipeline
+
+The following architecture best balances image quality, accessibility and Android coverage.
+
+During initialisation, probe device capabilities, select one rear physical camera, fix zoom and calculate its field of view. Start ARCore when available; otherwise start the game rotation vector and gravity sensors. Generate an adaptive spherical target lattice.
+
+During preview, maintain the current orientation, predicted overlap, angular velocity, tracking state, brightness and blur score. Show only the next target and a simple reticle.
+
+When the acceptance conditions are satisfied, acquire one still and record its complete timestamped camera state. Immediately extract low-resolution features and match the image against its expected neighbours. Do not advance permanently until the frame has sufficient visual support, unless it is a deliberately low-texture zenith or sky frame supported mainly by the pose prior.
+
+After every ring, run a lightweight pose-graph update and verify loop closure. Ask for a recapture while the target remains physically convenient if a gap or weak edge is detected.
+
+At completion, run global rotation and intrinsic optimisation. Reject outlying correspondences and calculate per-frame confidence. Straighten the sphere using gravity.
+
+Estimate exposure and colour corrections from overlaps. Warp source images to spherical or cube-map coordinates at seam resolution. Find graph-cut seams with motion, saliency and optional depth penalties.
+
+Decode and warp full-resolution source images in tiles. Blend them with a Laplacian or multi-band pyramid. Perform a final hole, seam, horizon and exposure audit.
+
+Export a 2:1 equirectangular JPEG with appropriate panoramic metadata, while retaining the source frames and pose graph temporarily so that a failed region can be reprocessed without repeating the whole capture.
+
+# Quality metrics that should gate success
+
+The product should not simply report “sphere complete” because every target was visited. Completion should require:
+
+a connected image graph;
+
+closed horizontal loops;
+
+complete spherical angular coverage;
+
+adequate inlier counts and inlier distribution;
+
+acceptable median and 95th-percentile reprojection errors;
+
+no unexplained large camera translations;
+
+acceptable blur and exposure levels;
+
+no large unfilled output regions;
+
+a gravity-consistent horizon;
+
+bounded photometric residuals across seams.
+
+These can be combined into one internal confidence score, but the user should see only actionable instructions. The application might say “One area needs another photo,” not “Bundle-adjustment residual exceeds 2.4 pixels.”
+
+# Recommended development sequence
+
+The first implementation should use CameraX, Android rotation vectors, OpenCV ORB features, rotation-only bundle adjustment, spherical warping, graph-cut seams and multi-band blending. This establishes a broad-device baseline and tests the most important element: guided acquisition.
+
+The second implementation stage should add ARCore as an optional pose and translation source, followed by Shared Camera on devices where the stream configuration is reliable.
+
+The third stage should add depth-assisted parallax warnings, foreground-aware seam costs, movement masks and selective local warping.
+
+Dense scene reconstruction, neural stitching and generative nadir repair should be later enhancements. They are not prerequisites for a reliable consumer photosphere and risk distracting from the higher-value work of ensuring good overlap, low movement, stable optics and immediate capture validation.
+
+The resulting product should feel less like a photographic instrument and more like following dots in a simple game. Behind that interface, however, it should maintain calibrated camera rays, timestamped pose estimates, a constrained image graph, robust feature correspondences, global rotation optimisation, photometric correction and seam-aware multi-scale compositing. That combination is both technically defensible and achievable across a much larger Android population than an ARCore-only design.
+
+[1]: https://developers.google.com/ar/develop/runtime "Performance considerations  |  ARCore  |  Google for Developers"
+[2]: https://developer.android.com/reference/android/hardware/camera2/CameraCharacteristics?authuser=1 "CameraCharacteristics  |  API reference  |  Android Developers"
+[3]: https://source.android.com/docs/core/interaction/sensors/sensor-types "Sensor types  |  Android Open Source Project"
+[4]: https://arxiv.org/abs/2012.00465 "Minimal Solutions for Panoramic Stitching Given Gravity Prior"
+[5]: https://developers.google.com/ar/reference/java/com/google/ar/core/Camera?utm_source=chatgpt.com "Camera  |  ARCore  |  Google for Developers"
+[6]: https://developer.android.com/reference/android/hardware/camera2/CaptureResult "CaptureResult  |  API reference  |  Android Developers"
+[7]: https://arxiv.org/abs/2008.09229 "Image Stitching and Rectification for Hand-Held Cameras"
+[8]: https://github.com/ceres-solver/ceres-solver/blob/master/examples/bundle_adjuster.cc "ceres-solver/examples/bundle_adjuster.cc at master · ceres-solver/ceres-solver · GitHub"
+[9]: https://research.ibm.com/publications/adaptive-as-natural-as-possible-image-stitching "Adaptive as-natural-as-possible image stitching for CVPR 2015 - IBM Research"
+[10]: https://research.google/pubs/robust-image-stitching-using-multiple-registrations/ "Robust image stitching using multiple registrations"
+[11]: https://developers.google.com/ar/devices "ARCore supported devices  |  Google for Developers"
+[12]: https://developers.google.com/ar/develop/java/camera-sharing "Shared camera access with ARCore  |  Google for Developers"
+[13]: https://developer.android.com/media/camera/camera2/multiple-camera-streams-simultaneously "Use multiple camera streams simultaneously  |  Android media  |  Android Developers"
+[14]: https://developers.google.com/ar/develop/java/depth/developer-guide "Use Depth in your Android app  |  ARCore  |  Google for Developers"
+[15]: https://developers.google.com/ar/reference/java/com/google/ar/core/Frame "Frame  |  ARCore  |  Google for Developers"
+[16]: https://developers.google.com/ar/develop/java/enable-arcore "Enable AR in your Android app  |  ARCore  |  Google for Developers"
+[17]: https://developer.android.com/media/camera/camerax?authuser=01&utm_source=chatgpt.com "CameraX overview  |  Android media  |  Android Developers"
+[18]: https://docs.opencv.org/4.x/d2/d8d/classcv_1_1Stitcher.html?66uPO=j2a6tBDvqxj&utm_source=chatgpt.com "OpenCV: cv::Stitcher Class Reference"

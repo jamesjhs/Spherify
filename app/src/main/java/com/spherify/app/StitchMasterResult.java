@@ -2,8 +2,8 @@
  * StitchMasterResult.java
  *
  * Educational overview:
- * StitchMasterResult bundles the newly-created library item with the Phase 5
- * quality summary that should be shown to the user after an experimental stitch.
+ * StitchMasterResult bundles the newly-created library item with the public
+ * quality summary that should be shown after OpenCV validation.
  */
 package com.spherify.app;
 

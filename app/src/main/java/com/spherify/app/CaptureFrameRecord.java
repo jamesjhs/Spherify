@@ -20,7 +20,7 @@ final class CaptureFrameRecord {
         this.sessionId = sessionId;
         this.role = role;
         this.rawFacts = rawFacts;
-        this.analysisFacts = analysisFacts == null ? CaptureAnalysisFacts.placeholder() : analysisFacts;
+        this.analysisFacts = analysisFacts == null ? CaptureAnalysisFacts.empty() : analysisFacts;
     }
 
     JSONObject toJson() throws JSONException {
