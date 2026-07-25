@@ -482,7 +482,8 @@ final class SpherifyLibrary {
                     .append(", inliers ").append(frame.analysisFacts.inlierCount)
                     .append(", residual ").append(formatScore(frame.analysisFacts.residualScore))
                     .append(", confidence ").append(formatScore(frame.analysisFacts.confidence))
-                    .append("\nWeak/recapture hint: ").append(emptyAsMissing(frame.analysisFacts.parallaxRiskHint))
+                    .append("\nAnalysis category: ").append(emptyAsMissing(frame.analysisFacts.validationCategory))
+                    .append("\nCapture hint: ").append(emptyAsMissing(frame.analysisFacts.parallaxRiskHint))
                     .append("\nRejection: ").append(emptyAsMissing(frame.analysisFacts.rejectionReason));
         }
         return message.toString();
@@ -745,18 +746,29 @@ final class SpherifyLibrary {
         if (session == null) {
             return GraphReadinessReport.missingSession();
         }
+        ArrayList<CaptureFrameRecord> acceptedFrames = new ArrayList<>();
         ArrayList<String> acceptedFrameIds = new ArrayList<>();
+        ArrayList<String> visualFrameIds = new ArrayList<>();
+        HashMap<String, CaptureFrameRecord> acceptedFramesById = new HashMap<>();
         for (CaptureFrameRecord frame : session.frames) {
             if (frame.role == CaptureFrameRole.ACCEPTED && new File(frame.rawFacts.filePath).exists()) {
+                acceptedFrames.add(frame);
                 acceptedFrameIds.add(frame.id);
+                acceptedFramesById.put(frame.id, frame);
+                if (!isLowTexturePoseOnly(frame)) {
+                    visualFrameIds.add(frame.id);
+                }
             }
         }
         ArrayList<String> blockers = new ArrayList<>();
         if (acceptedFrameIds.size() < 30) {
             blockers.add("graph needs at least 30 readable accepted guided frames; found " + acceptedFrameIds.size());
         }
+        if (visualFrameIds.size() < 24) {
+            blockers.add("textured visual graph needs at least 24 OpenCV-checkable frames; found " + visualFrameIds.size());
+        }
         HashMap<String, Integer> componentIndexes = new HashMap<>();
-        for (String frameId : acceptedFrameIds) {
+        for (String frameId : visualFrameIds) {
             componentIndexes.put(frameId, componentIndexes.size());
         }
         int acceptedEdges = 0;
@@ -773,17 +785,44 @@ final class SpherifyLibrary {
             acceptedEdges++;
             union(componentIndexes, edge.fromFrameId, edge.toFrameId);
         }
-        if (acceptedEdges < Math.max(acceptedFrameIds.size() - 1, 29)) {
-            blockers.add("graph is too sparse after filtering; usable edges " + acceptedEdges + "/" + session.graphEdges.size());
+        if (visualFrameIds.size() > 1 && acceptedEdges < visualFrameIds.size() - 1) {
+            blockers.add("textured graph is too sparse after filtering; usable edges " + acceptedEdges + "/" + session.graphEdges.size());
         }
-        String root = acceptedFrameIds.isEmpty() ? "" : find(componentIndexes, acceptedFrameIds.get(0));
-        for (String frameId : acceptedFrameIds) {
+        String root = visualFrameIds.isEmpty() ? "" : find(componentIndexes, visualFrameIds.get(0));
+        for (String frameId : visualFrameIds) {
             if (!root.equals(find(componentIndexes, frameId))) {
-                blockers.add("accepted frame graph is disconnected after weak/parallax edges are removed");
+                blockers.add("textured frame graph is disconnected after weak/parallax edges are removed");
+                break;
+            }
+        }
+        for (CaptureFrameRecord frame : acceptedFrames) {
+            if (isLowTexturePoseOnly(frame) && nearbyVisualAnchorCount(frame, acceptedFramesById) < 2) {
+                blockers.add("low-detail frame " + frame.id + " is not bracketed by textured neighbors");
                 break;
             }
         }
         return new GraphReadinessReport(blockers.isEmpty(), acceptedFrameIds.size(), session.graphEdges.size(), acceptedEdges, rejectedEdges, blockers);
+    }
+
+    private static boolean isLowTexturePoseOnly(CaptureFrameRecord frame) {
+        return frame != null && "low_texture_pose_only".equals(frame.analysisFacts.validationCategory);
+    }
+
+    private static int nearbyVisualAnchorCount(CaptureFrameRecord frame, HashMap<String, CaptureFrameRecord> acceptedFramesById) {
+        int count = 0;
+        for (CaptureFrameRecord candidate : acceptedFramesById.values()) {
+            if (candidate == frame || isLowTexturePoseOnly(candidate)) {
+                continue;
+            }
+            float yawDelta = Math.abs(signedHeadingDelta(
+                    frame.rawFacts.targetYawDegrees,
+                    candidate.rawFacts.targetYawDegrees));
+            int pitchDelta = Math.abs(frame.rawFacts.targetPitchDegrees - candidate.rawFacts.targetPitchDegrees);
+            if (yawDelta <= 50f && pitchDelta <= 50) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static boolean graphEdgeLooksSolvable(CaptureGraphEdgeRecord edge) {

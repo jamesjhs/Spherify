@@ -17,6 +17,8 @@ import org.opencv.core.MatOfKeyPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
 import org.opencv.core.Rect;
+import org.opencv.core.Scalar;
+import org.opencv.core.Size;
 import org.opencv.features.BFMatcher;
 import org.opencv.features.ORB;
 import org.opencv.geometry.Geometry;
@@ -41,13 +43,21 @@ final class OpenCvOverlapValidator {
             File candidateFile,
             CandidateQualityReport quality,
             List<CaptureFrameRecord> predictedNeighbors,
+            JSONObject candidateExposure,
+            boolean candidatePoseAvailable,
             int candidateTargetPitchDegrees,
-            boolean allowNoOverlapAnchorFrame) {
+            boolean allowNoOverlapAnchorFrame,
+            boolean poseMetadataAvailable) {
         JSONArray predicted = new JSONArray();
         for (CaptureFrameRecord neighbor : predictedNeighbors) {
             predicted.put(neighbor.id);
         }
         if (!quality.pass) {
+            if (isLowTextureOnlyFailure(quality)
+                    && poseMetadataAvailable
+                    && (allowNoOverlapAnchorFrame || !predictedNeighbors.isEmpty())) {
+                return acceptedLowTexturePoseOnly(quality, predicted, allowNoOverlapAnchorFrame);
+            }
             return rejected(quality, predicted, "not_run", 0, -1.0, "quality gate", quality.rejectionReason);
         }
         if (predictedNeighbors.isEmpty() && allowNoOverlapAnchorFrame) {
@@ -62,7 +72,8 @@ final class OpenCvOverlapValidator {
                     "",
                     "",
                     "",
-                    new JSONArray());
+                    new JSONArray(),
+                    "pose_anchor");
         }
         if (predictedNeighbors.isEmpty()) {
             return rejected(quality, predicted, "not_run", 0, -1.0, "no predicted overlap", "Weak overlap");
@@ -77,15 +88,23 @@ final class OpenCvOverlapValidator {
                     candidateFile,
                     new File(neighbor.rawFacts.filePath),
                     neighbor,
+                    candidateExposure,
+                    candidatePoseAvailable,
                     candidateTargetPitchDegrees);
             if (result != null && (best == null || result.confidence > best.confidence)) {
                 best = result;
             }
         }
         if (best == null) {
+            if (isLowTextureScene(quality) && poseMetadataAvailable) {
+                return acceptedLowTexturePoseOnly(quality, predicted, false);
+            }
             return rejected(quality, predicted, "ransac_failed", 0, -1.0, "no valid overlap", "Weak overlap");
         }
         if (best.inlierCount < MIN_INLIERS || best.confidence < 0.25) {
+            if (isLowTextureScene(quality) && poseMetadataAvailable && best.residualScore <= 55.0) {
+                return acceptedLowTexturePoseOnly(quality, predicted, false);
+            }
             return rejected(
                     quality,
                     predicted,
@@ -106,7 +125,27 @@ final class OpenCvOverlapValidator {
                 best.residualScore > 6.0 ? "possible parallax or rolling shutter" : "",
                 "",
                 best.neighborFrameId,
-                best.controlPoints);
+                best.controlPoints,
+                "visual_overlap");
+    }
+
+    private CandidateAnalysisResult acceptedLowTexturePoseOnly(
+            CandidateQualityReport quality,
+            JSONArray predicted,
+            boolean anchorFrame) {
+        return new CandidateAnalysisResult(
+                true,
+                quality,
+                predicted,
+                anchorFrame ? "low_texture_pose_anchor" : "low_texture_pose_only",
+                0,
+                -1.0,
+                0.0,
+                "insufficient visual features",
+                "",
+                "",
+                new JSONArray(),
+                "low_texture_pose_only");
     }
 
     private CandidateAnalysisResult rejected(
@@ -128,7 +167,16 @@ final class OpenCvOverlapValidator {
                 parallaxHint,
                 reason,
                 "",
-                new JSONArray());
+                new JSONArray(),
+                "rejected");
+    }
+
+    private static boolean isLowTextureOnlyFailure(CandidateQualityReport quality) {
+        return quality != null && "Need more visual detail".equals(quality.rejectionReason);
+    }
+
+    private static boolean isLowTextureScene(CandidateQualityReport quality) {
+        return quality != null && quality.textureScore >= 0.0 && quality.textureScore < 7.0;
     }
 
     private static boolean initOpenCv() {
@@ -147,6 +195,8 @@ final class OpenCvOverlapValidator {
             File candidateFile,
             File neighborFile,
             CaptureFrameRecord neighbor,
+            JSONObject candidateExposure,
+            boolean candidatePoseAvailable,
             int candidateTargetPitchDegrees) {
         Bitmap candidateBitmap = decodeSample(candidateFile);
         Bitmap neighborBitmap = decodeSample(neighborFile);
@@ -165,12 +215,19 @@ final class OpenCvOverlapValidator {
             Imgproc.cvtColor(candidateRgba, candidateGray, Imgproc.COLOR_RGBA2GRAY);
             Imgproc.cvtColor(neighborRgba, neighborGray, Imgproc.COLOR_RGBA2GRAY);
 
+            MatchResult poseNormalized = poseNormalizedMatch(
+                    candidateGray,
+                    neighborGray,
+                    neighbor,
+                    candidateExposure,
+                    candidatePoseAvailable);
             if (isAdjacentRowPitch(candidateTargetPitchDegrees, neighbor.rawFacts.targetPitchDegrees)) {
-                return adjacentRowBandMatch(
+                MatchResult band = adjacentRowBandMatch(
                         candidateGray,
                         neighborGray,
                         neighbor,
                         candidateTargetPitchDegrees);
+                return better(poseNormalized, band);
             }
             MatchResult full = matchGray(candidateGray, neighborGray, neighbor.id, 0, 0, 0, 0);
             MatchResult band = adjacentRowBandMatch(
@@ -179,9 +236,9 @@ final class OpenCvOverlapValidator {
                     neighbor,
                     candidateTargetPitchDegrees);
             if (band != null && (full == null || band.confidence > full.confidence)) {
-                return band;
+                full = band;
             }
-            return full;
+            return better(poseNormalized, full);
         } catch (JSONException ignored) {
             return null;
         } finally {
@@ -192,6 +249,70 @@ final class OpenCvOverlapValidator {
             candidateGray.release();
             neighborGray.release();
         }
+    }
+
+    private MatchResult poseNormalizedMatch(
+            Mat candidateGray,
+            Mat neighborGray,
+            CaptureFrameRecord neighbor,
+            JSONObject candidateExposure,
+            boolean candidatePoseAvailable) throws JSONException {
+        FrameGeometry candidateGeometry = FrameGeometry.from(
+                candidateExposure,
+                null,
+                candidatePoseAvailable,
+                candidateGray.width(),
+                candidateGray.height());
+        FrameGeometry neighborGeometry = FrameGeometry.from(
+                neighbor.rawFacts.exposure,
+                neighbor.rawFacts.intrinsics,
+                neighbor.rawFacts.capturedPoseAvailable,
+                neighborGray.width(),
+                neighborGray.height());
+        if (candidateGeometry == null || neighborGeometry == null) {
+            return null;
+        }
+
+        Mat candidateToNeighbor = rotationHomography(candidateGeometry, neighborGeometry);
+        Mat neighborToCandidate = rotationHomography(neighborGeometry, candidateGeometry);
+        Mat warpedCandidate = new Mat();
+        Mat warpedNeighbor = new Mat();
+        try {
+            Imgproc.warpPerspective(
+                    candidateGray,
+                    warpedCandidate,
+                    candidateToNeighbor,
+                    new Size(neighborGray.width(), neighborGray.height()),
+                    Imgproc.INTER_LINEAR,
+                    Core.BORDER_CONSTANT,
+                    Scalar.all(0));
+            Imgproc.warpPerspective(
+                    neighborGray,
+                    warpedNeighbor,
+                    neighborToCandidate,
+                    new Size(candidateGray.width(), candidateGray.height()),
+                    Imgproc.INTER_LINEAR,
+                    Core.BORDER_CONSTANT,
+                    Scalar.all(0));
+            MatchResult candidateInNeighbor = matchGray(warpedCandidate, neighborGray, neighbor.id, 0, 0, 0, 0);
+            MatchResult neighborInCandidate = matchGray(candidateGray, warpedNeighbor, neighbor.id, 0, 0, 0, 0);
+            return better(candidateInNeighbor, neighborInCandidate);
+        } finally {
+            candidateToNeighbor.release();
+            neighborToCandidate.release();
+            warpedCandidate.release();
+            warpedNeighbor.release();
+        }
+    }
+
+    private static MatchResult better(MatchResult left, MatchResult right) {
+        if (left == null) {
+            return right;
+        }
+        if (right == null) {
+            return left;
+        }
+        return left.confidence >= right.confidence ? left : right;
     }
 
     private boolean isAdjacentRowPitch(int candidateTargetPitchDegrees, int neighborTargetPitchDegrees) {
@@ -347,6 +468,139 @@ final class OpenCvOverlapValidator {
     private static void recycle(Bitmap bitmap) {
         if (bitmap != null && !bitmap.isRecycled()) {
             bitmap.recycle();
+        }
+    }
+
+    private static Mat rotationHomography(FrameGeometry source, FrameGeometry destination) {
+        double[][] relative = multiply(transpose(destination.rotationCameraToWorld), source.rotationCameraToWorld);
+        double[][] homography = multiply(destination.intrinsics, multiply(relative, inverseIntrinsics(source.intrinsics)));
+        Mat mat = new Mat(3, 3, org.opencv.core.CvType.CV_64F);
+        mat.put(0, 0,
+                homography[0][0], homography[0][1], homography[0][2],
+                homography[1][0], homography[1][1], homography[1][2],
+                homography[2][0], homography[2][1], homography[2][2]);
+        return mat;
+    }
+
+    private static double[][] inverseIntrinsics(double[][] k) {
+        double fx = k[0][0];
+        double fy = k[1][1];
+        double cx = k[0][2];
+        double cy = k[1][2];
+        return new double[][]{
+                {1.0 / fx, 0.0, -cx / fx},
+                {0.0, 1.0 / fy, -cy / fy},
+                {0.0, 0.0, 1.0}
+        };
+    }
+
+    private static double[][] multiply(double[][] left, double[][] right) {
+        double[][] result = new double[3][3];
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                result[row][col] = left[row][0] * right[0][col]
+                        + left[row][1] * right[1][col]
+                        + left[row][2] * right[2][col];
+            }
+        }
+        return result;
+    }
+
+    private static double[][] transpose(double[][] matrix) {
+        return new double[][]{
+                {matrix[0][0], matrix[1][0], matrix[2][0]},
+                {matrix[0][1], matrix[1][1], matrix[2][1]},
+                {matrix[0][2], matrix[1][2], matrix[2][2]}
+        };
+    }
+
+    private static final class FrameGeometry {
+        final double[][] intrinsics;
+        final double[][] rotationCameraToWorld;
+
+        private FrameGeometry(double[][] intrinsics, double[][] rotationCameraToWorld) {
+            this.intrinsics = intrinsics;
+            this.rotationCameraToWorld = rotationCameraToWorld;
+        }
+
+        static FrameGeometry from(
+                JSONObject exposure,
+                JSONObject intrinsicsJson,
+                boolean poseAvailable,
+                int decodedWidth,
+                int decodedHeight) {
+            if (!poseAvailable || exposure == null || decodedWidth <= 0 || decodedHeight <= 0) {
+                return null;
+            }
+            double fx = firstPositive(
+                    exposure.optDouble("imageFocalLengthXPixels", 0.0),
+                    intrinsicsJson == null ? 0.0 : intrinsicsJson.optDouble("focalLengthXPixels", 0.0));
+            double fy = firstPositive(
+                    exposure.optDouble("imageFocalLengthYPixels", 0.0),
+                    intrinsicsJson == null ? 0.0 : intrinsicsJson.optDouble("focalLengthYPixels", 0.0));
+            double cx = firstPositive(
+                    exposure.optDouble("imagePrincipalPointXPixels", 0.0),
+                    intrinsicsJson == null ? 0.0 : intrinsicsJson.optDouble("principalPointXPixels", 0.0));
+            double cy = firstPositive(
+                    exposure.optDouble("imagePrincipalPointYPixels", 0.0),
+                    intrinsicsJson == null ? 0.0 : intrinsicsJson.optDouble("principalPointYPixels", 0.0));
+            int sourceWidth = firstPositiveInt(
+                    exposure.optInt("imageIntrinsicsWidth", 0),
+                    intrinsicsJson == null ? 0 : intrinsicsJson.optInt("width", 0));
+            int sourceHeight = firstPositiveInt(
+                    exposure.optInt("imageIntrinsicsHeight", 0),
+                    intrinsicsJson == null ? 0 : intrinsicsJson.optInt("height", 0));
+            if (fx <= 0.0 || fy <= 0.0 || sourceWidth <= 0 || sourceHeight <= 0) {
+                return null;
+            }
+            double scaleX = decodedWidth / (double) sourceWidth;
+            double scaleY = decodedHeight / (double) sourceHeight;
+            double[][] scaledIntrinsics = new double[][]{
+                    {fx * scaleX, 0.0, cx * scaleX},
+                    {0.0, fy * scaleY, cy * scaleY},
+                    {0.0, 0.0, 1.0}
+            };
+            double qx = exposure.optDouble("arCorePoseQx", Double.NaN);
+            double qy = exposure.optDouble("arCorePoseQy", Double.NaN);
+            double qz = exposure.optDouble("arCorePoseQz", Double.NaN);
+            double qw = exposure.optDouble("arCorePoseQw", Double.NaN);
+            if (Double.isNaN(qx) || Double.isNaN(qy) || Double.isNaN(qz) || Double.isNaN(qw)) {
+                return null;
+            }
+            return new FrameGeometry(scaledIntrinsics, quaternionToRotation(qx, qy, qz, qw));
+        }
+
+        private static double firstPositive(double preferred, double fallback) {
+            return preferred > 0.0 ? preferred : fallback;
+        }
+
+        private static int firstPositiveInt(int preferred, int fallback) {
+            return preferred > 0 ? preferred : fallback;
+        }
+
+        private static double[][] quaternionToRotation(double qx, double qy, double qz, double qw) {
+            double norm = Math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+            if (norm <= 0.0) {
+                return new double[][]{{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+            }
+            qx /= norm;
+            qy /= norm;
+            qz /= norm;
+            qw /= norm;
+            double xx = qx * qx;
+            double yy = qy * qy;
+            double zz = qz * qz;
+            double xy = qx * qy;
+            double xz = qx * qz;
+            double yz = qy * qz;
+            double wx = qw * qx;
+            double wy = qw * qy;
+            double wz = qw * qz;
+            return new double[][]{
+                    {1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)},
+                    {2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)},
+                    {2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)}
+            };
         }
     }
 

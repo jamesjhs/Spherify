@@ -25,6 +25,8 @@ import android.app.AlertDialog;
 import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.ImageFormat;
 import android.graphics.Paint;
@@ -57,6 +59,7 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -105,12 +108,23 @@ public final class SharedCameraCaptureActivity extends Activity
     private static final int MIN_CPU_IMAGE_WIDTH = 1280;
     private static final int MIN_TRACKING_FEATURE_POINTS = 12;
     private static final int LOW_CONFIDENCE_FEATURE_POINTS = 30;
-    private static final float FRONTIER_TARGET_MAX_DEGREES = 38f;
+    private static final float FRONTIER_TARGET_MAX_DEGREES = 52f;
     private static final float ACTIVE_TARGET_HYSTERESIS_DEGREES = 24f;
     private static final int MAX_VISIBLE_FRONTIER_TARGETS = 8;
     private static final float MAX_TRANSLATION_FROM_ANCHOR_METERS = 0.12f;
     private static final long MIN_CAPTURE_INTERVAL_MS = 1100L;
     private static final long REQUIRED_ALIGNED_MS = 850L;
+    private static final long TEXTURE_HINT_INTERVAL_MS = 650L;
+    private static final int TEXTURE_HINT_GRID_COLUMNS = 5;
+    private static final int TEXTURE_HINT_GRID_ROWS = 5;
+    private static final int REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES = 270;
+    private static final boolean REFERENCE_PREVIEW_MIRROR_CORRECTION = true;
+    private static final int MAX_VISIBLE_REFERENCE_OVERLAYS = 3;
+    private static final int MAX_RETAINED_REFERENCE_OVERLAYS = 96;
+    private static final float REFERENCE_OVERLAY_FADE_START_DEGREES = 14f;
+    private static final float REFERENCE_OVERLAY_FADE_END_DEGREES = 52f;
+    private static final int REFERENCE_OVERLAY_MAX_ALPHA = 138;
+    private static final int REFERENCE_OVERLAY_MIN_ALPHA = 42;
     private static final String CAPTURE_PROFILE = "arcore_shared_camera";
     private static final String TAG = "SpherifySharedCamera";
 
@@ -120,6 +134,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private final TreeMap<Long, TotalCaptureResult> camera2ResultsByTimestamp = new TreeMap<>();
     private final ArrayList<CaptureTarget> targets = new ArrayList<>();
     private final ArrayList<Integer> selectableTargetIndices = new ArrayList<>();
+    private final ArrayList<CapturedReferenceFrame> capturedReferenceFrames = new ArrayList<>();
     private final AtomicBoolean frameAvailable = new AtomicBoolean();
     private final float[] latestProjectionMatrix = new float[16];
     private final float[] latestViewMatrix = new float[16];
@@ -127,6 +142,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private GLSurfaceView glSurfaceView;
     private TargetOverlayView overlayView;
     private TextView statusText;
+    private ProgressBar captureProgressBar;
     private Button captureButton;
     private SpherifyLibrary library;
     private Session arSession;
@@ -145,6 +161,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private boolean capturePending;
     private boolean captureInProgress;
     private boolean completionInProgress;
+    private boolean finishGuidanceActive;
     private int activeTargetIndex;
     private int anchorYawDegrees;
     private int anchorPitchDegrees;
@@ -154,6 +171,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private int cameraTextureId;
     private int viewportWidth;
     private int viewportHeight;
+    private long lastTextureHintAtMs;
     private android.util.Size selectedCpuImageSize = new android.util.Size(0, 0);
     private android.util.Size selectedGpuTextureSize = new android.util.Size(0, 0);
     private String cameraConfigSummary = "";
@@ -161,6 +179,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private TextView completionText;
     private final CameraBackgroundRenderer backgroundRenderer = new CameraBackgroundRenderer();
     private ArFrameState latestFrameState = ArFrameState.notReady("tracking not started");
+    private TextureHint latestTextureHint = TextureHint.unavailable();
     private CameraFacts cameraFacts = CameraFacts.unavailable();
 
     private final CameraDevice.StateCallback cameraDeviceCallback = new CameraDevice.StateCallback() {
@@ -276,6 +295,10 @@ public final class SharedCameraCaptureActivity extends Activity
             arSession.close();
             arSession = null;
         }
+        for (CapturedReferenceFrame reference : capturedReferenceFrames) {
+            reference.recycle();
+        }
+        capturedReferenceFrames.clear();
         super.onDestroy();
     }
 
@@ -292,6 +315,17 @@ public final class SharedCameraCaptureActivity extends Activity
         root.addView(statusText, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        captureProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        captureProgressBar.setIndeterminate(false);
+        captureProgressBar.setMax(1);
+        captureProgressBar.setProgress(0);
+        captureProgressBar.setContentDescription("Capture progress");
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                8);
+        progressParams.setMargins(16, 0, 16, 8);
+        root.addView(captureProgressBar, progressParams);
 
         FrameLayout previewFrame = new FrameLayout(this);
         glSurfaceView = new GLSurfaceView(this);
@@ -553,6 +587,7 @@ public final class SharedCameraCaptureActivity extends Activity
         }
         try {
             if (!capturePending) {
+                updateTextureHint(image);
                 return;
             }
             capturePending = false;
@@ -577,6 +612,28 @@ public final class SharedCameraCaptureActivity extends Activity
         }
     }
 
+    private void updateTextureHint(Image image) {
+        long now = System.currentTimeMillis();
+        if (now - lastTextureHintAtMs < TEXTURE_HINT_INTERVAL_MS || image.getFormat() != ImageFormat.YUV_420_888) {
+            return;
+        }
+        lastTextureHintAtMs = now;
+        TextureHint hint = TextureHint.from(
+                image,
+                displayRotationDegrees(),
+                cameraFacts.sensorOrientationDegrees,
+                cameraFacts.frontFacing);
+        latestTextureHint = hint;
+        if (overlayView != null) {
+            runOnUiThread(() -> {
+                overlayView.setTextureHint(hint);
+                if (!latestFrameState.ready && "Point at textured detail".equals(latestFrameState.blocker)) {
+                    refreshUi();
+                }
+            });
+        }
+    }
+
     private void validateAndRecord(File imageFile, CaptureTarget target, ArFrameState state, TotalCaptureResult metadata) {
         try {
             JSONObject exposure = exposureJsonFor(metadata, state);
@@ -589,8 +646,11 @@ public final class SharedCameraCaptureActivity extends Activity
                     imageFile,
                     quality,
                     neighbors,
+                    exposure,
+                    state.ready,
                     target.pitchDegrees,
-                    !captureAnchored);
+                    !captureAnchored,
+                    state.ready);
             if (!state.parallaxWarning.isEmpty()) {
                 analysis = new CandidateAnalysisResult(
                         false,
@@ -619,13 +679,19 @@ public final class SharedCameraCaptureActivity extends Activity
                     exposure.toString(),
                     analysis);
             CandidateAnalysisResult finalAnalysis = analysis;
-            runOnUiThread(() -> handleAnalysis(target, finalAnalysis));
+            File acceptedImageFile = imageFile;
+            ArFrameState captureState = state;
+            runOnUiThread(() -> handleAnalysis(target, finalAnalysis, acceptedImageFile, captureState));
         } catch (IOException | JSONException e) {
             runOnUiThread(() -> rejectInUi(e.getMessage()));
         }
     }
 
-    private void handleAnalysis(CaptureTarget target, CandidateAnalysisResult analysis) {
+    private void handleAnalysis(
+            CaptureTarget target,
+            CandidateAnalysisResult analysis,
+            File imageFile,
+            ArFrameState captureState) {
         captureInProgress = false;
         if (analysis.accepted) {
             int acceptedYaw = target.yawDegrees;
@@ -638,12 +704,14 @@ public final class SharedCameraCaptureActivity extends Activity
                 rebuildAnchoredTargets(acceptedYaw, acceptedPitch);
             }
             markTargetAccepted(acceptedYaw, acceptedPitch);
+            addCapturedReferenceFrame(imageFile, acceptedYaw, acceptedPitch, captureState);
+            finishGuidanceActive = false;
             target.weak = false;
             updateActiveTarget();
             ensureSession(true);
             overlayView.showCaptureResult(true);
             captureButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-            Toast.makeText(this, analysis.inlierCount > 0 ? "Accepted - overlap valid" : "Accepted - AR anchor", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, acceptedCaptureMessage(analysis, "Accepted - AR anchor"), Toast.LENGTH_SHORT).show();
             if (activeTarget() == null) {
                 startIntegratedSpherification();
                 return;
@@ -652,10 +720,38 @@ public final class SharedCameraCaptureActivity extends Activity
             target.weak = true;
             overlayView.showCaptureResult(false);
             captureButton.performHapticFeedback(HapticFeedbackConstants.REJECT);
-            Toast.makeText(this, analysis.rejectionReason.isEmpty() ? "Recapture this area" : analysis.rejectionReason, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, rejectionMessage(analysis), Toast.LENGTH_LONG).show();
         }
         requestAutomaticDebugCsvDump();
         refreshUi();
+    }
+
+    private static String acceptedCaptureMessage(CandidateAnalysisResult analysis, String anchorMessage) {
+        if ("low_texture_pose_only".equals(analysis.validationCategory)) {
+            return "Low detail here, continue slowly";
+        }
+        return analysis.inlierCount > 0 ? "Accepted - overlap valid" : anchorMessage;
+    }
+
+    private static String rejectionMessage(CandidateAnalysisResult analysis) {
+        if ("Need more visual detail".equals(analysis.rejectionReason)) {
+            return "Low detail here, add visual detail";
+        }
+        return analysis.rejectionReason.isEmpty() ? "Recapture this area" : analysis.rejectionReason;
+    }
+
+    private void addCapturedReferenceFrame(File imageFile, int yawDegrees, int pitchDegrees, ArFrameState captureState) {
+        float referenceYaw = captureState.ready ? captureState.yawDegrees : yawDegrees;
+        float referencePitch = captureState.ready ? captureState.pitchDegrees : pitchDegrees;
+        CapturedReferenceFrame reference = CapturedReferenceFrame.from(imageFile, referenceYaw, referencePitch, captureState);
+        if (reference == null) {
+            return;
+        }
+        capturedReferenceFrames.add(reference);
+        while (capturedReferenceFrames.size() > MAX_RETAINED_REFERENCE_OVERLAYS) {
+            CapturedReferenceFrame removed = capturedReferenceFrames.remove(0);
+            removed.recycle();
+        }
     }
 
     private void rejectInUi(String reason) {
@@ -684,6 +780,10 @@ public final class SharedCameraCaptureActivity extends Activity
         json.put("lensFocalLengthMm", focal);
         json.put("sensorPhysicalWidthMm", cameraFacts.sensorWidthMm);
         json.put("sensorPhysicalHeightMm", cameraFacts.sensorHeightMm);
+        json.put("cameraSensorOrientationDegrees", cameraFacts.sensorOrientationDegrees);
+        json.put("cameraFrontFacing", cameraFacts.frontFacing);
+        json.put("sensorToDisplayRotationDegrees", state.sensorToDisplayRotationDegrees);
+        json.put("mirrorForDisplay", state.mirrorForDisplay);
         json.put("arCoreSelectedCpuImageWidth", selectedCpuImageSize.getWidth());
         json.put("arCoreSelectedCpuImageHeight", selectedCpuImageSize.getHeight());
         json.put("arCoreSelectedGpuTextureWidth", selectedGpuTextureSize.getWidth());
@@ -910,7 +1010,8 @@ public final class SharedCameraCaptureActivity extends Activity
                 && captureBlocker(target, state).isEmpty()
                 && !captureInProgress
                 && !completionInProgress;
-        if (canCapture) {
+        boolean autoCaptureReady = canCapture && captureAnchored;
+        if (autoCaptureReady) {
             if (alignedSinceMs == 0L) {
                 alignedSinceMs = System.currentTimeMillis();
             }
@@ -921,21 +1022,55 @@ public final class SharedCameraCaptureActivity extends Activity
             alignedSinceMs = 0L;
         }
         captureButton.setEnabled(canCapture);
-        overlayView.setState(targets, activeTargetIndex, selectableTargetIndices, state);
+        int acceptedCount = acceptedTargetCount();
+        int requiredCount = Math.max(1, targets.size());
+        captureProgressBar.setMax(requiredCount);
+        captureProgressBar.setProgress(Math.min(acceptedCount, requiredCount));
+        captureProgressBar.setContentDescription(String.format(
+                Locale.US,
+                "Capture progress %d of %d",
+                acceptedCount,
+                targets.size()));
+        overlayView.setState(targets, activeTargetIndex, selectableTargetIndices, state, capturedReferenceFrames);
+        overlayView.setTextureHint(latestTextureHint);
         String text = completionInProgress
                 ? "Solving PhotoSphere"
                 : captureInProgress
                 ? "Validating AR frame"
+                : finishGuidanceActive
+                ? "Capture required missing view"
                 : target == null
                 ? "Ready to solve PhotoSphere"
                 : !state.ready
-                ? state.blocker
-                : !state.parallaxWarning.isEmpty()
-                ? state.parallaxWarning
+                ? textureGuidanceText(state)
                 : !isAligned(target, state)
                 ? selectableTargetIndices.size() > 1 ? "Choose nearby target" : "Move to target"
+                : !state.parallaxWarning.isEmpty()
+                ? state.parallaxWarning
+                : !captureAnchored
+                ? "Press Capture to start"
                 : "Hold steady - capture ready";
-        statusText.setText(String.format(Locale.US, "%s  |  %d/%d", text, acceptedTargetCount(), targets.size()));
+        statusText.setText(String.format(Locale.US, "%s  |  %d/%d", text, acceptedCount, targets.size()));
+    }
+
+    private String textureGuidanceText(ArFrameState state) {
+        if ("Point at textured detail".equals(state.blocker) && latestTextureHint.available) {
+            float dx = latestTextureHint.viewX - 0.5f;
+            float dy = latestTextureHint.viewY - 0.5f;
+            if (Math.abs(dx) < 0.12f && Math.abs(dy) < 0.12f) {
+                return "Hold on textured detail";
+            }
+            String horizontal = Math.abs(dx) < 0.12f ? "" : dx < 0f ? "left" : "right";
+            String vertical = Math.abs(dy) < 0.12f ? "" : dy < 0f ? "up" : "down";
+            if (horizontal.isEmpty()) {
+                return "Aim " + vertical + " for textured detail";
+            }
+            if (vertical.isEmpty()) {
+                return "Aim " + horizontal + " for textured detail";
+            }
+            return "Aim " + vertical + "-" + horizontal + " for textured detail";
+        }
+        return state.blocker;
     }
 
     private int acceptedTargetCount() {
@@ -950,7 +1085,22 @@ public final class SharedCameraCaptureActivity extends Activity
 
     private void finishCapture() {
         ensureSession(false);
+        if (!minimumRequiredCaptureComplete()) {
+            guideMissingRequiredCapture();
+            return;
+        }
         startIntegratedSpherification();
+    }
+
+    private boolean minimumRequiredCaptureComplete() {
+        return captureAnchored && acceptedTargetCount() >= 30 && activeTarget() == null;
+    }
+
+    private void guideMissingRequiredCapture() {
+        finishGuidanceActive = true;
+        updateActiveTarget();
+        refreshUi();
+        Toast.makeText(this, "Capture the highlighted required view before finishing", Toast.LENGTH_LONG).show();
     }
 
     private void startIntegratedSpherification() {
@@ -1098,7 +1248,12 @@ public final class SharedCameraCaptureActivity extends Activity
                 texture.updateTexImage();
             }
             backgroundRenderer.draw();
-            latestFrameState = ArFrameState.from(frame, captureAnchored, anchorPoseTranslation());
+            latestFrameState = ArFrameState.from(
+                    frame,
+                    captureAnchored,
+                    anchorPoseTranslation(),
+                    displayRotationDegrees(),
+                    cameraFacts);
             frame.getCamera().getProjectionMatrix(latestProjectionMatrix, 0, 0.1f, 100f);
             frame.getCamera().getViewMatrix(latestViewMatrix, 0);
             System.arraycopy(latestProjectionMatrix, 0, latestFrameState.projectionMatrix, 0, 16);
@@ -1127,6 +1282,31 @@ public final class SharedCameraCaptureActivity extends Activity
         }
         int rotation = getWindowManager().getDefaultDisplay().getRotation();
         arSession.setDisplayGeometry(rotation, viewportWidth, viewportHeight);
+    }
+
+    private int displayRotationDegrees() {
+        int rotation = getWindowManager().getDefaultDisplay().getRotation();
+        switch (rotation) {
+            case Surface.ROTATION_90:
+                return 90;
+            case Surface.ROTATION_180:
+                return 180;
+            case Surface.ROTATION_270:
+                return 270;
+            case Surface.ROTATION_0:
+            default:
+                return 0;
+        }
+    }
+
+    private static int sensorToDisplayRotationDegrees(
+            int sensorOrientationDegrees,
+            int displayRotationDegrees,
+            boolean frontFacing) {
+        if (frontFacing) {
+            return (sensorOrientationDegrees + displayRotationDegrees) % 360;
+        }
+        return (sensorOrientationDegrees - displayRotationDegrees + 360) % 360;
     }
 
     private static void writeJpegFromYuv(Image image, File outputFile) throws IOException {
@@ -1185,20 +1365,36 @@ public final class SharedCameraCaptureActivity extends Activity
         final boolean available;
         final float sensorWidthMm;
         final float sensorHeightMm;
+        final int sensorOrientationDegrees;
+        final boolean frontFacing;
 
-        CameraFacts(boolean available, float sensorWidthMm, float sensorHeightMm) {
+        CameraFacts(
+                boolean available,
+                float sensorWidthMm,
+                float sensorHeightMm,
+                int sensorOrientationDegrees,
+                boolean frontFacing) {
             this.available = available;
             this.sensorWidthMm = sensorWidthMm;
             this.sensorHeightMm = sensorHeightMm;
+            this.sensorOrientationDegrees = sensorOrientationDegrees;
+            this.frontFacing = frontFacing;
         }
 
         static CameraFacts unavailable() {
-            return new CameraFacts(false, 0f, 0f);
+            return new CameraFacts(false, 0f, 0f, 0, false);
         }
 
         static CameraFacts from(CameraCharacteristics characteristics) {
             android.util.SizeF size = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
-            return size == null ? unavailable() : new CameraFacts(true, size.getWidth(), size.getHeight());
+            Integer sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+            return size == null ? unavailable() : new CameraFacts(
+                    true,
+                    size.getWidth(),
+                    size.getHeight(),
+                    sensorOrientation == null ? 0 : sensorOrientation,
+                    facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT);
         }
     }
 
@@ -1219,6 +1415,8 @@ public final class SharedCameraCaptureActivity extends Activity
         final float imageCy;
         final int imageWidth;
         final int imageHeight;
+        final int sensorToDisplayRotationDegrees;
+        final boolean mirrorForDisplay;
         final float poseTx;
         final float poseTy;
         final float poseTz;
@@ -1249,6 +1447,8 @@ public final class SharedCameraCaptureActivity extends Activity
                 float imageCy,
                 int imageWidth,
                 int imageHeight,
+                int sensorToDisplayRotationDegrees,
+                boolean mirrorForDisplay,
                 Pose pose) {
             this.ready = ready;
             this.blocker = blocker;
@@ -1266,6 +1466,8 @@ public final class SharedCameraCaptureActivity extends Activity
             this.imageCy = imageCy;
             this.imageWidth = imageWidth;
             this.imageHeight = imageHeight;
+            this.sensorToDisplayRotationDegrees = sensorToDisplayRotationDegrees;
+            this.mirrorForDisplay = mirrorForDisplay;
             this.poseTx = pose == null ? 0f : pose.tx();
             this.poseTy = pose == null ? 0f : pose.ty();
             this.poseTz = pose == null ? 0f : pose.tz();
@@ -1279,13 +1481,20 @@ public final class SharedCameraCaptureActivity extends Activity
         }
 
         static ArFrameState notReady(String blocker) {
-            return new ArFrameState(false, blocker, "not_tracking", 0f, 0f, 0f, 0, 0f, 0f, "", 0f, 0f, 0f, 0f, 0, 0, null);
+            return new ArFrameState(
+                    false, blocker, "not_tracking", 0f, 0f, 0f, 0, 0f, 0f, "",
+                    0f, 0f, 0f, 0f, 0, 0, 0, false, null);
         }
 
-        static ArFrameState from(Frame frame, boolean anchored, float[] anchorTranslation) {
+        static ArFrameState from(
+                Frame frame,
+                boolean anchored,
+                float[] anchorTranslation,
+                int displayRotationDegrees,
+                CameraFacts cameraFacts) {
             com.google.ar.core.Camera camera = frame.getCamera();
             TrackingState tracking = camera.getTrackingState();
-            Pose pose = camera.getPose();
+            Pose pose = camera.getDisplayOrientedPose();
             float[] matrix = new float[16];
             pose.toMatrix(matrix, 0);
             float forwardX = -matrix[8];
@@ -1318,12 +1527,12 @@ public final class SharedCameraCaptureActivity extends Activity
             boolean intrinsicsReady = focal[0] > 0f && focal[1] > 0f && dimensions[0] > 0 && dimensions[1] > 0;
             boolean ready = tracking == TrackingState.TRACKING
                     && intrinsicsReady
-                    && featurePoints >= MIN_TRACKING_FEATURE_POINTS;
+                    && (anchored || featurePoints >= MIN_TRACKING_FEATURE_POINTS);
             String blocker = tracking != TrackingState.TRACKING
                     ? "Waiting for AR tracking"
                     : !intrinsicsReady
                     ? "Waiting for camera calibration"
-                    : featurePoints < MIN_TRACKING_FEATURE_POINTS
+                    : !anchored && featurePoints < MIN_TRACKING_FEATURE_POINTS
                     ? "Point at textured detail"
                     : "";
             return new ArFrameState(
@@ -1343,6 +1552,11 @@ public final class SharedCameraCaptureActivity extends Activity
                     principal[1],
                     dimensions[0],
                     dimensions[1],
+                    sensorToDisplayRotationDegrees(
+                            cameraFacts.sensorOrientationDegrees,
+                            displayRotationDegrees,
+                            cameraFacts.frontFacing),
+                    cameraFacts.frontFacing,
                     pose);
         }
 
@@ -1359,7 +1573,11 @@ public final class SharedCameraCaptureActivity extends Activity
         }
 
         float[] project(CaptureTarget target, int width, int height) {
-            float[] direction = directionFromYawPitch(target.yawDegrees, target.pitchDegrees);
+            return projectYawPitch(target.yawDegrees, target.pitchDegrees, width, height);
+        }
+
+        float[] projectYawPitch(float yawDegrees, float pitchDegrees, int width, int height) {
+            float[] direction = directionFromYawPitch(yawDegrees, pitchDegrees);
             float[] world = {poseTx + direction[0] * 2f, poseTy + direction[1] * 2f, poseTz + direction[2] * 2f, 1f};
             float[] eye = new float[4];
             float[] clip = new float[4];
@@ -1399,16 +1617,354 @@ public final class SharedCameraCaptureActivity extends Activity
         }
     }
 
+    private static final class CapturedReferenceFrame {
+        private static final int MAX_REFERENCE_SIZE = 360;
+        private static final int MESH_WIDTH = 10;
+        private static final int MESH_HEIGHT = 6;
+
+        final Bitmap bitmap;
+        final float centerYawDegrees;
+        final float centerPitchDegrees;
+        final float focalX;
+        final float focalY;
+        final float centerX;
+        final float centerY;
+        final int sourceWidth;
+        final int sourceHeight;
+        final int meshRotationCorrectionDegrees;
+        final boolean meshMirrorCorrection;
+        final float[] meshVertices = new float[(MESH_WIDTH + 1) * (MESH_HEIGHT + 1) * 2];
+
+        private CapturedReferenceFrame(
+                Bitmap bitmap,
+                float centerYawDegrees,
+                float centerPitchDegrees,
+                float focalX,
+                float focalY,
+                float centerX,
+                float centerY,
+                int sourceWidth,
+                int sourceHeight,
+                int meshRotationCorrectionDegrees,
+                boolean meshMirrorCorrection) {
+            this.bitmap = bitmap;
+            this.centerYawDegrees = centerYawDegrees;
+            this.centerPitchDegrees = centerPitchDegrees;
+            this.focalX = focalX;
+            this.focalY = focalY;
+            this.centerX = centerX;
+            this.centerY = centerY;
+            this.sourceWidth = sourceWidth;
+            this.sourceHeight = sourceHeight;
+            this.meshRotationCorrectionDegrees = meshRotationCorrectionDegrees;
+            this.meshMirrorCorrection = meshMirrorCorrection;
+        }
+
+        static CapturedReferenceFrame from(File imageFile, float yawDegrees, float pitchDegrees, ArFrameState captureState) {
+            Bitmap bitmap = decodeReferenceBitmap(imageFile);
+            if (bitmap == null) {
+                return null;
+            }
+            float sourceWidth = captureState.imageWidth > 0 ? captureState.imageWidth : bitmap.getWidth();
+            float sourceHeight = captureState.imageHeight > 0 ? captureState.imageHeight : bitmap.getHeight();
+            Bitmap corrected = transformReferencePreview(
+                    bitmap,
+                    REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES,
+                    REFERENCE_PREVIEW_MIRROR_CORRECTION);
+            DisplayIntrinsics displayIntrinsics = DisplayIntrinsics.from(
+                    sourceWidth,
+                    sourceHeight,
+                    captureState.imageFx,
+                    captureState.imageFy,
+                    captureState.imageCx,
+                    captureState.imageCy,
+                    REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES,
+                    REFERENCE_PREVIEW_MIRROR_CORRECTION,
+                    corrected.getWidth(),
+                    corrected.getHeight());
+            float fx = displayIntrinsics.fx > 0f ? displayIntrinsics.fx
+                    : corrected.getWidth() / (2f * (float) Math.tan(Math.toRadians(captureState.horizontalFovDegrees() * 0.5f)));
+            float fy = displayIntrinsics.fy > 0f ? displayIntrinsics.fy
+                    : corrected.getHeight() / (2f * (float) Math.tan(Math.toRadians(captureState.verticalFovDegrees() * 0.5f)));
+            float cx = displayIntrinsics.cx > 0f ? displayIntrinsics.cx : corrected.getWidth() * 0.5f;
+            float cy = displayIntrinsics.cy > 0f ? displayIntrinsics.cy : corrected.getHeight() * 0.5f;
+            return new CapturedReferenceFrame(
+                    corrected,
+                    yawDegrees,
+                    pitchDegrees,
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    corrected.getWidth(),
+                    corrected.getHeight(),
+                    0,
+                    false);
+        }
+
+        boolean updateMesh(ArFrameState frameState, int viewWidth, int viewHeight) {
+            if (bitmap.isRecycled() || viewWidth <= 0 || viewHeight <= 0 || focalX <= 0f || focalY <= 0f) {
+                return false;
+            }
+            int offset = 0;
+            int visible = 0;
+            for (int y = 0; y <= MESH_HEIGHT; y++) {
+                float sourceY = sourceHeight * y / (float) MESH_HEIGHT;
+                for (int x = 0; x <= MESH_WIDTH; x++) {
+                    float sourceX = sourceWidth * x / (float) MESH_WIDTH;
+                    float yawOffset = (float) Math.toDegrees(Math.atan((sourceX - centerX) / focalX));
+                    float pitchOffset = -(float) Math.toDegrees(Math.atan((sourceY - centerY) / focalY));
+                    float[] point = frameState.projectYawPitch(
+                            normalize(centerYawDegrees + yawOffset),
+                            clamp(centerPitchDegrees + pitchOffset, -89f, 89f),
+                            viewWidth,
+                            viewHeight);
+                    if (Float.isFinite(point[0]) && Float.isFinite(point[1])) {
+                        visible++;
+                    } else {
+                        point[0] = -10000f;
+                        point[1] = -10000f;
+                    }
+                    meshVertices[offset++] = point[0];
+                    meshVertices[offset++] = point[1];
+                }
+            }
+            return visible >= 4;
+        }
+
+        float angularDistanceFrom(ArFrameState frameState) {
+            float yaw = signedHeadingDelta(centerYawDegrees, frameState.yawDegrees);
+            float pitch = centerPitchDegrees - frameState.pitchDegrees;
+            return (float) Math.sqrt(yaw * yaw + pitch * pitch);
+        }
+
+        void recycle() {
+            if (!bitmap.isRecycled()) {
+                bitmap.recycle();
+            }
+        }
+
+        private static Bitmap decodeReferenceBitmap(File imageFile) {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return null;
+            }
+            int sample = 1;
+            while (bounds.outWidth / sample > MAX_REFERENCE_SIZE || bounds.outHeight / sample > MAX_REFERENCE_SIZE) {
+                sample *= 2;
+            }
+            BitmapFactory.Options decode = new BitmapFactory.Options();
+            decode.inSampleSize = sample;
+            decode.inPreferredConfig = Bitmap.Config.RGB_565;
+            return BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+        }
+
+        private static Bitmap transformReferencePreview(Bitmap bitmap, int rotationDegrees, boolean mirror) {
+            if (bitmap == null || (rotationDegrees == 0 && !mirror)) {
+                return bitmap;
+            }
+            android.graphics.Matrix matrix = new android.graphics.Matrix();
+            if (mirror) {
+                matrix.postScale(-1f, 1f);
+            }
+            if (rotationDegrees != 0) {
+                matrix.postRotate(rotationDegrees);
+            }
+            Bitmap transformed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            bitmap.recycle();
+            return transformed;
+        }
+
+        private static final class DisplayIntrinsics {
+            final float fx;
+            final float fy;
+            final float cx;
+            final float cy;
+
+            DisplayIntrinsics(float fx, float fy, float cx, float cy) {
+                this.fx = fx;
+                this.fy = fy;
+                this.cx = cx;
+                this.cy = cy;
+            }
+
+            static DisplayIntrinsics from(
+                    float sourceWidth,
+                    float sourceHeight,
+                    float sourceFx,
+                    float sourceFy,
+                    float sourceCx,
+                    float sourceCy,
+                    int rotationDegrees,
+                    boolean mirror,
+                    int bitmapWidth,
+                    int bitmapHeight) {
+                float fx = sourceFx;
+                float fy = sourceFy;
+                float cx = sourceCx > 0f ? sourceCx : sourceWidth * 0.5f;
+                float cy = sourceCy > 0f ? sourceCy : sourceHeight * 0.5f;
+                if (rotationDegrees == 90) {
+                    float oldFx = fx;
+                    fx = fy;
+                    fy = oldFx;
+                    float oldCx = cx;
+                    cx = sourceHeight - cy;
+                    cy = oldCx;
+                } else if (rotationDegrees == 180) {
+                    cx = sourceWidth - cx;
+                    cy = sourceHeight - cy;
+                } else if (rotationDegrees == 270) {
+                    float oldFx = fx;
+                    fx = fy;
+                    fy = oldFx;
+                    float oldCx = cx;
+                    cx = cy;
+                    cy = sourceWidth - oldCx;
+                }
+                float rotatedWidth = rotationDegrees == 90 || rotationDegrees == 270 ? sourceHeight : sourceWidth;
+                float rotatedHeight = rotationDegrees == 90 || rotationDegrees == 270 ? sourceWidth : sourceHeight;
+                if (mirror) {
+                    cx = rotatedWidth - cx;
+                }
+                float scaleX = bitmapWidth / Math.max(1f, rotatedWidth);
+                float scaleY = bitmapHeight / Math.max(1f, rotatedHeight);
+                return new DisplayIntrinsics(fx * scaleX, fy * scaleY, cx * scaleX, cy * scaleY);
+            }
+        }
+
+        private static float normalize(float degrees) {
+            float result = degrees % 360f;
+            return result < 0f ? result + 360f : result;
+        }
+
+        private static float clamp(float value, float min, float max) {
+            return Math.max(min, Math.min(max, value));
+        }
+    }
+
+    private static final class TextureHint {
+        final boolean available;
+        final float viewX;
+        final float viewY;
+        final float score;
+
+        TextureHint(boolean available, float viewX, float viewY, float score) {
+            this.available = available;
+            this.viewX = viewX;
+            this.viewY = viewY;
+            this.score = score;
+        }
+
+        static TextureHint unavailable() {
+            return new TextureHint(false, 0.5f, 0.5f, 0f);
+        }
+
+        static TextureHint from(Image image, int displayRotationDegrees, int sensorOrientationDegrees, boolean frontFacing) {
+            Image.Plane plane = image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer();
+            int width = image.getWidth();
+            int height = image.getHeight();
+            int rowStride = plane.getRowStride();
+            int pixelStride = plane.getPixelStride();
+            int cellWidth = Math.max(8, width / TEXTURE_HINT_GRID_COLUMNS);
+            int cellHeight = Math.max(8, height / TEXTURE_HINT_GRID_ROWS);
+            double bestScore = 0.0;
+            int bestX = width / 2;
+            int bestY = height / 2;
+            for (int row = 0; row < TEXTURE_HINT_GRID_ROWS; row++) {
+                for (int col = 0; col < TEXTURE_HINT_GRID_COLUMNS; col++) {
+                    int left = col * width / TEXTURE_HINT_GRID_COLUMNS;
+                    int top = row * height / TEXTURE_HINT_GRID_ROWS;
+                    int right = Math.min(width - 2, left + cellWidth);
+                    int bottom = Math.min(height - 2, top + cellHeight);
+                    double score = textureScore(buffer, rowStride, pixelStride, left, top, right, bottom);
+                    double centerBias = 1.0 - 0.22 * Math.hypot(col - 2.0, row - 2.0);
+                    score *= Math.max(0.45, centerBias);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestX = (left + right) / 2;
+                        bestY = (top + bottom) / 2;
+                    }
+                }
+            }
+            float[] view = sensorPointToDisplayNormalized(
+                    bestX / (float) Math.max(1, width),
+                    bestY / (float) Math.max(1, height),
+                    sensorToDisplayRotationDegrees(sensorOrientationDegrees, displayRotationDegrees, frontFacing),
+                    frontFacing);
+            return new TextureHint(bestScore > 7.0, view[0], view[1], (float) bestScore);
+        }
+
+        private static double textureScore(
+                ByteBuffer buffer,
+                int rowStride,
+                int pixelStride,
+                int left,
+                int top,
+                int right,
+                int bottom) {
+            double total = 0.0;
+            int count = 0;
+            int stepX = Math.max(2, (right - left) / 18);
+            int stepY = Math.max(2, (bottom - top) / 18);
+            for (int y = top + 1; y < bottom; y += stepY) {
+                for (int x = left + 1; x < right; x += stepX) {
+                    int center = yValue(buffer, rowStride, pixelStride, x, y);
+                    int rightValue = yValue(buffer, rowStride, pixelStride, x + 1, y);
+                    int downValue = yValue(buffer, rowStride, pixelStride, x, y + 1);
+                    total += Math.abs(rightValue - center) + Math.abs(downValue - center);
+                    count++;
+                }
+            }
+            return count <= 0 ? 0.0 : total / count;
+        }
+
+        private static int yValue(ByteBuffer buffer, int rowStride, int pixelStride, int x, int y) {
+            return buffer.get(y * rowStride + x * pixelStride) & 0xFF;
+        }
+
+        private static float[] sensorPointToDisplayNormalized(float x, float y, int rotationDegrees, boolean mirror) {
+            float outX;
+            float outY;
+            if (rotationDegrees == 90) {
+                outX = 1f - y;
+                outY = x;
+            } else if (rotationDegrees == 180) {
+                outX = 1f - x;
+                outY = 1f - y;
+            } else if (rotationDegrees == 270) {
+                outX = y;
+                outY = 1f - x;
+            } else {
+                outX = x;
+                outY = y;
+            }
+            if (mirror) {
+                outX = 1f - outX;
+            }
+            return new float[]{clamp01(outX), clamp01(outY)};
+        }
+
+        private static float clamp01(float value) {
+            return Math.max(0f, Math.min(1f, value));
+        }
+    }
+
     private static final class TargetOverlayView extends View {
         private final Paint targetPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint reticlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint coveragePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint feedbackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path cuePath = new Path();
+        private final Path horizonPath = new Path();
         private List<CaptureTarget> targets = new ArrayList<>();
         private List<Integer> selectableIndices = new ArrayList<>();
+        private List<CapturedReferenceFrame> referenceFrames = new ArrayList<>();
         private int activeTargetIndex = -1;
         private ArFrameState frameState = ArFrameState.notReady("tracking not started");
+        private TextureHint textureHint = TextureHint.unavailable();
         private long feedbackUntilMs;
         private boolean feedbackAccepted;
 
@@ -1425,11 +1981,18 @@ public final class SharedCameraCaptureActivity extends Activity
                 List<CaptureTarget> targets,
                 int activeTargetIndex,
                 List<Integer> selectableIndices,
-                ArFrameState frameState) {
+                ArFrameState frameState,
+                List<CapturedReferenceFrame> referenceFrames) {
             this.targets = targets;
             this.activeTargetIndex = activeTargetIndex;
             this.selectableIndices = new ArrayList<>(selectableIndices);
             this.frameState = frameState;
+            this.referenceFrames = referenceFrames == null ? new ArrayList<>() : new ArrayList<>(referenceFrames);
+            invalidate();
+        }
+
+        void setTextureHint(TextureHint textureHint) {
+            this.textureHint = textureHint == null ? TextureHint.unavailable() : textureHint;
             invalidate();
         }
 
@@ -1445,11 +2008,14 @@ public final class SharedCameraCaptureActivity extends Activity
             drawFeedbackFlash(canvas);
             float cx = getWidth() * 0.5f;
             float cy = getHeight() * 0.5f;
+            drawCapturedReferenceFrames(canvas);
+            drawHorizon(canvas);
             reticlePaint.setColor(frameState.ready ? 0xFFFFFFFF : 0xFF94A3B8);
             reticlePaint.setStyle(Paint.Style.STROKE);
             canvas.drawCircle(cx, cy, 34f, reticlePaint);
             drawCoverageMap(canvas);
             if (!frameState.ready) {
+                drawTextureHint(canvas);
                 return;
             }
             drawCapturedTargets(canvas);
@@ -1458,6 +2024,137 @@ public final class SharedCameraCaptureActivity extends Activity
                 return;
             }
             drawActiveTarget(canvas);
+        }
+
+        private void drawHorizon(Canvas canvas) {
+            if (!frameState.ready) {
+                return;
+            }
+            horizonPath.reset();
+            boolean drawing = false;
+            for (int step = -12; step <= 12; step++) {
+                float yaw = frameState.yawDegrees + step * 7.5f;
+                float[] point = frameState.projectYawPitch(yaw, 0f, getWidth(), getHeight());
+                boolean visible = Float.isFinite(point[0]) && Float.isFinite(point[1])
+                        && point[0] > -getWidth() && point[0] < getWidth() * 2f
+                        && point[1] > -getHeight() && point[1] < getHeight() * 2f;
+                if (!visible) {
+                    drawing = false;
+                    continue;
+                }
+                if (!drawing) {
+                    horizonPath.moveTo(point[0], point[1]);
+                    drawing = true;
+                } else {
+                    horizonPath.lineTo(point[0], point[1]);
+                }
+            }
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(3f);
+            targetPaint.setColor(0xCC38BDF8);
+            canvas.drawPath(horizonPath, targetPaint);
+            targetPaint.setStrokeWidth(1.5f);
+            targetPaint.setColor(0x88FFFFFF);
+            canvas.drawPath(horizonPath, targetPaint);
+        }
+
+        private void drawTextureHint(Canvas canvas) {
+            if (textureHint == null || !textureHint.available || !"Point at textured detail".equals(frameState.blocker)) {
+                return;
+            }
+            float x = textureHint.viewX * getWidth();
+            float y = textureHint.viewY * getHeight();
+            reticlePaint.setColor(0xFFE2E8F0);
+            reticlePaint.setStyle(Paint.Style.STROKE);
+            reticlePaint.setStrokeWidth(4f);
+            canvas.drawCircle(x, y, 30f, reticlePaint);
+            reticlePaint.setStrokeWidth(2f);
+            canvas.drawCircle(x, y, 42f, reticlePaint);
+            float centerX = getWidth() * 0.5f;
+            float centerY = getHeight() * 0.5f;
+            targetPaint.setColor(0xFFE2E8F0);
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(5f);
+            canvas.drawLine(centerX, centerY, x, y, targetPaint);
+        }
+
+        private void drawCapturedReferenceFrames(Canvas canvas) {
+            if (!frameState.ready || referenceFrames.isEmpty()) {
+                return;
+            }
+            ArrayList<ReferenceOverlayCandidate> candidates = new ArrayList<>();
+            for (CapturedReferenceFrame reference : referenceFrames) {
+                float distance = reference.angularDistanceFrom(frameState);
+                if (distance <= REFERENCE_OVERLAY_FADE_END_DEGREES) {
+                    candidates.add(new ReferenceOverlayCandidate(reference, distance));
+                }
+            }
+            Collections.sort(candidates, (left, right) -> Float.compare(left.distanceDegrees, right.distanceDegrees));
+            targetPaint.setStyle(Paint.Style.FILL);
+            int count = Math.min(MAX_VISIBLE_REFERENCE_OVERLAYS, candidates.size());
+            for (int i = count - 1; i >= 0; i--) {
+                ReferenceOverlayCandidate candidate = candidates.get(i);
+                CapturedReferenceFrame reference = candidate.reference;
+                if (!reference.updateMesh(frameState, getWidth(), getHeight())) {
+                    continue;
+                }
+                int alpha = referenceOverlayAlpha(candidate.distanceDegrees);
+                targetPaint.setAlpha(alpha);
+                canvas.drawBitmapMesh(
+                        reference.bitmap,
+                        CapturedReferenceFrame.MESH_WIDTH,
+                        CapturedReferenceFrame.MESH_HEIGHT,
+                        reference.meshVertices,
+                        0,
+                        null,
+                        0,
+                        targetPaint);
+                drawReferenceFootprint(canvas, reference, Math.min(210, alpha + 70));
+            }
+            targetPaint.setAlpha(255);
+            targetPaint.setStyle(Paint.Style.STROKE);
+        }
+
+        private int referenceOverlayAlpha(float distanceDegrees) {
+            float t = (distanceDegrees - REFERENCE_OVERLAY_FADE_START_DEGREES)
+                    / Math.max(1f, REFERENCE_OVERLAY_FADE_END_DEGREES - REFERENCE_OVERLAY_FADE_START_DEGREES);
+            t = Math.max(0f, Math.min(1f, t));
+            return Math.round(REFERENCE_OVERLAY_MAX_ALPHA * (1f - t) + REFERENCE_OVERLAY_MIN_ALPHA * t);
+        }
+
+        private void drawReferenceFootprint(Canvas canvas, CapturedReferenceFrame reference, int alpha) {
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(4f);
+            targetPaint.setColor((Math.max(0, Math.min(255, alpha)) << 24) | 0x0038BDF8);
+            float[] vertices = reference.meshVertices;
+            int row = (CapturedReferenceFrame.MESH_WIDTH + 1) * 2;
+            int bottom = CapturedReferenceFrame.MESH_HEIGHT * row;
+            drawMeshLine(canvas, vertices, 0, CapturedReferenceFrame.MESH_WIDTH * 2);
+            drawMeshLine(canvas, vertices, bottom, bottom + CapturedReferenceFrame.MESH_WIDTH * 2);
+            drawMeshLine(canvas, vertices, 0, bottom);
+            drawMeshLine(canvas, vertices, CapturedReferenceFrame.MESH_WIDTH * 2, bottom + CapturedReferenceFrame.MESH_WIDTH * 2);
+            targetPaint.setStyle(Paint.Style.FILL);
+        }
+
+        private static final class ReferenceOverlayCandidate {
+            final CapturedReferenceFrame reference;
+            final float distanceDegrees;
+
+            ReferenceOverlayCandidate(CapturedReferenceFrame reference, float distanceDegrees) {
+                this.reference = reference;
+                this.distanceDegrees = distanceDegrees;
+            }
+        }
+
+        private void drawMeshLine(Canvas canvas, float[] vertices, int from, int to) {
+            float x1 = vertices[from];
+            float y1 = vertices[from + 1];
+            float x2 = vertices[to];
+            float y2 = vertices[to + 1];
+            if (Float.isFinite(x1) && Float.isFinite(y1) && Float.isFinite(x2) && Float.isFinite(y2)
+                    && x1 > -9999f && x2 > -9999f) {
+                canvas.drawLine(x1, y1, x2, y2, targetPaint);
+            }
         }
 
         private void drawCapturedTargets(Canvas canvas) {
@@ -1558,33 +2255,74 @@ public final class SharedCameraCaptureActivity extends Activity
             if (targets.isEmpty()) {
                 return;
             }
-            float width = Math.min(160f, getWidth() * 0.34f);
-            float height = width * 0.52f;
-            float left = getWidth() - width - 16f;
-            float top = 16f;
+            float size = Math.min(124f, getWidth() * 0.26f);
+            float radius = size * 0.5f;
+            float centerX = getWidth() - radius - 16f;
+            float centerY = 16f + radius;
             coveragePaint.setStyle(Paint.Style.FILL);
             coveragePaint.setColor(0x66000000);
-            canvas.drawRoundRect(left, top, left + width, top + height, 8f, 8f, coveragePaint);
+            canvas.drawCircle(centerX, centerY, radius, coveragePaint);
             coveragePaint.setStyle(Paint.Style.STROKE);
             coveragePaint.setStrokeWidth(2f);
             coveragePaint.setColor(0x99E2E8F0);
-            canvas.drawRoundRect(left, top, left + width, top + height, 8f, 8f, coveragePaint);
+            canvas.drawCircle(centerX, centerY, radius, coveragePaint);
+            drawMiniGlobeGrid(canvas, centerX, centerY, radius);
             for (int i = 0; i < targets.size(); i++) {
                 CaptureTarget target = targets.get(i);
-                float x = left + 8f + (width - 16f) * (target.yawDegrees / 360f);
-                float y = top + height * 0.5f - (height - 16f) * (target.pitchDegrees / 170f);
+                float[] point = miniGlobePoint(target.yawDegrees, target.pitchDegrees, centerX, centerY, radius);
+                if (!Float.isFinite(point[0]) || point[2] < -0.12f) {
+                    continue;
+                }
+                float depth = Math.max(0.35f, 0.65f + point[2] * 0.35f);
                 if (target.captured) {
-                    coveragePaint.setColor(0xFF34D399);
+                    coveragePaint.setColor(colorWithAlpha(0xFF34D399, depth));
                 } else if (target.weak) {
-                    coveragePaint.setColor(0xFFF97316);
+                    coveragePaint.setColor(colorWithAlpha(0xFFF97316, depth));
                 } else if (i == activeTargetIndex) {
-                    coveragePaint.setColor(0xFFFFFFFF);
+                    coveragePaint.setColor(colorWithAlpha(0xFFFFFFFF, depth));
                 } else {
-                    coveragePaint.setColor(0xFF64748B);
+                    coveragePaint.setColor(colorWithAlpha(0xFF64748B, depth));
                 }
                 coveragePaint.setStyle(Paint.Style.FILL);
-                canvas.drawCircle(x, y, i == activeTargetIndex ? 5.5f : 3.8f, coveragePaint);
+                canvas.drawCircle(point[0], point[1], i == activeTargetIndex ? 6f : 4f, coveragePaint);
             }
+        }
+
+        private void drawMiniGlobeGrid(Canvas canvas, float centerX, float centerY, float radius) {
+            coveragePaint.setStyle(Paint.Style.STROKE);
+            coveragePaint.setStrokeWidth(1.2f);
+            coveragePaint.setColor(0x55E2E8F0);
+            canvas.drawLine(centerX - radius, centerY, centerX + radius, centerY, coveragePaint);
+            canvas.drawLine(centerX, centerY - radius, centerX, centerY + radius, coveragePaint);
+            canvas.drawCircle(centerX, centerY, radius * 0.55f, coveragePaint);
+        }
+
+        private float[] miniGlobePoint(float yawDegrees, float pitchDegrees, float centerX, float centerY, float radius) {
+            double yaw = Math.toRadians(yawDegrees);
+            double pitch = Math.toRadians(pitchDegrees);
+            double currentYaw = Math.toRadians(frameState.ready ? frameState.yawDegrees : 0f);
+            double currentPitch = Math.toRadians(frameState.ready ? frameState.pitchDegrees : 0f);
+            float x = (float) (Math.cos(pitch) * Math.sin(yaw));
+            float y = (float) Math.sin(pitch);
+            float z = (float) (Math.cos(pitch) * Math.cos(yaw));
+            float cy = (float) Math.cos(-currentYaw);
+            float sy = (float) Math.sin(-currentYaw);
+            float yawX = x * cy + z * sy;
+            float yawZ = -x * sy + z * cy;
+            float cp = (float) Math.cos(-currentPitch);
+            float sp = (float) Math.sin(-currentPitch);
+            float pitchY = y * cp - yawZ * sp;
+            float pitchZ = y * sp + yawZ * cp;
+            return new float[]{
+                    centerX + yawX * radius * 0.86f,
+                    centerY - pitchY * radius * 0.86f,
+                    pitchZ
+            };
+        }
+
+        private static int colorWithAlpha(int color, float alphaScale) {
+            int alpha = Math.max(35, Math.min(255, Math.round(((color >>> 24) & 0xFF) * alphaScale)));
+            return (color & 0x00FFFFFF) | (alpha << 24);
         }
 
         private void drawOffscreenCue(Canvas canvas, float targetX, float targetY) {

@@ -55,7 +55,11 @@ useful only after geometry is strong enough. The current code now:
 - runs an iterative pose graph relaxation instead of per-frame overwrite nudges;
 - normalizes source exposure before rendering to reduce harsh source-selected
   brightness jumps;
-- blocks obviously weak capture sessions before rendering.
+- treats low-texture failures as insufficient visual features rather than bad
+  capture when pose metadata is complete, while keeping textured overlap edges
+  strict for graph connectivity;
+- blocks obviously weak, disconnected, high-residual, or parallax-risk capture
+  sessions before rendering.
 
 ## Next Required Work
 

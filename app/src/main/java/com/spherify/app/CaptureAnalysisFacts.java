@@ -15,6 +15,7 @@ final class CaptureAnalysisFacts {
     final double confidence;
     final String parallaxRiskHint;
     final String rejectionReason;
+    final String validationCategory;
 
     CaptureAnalysisFacts(
             double blurScore,
@@ -27,6 +28,32 @@ final class CaptureAnalysisFacts {
             double confidence,
             String parallaxRiskHint,
             String rejectionReason) {
+        this(
+                blurScore,
+                exposureScore,
+                textureScore,
+                predictedOverlapSet,
+                opencvRansacResult,
+                inlierCount,
+                residualScore,
+                confidence,
+                parallaxRiskHint,
+                rejectionReason,
+                "");
+    }
+
+    CaptureAnalysisFacts(
+            double blurScore,
+            double exposureScore,
+            double textureScore,
+            JSONArray predictedOverlapSet,
+            String opencvRansacResult,
+            int inlierCount,
+            double residualScore,
+            double confidence,
+            String parallaxRiskHint,
+            String rejectionReason,
+            String validationCategory) {
         this.blurScore = blurScore;
         this.exposureScore = exposureScore;
         this.textureScore = textureScore;
@@ -37,6 +64,7 @@ final class CaptureAnalysisFacts {
         this.confidence = confidence;
         this.parallaxRiskHint = parallaxRiskHint == null ? "" : parallaxRiskHint;
         this.rejectionReason = rejectionReason == null ? "" : rejectionReason;
+        this.validationCategory = validationCategory == null ? "" : validationCategory;
     }
 
     static CaptureAnalysisFacts empty() {
@@ -65,6 +93,7 @@ final class CaptureAnalysisFacts {
         json.put("confidence", confidence);
         json.put("parallaxRiskHint", parallaxRiskHint);
         json.put("rejectionReason", rejectionReason);
+        json.put("validationCategory", validationCategory);
         return json;
     }
 
@@ -82,6 +111,7 @@ final class CaptureAnalysisFacts {
                 json.optDouble("residualScore", -1.0),
                 json.optDouble("confidence", 0.0),
                 json.optString("parallaxRiskHint", ""),
-                json.optString("rejectionReason", ""));
+                json.optString("rejectionReason", ""),
+                json.optString("validationCategory", ""));
     }
 }

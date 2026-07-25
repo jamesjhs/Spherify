@@ -14,6 +14,7 @@ final class CandidateAnalysisResult {
     final String rejectionReason;
     final String acceptedNeighborFrameId;
     final JSONArray controlPoints;
+    final String validationCategory;
 
     CandidateAnalysisResult(
             boolean accepted,
@@ -27,6 +28,34 @@ final class CandidateAnalysisResult {
             String rejectionReason,
             String acceptedNeighborFrameId,
             JSONArray controlPoints) {
+        this(
+                accepted,
+                quality,
+                predictedOverlapSet,
+                opencvRansacResult,
+                inlierCount,
+                residualScore,
+                confidence,
+                parallaxRiskHint,
+                rejectionReason,
+                acceptedNeighborFrameId,
+                controlPoints,
+                accepted ? "visual_overlap" : "rejected");
+    }
+
+    CandidateAnalysisResult(
+            boolean accepted,
+            CandidateQualityReport quality,
+            JSONArray predictedOverlapSet,
+            String opencvRansacResult,
+            int inlierCount,
+            double residualScore,
+            double confidence,
+            String parallaxRiskHint,
+            String rejectionReason,
+            String acceptedNeighborFrameId,
+            JSONArray controlPoints,
+            String validationCategory) {
         this.accepted = accepted;
         this.quality = quality;
         this.predictedOverlapSet = predictedOverlapSet == null ? new JSONArray() : predictedOverlapSet;
@@ -38,6 +67,7 @@ final class CandidateAnalysisResult {
         this.rejectionReason = rejectionReason == null ? "" : rejectionReason;
         this.acceptedNeighborFrameId = acceptedNeighborFrameId == null ? "" : acceptedNeighborFrameId;
         this.controlPoints = controlPoints == null ? new JSONArray() : controlPoints;
+        this.validationCategory = validationCategory == null ? "" : validationCategory;
     }
 
     CaptureAnalysisFacts toAnalysisFacts() {
@@ -51,6 +81,7 @@ final class CandidateAnalysisResult {
                 residualScore,
                 confidence,
                 parallaxRiskHint,
-                rejectionReason);
+                rejectionReason,
+                validationCategory);
     }
 }

@@ -24,9 +24,9 @@ import java.util.List;
 final class CaptureTargetPlanner {
     private static final double DEFAULT_HORIZONTAL_FOV_DEGREES = 75.0;
     private static final double DEFAULT_VERTICAL_FOV_DEGREES = 60.0;
-    private static final double TARGET_OVERLAP = 0.58;
-    private static final int MIN_STEP_DEGREES = 18;
-    private static final int MAX_STEP_DEGREES = 34;
+    private static final double TARGET_OVERLAP = 0.70;
+    private static final int MIN_STEP_DEGREES = 14;
+    private static final int MAX_STEP_DEGREES = 26;
 
     private CaptureTargetPlanner() {
     }
@@ -46,39 +46,25 @@ final class CaptureTargetPlanner {
             int anchorPitchDegrees,
             double horizontalFovDegrees,
             double verticalFovDegrees) {
-        int yawStep = captureStep(horizontalFovDegrees);
-        int pitchStep = captureStep(verticalFovDegrees);
-        int row1 = pitchStep;
-        int row2 = pitchStep * 2;
-        int row3 = Math.min(75, pitchStep * 3);
+        int yawStep = 45;
+        int row1 = 35;
+        int row2 = 70;
         ArrayList<CaptureTarget> targets = new ArrayList<>();
         int anchorPitch = clampPitch(anchorPitchDegrees);
         targets.add(new CaptureTarget(normalize(anchorYawDegrees), anchorPitch, CaptureTargetPhase.START));
-        addTargetIfMissing(targets, anchorYawDegrees + yawStep, anchorPitch, CaptureTargetPhase.HORIZON);
-        addTargetIfMissing(targets, anchorYawDegrees - yawStep, anchorPitch, CaptureTargetPhase.HORIZON);
-        addTargetIfMissing(targets, anchorYawDegrees, anchorPitch + row1, CaptureTargetPhase.MID);
-        addTargetIfMissing(targets, anchorYawDegrees, anchorPitch - row1, CaptureTargetPhase.MID);
-        int columns = Math.max(8, (int) Math.ceil(360.0 / yawStep));
-        for (int column = 2; column <= columns / 2; column++) {
-            addTargetIfMissing(targets, anchorYawDegrees + column * yawStep, anchorPitch, CaptureTargetPhase.HORIZON);
-            addTargetIfMissing(targets, anchorYawDegrees - column * yawStep, anchorPitch, CaptureTargetPhase.HORIZON);
+        for (int column = 1; column < 8; column++) {
+            int offset = column * yawStep;
+            addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch, CaptureTargetPhase.HORIZON);
         }
-        for (int column = 1; column <= columns / 2; column++) {
+        for (int column = 0; column < 8; column++) {
             int offset = column * yawStep;
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch + row1, CaptureTargetPhase.MID);
-            addTargetIfMissing(targets, anchorYawDegrees - offset, anchorPitch + row1, CaptureTargetPhase.MID);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch - row1, CaptureTargetPhase.MID);
-            addTargetIfMissing(targets, anchorYawDegrees - offset, anchorPitch - row1, CaptureTargetPhase.MID);
         }
-        for (int column = 0; column < columns; column += 2) {
+        for (int column = 1; column < 8; column += 2) {
             int offset = column * yawStep;
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch + row2, CaptureTargetPhase.HIGH);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch - row2, CaptureTargetPhase.HIGH);
-        }
-        for (int column = 0; column < columns; column += 3) {
-            int offset = column * yawStep;
-            addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch + row3, CaptureTargetPhase.POLE);
-            addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch - row3, CaptureTargetPhase.POLE);
         }
         addTargetIfMissing(targets, anchorYawDegrees, 85, CaptureTargetPhase.POLE);
         addTargetIfMissing(targets, anchorYawDegrees, -85, CaptureTargetPhase.POLE);

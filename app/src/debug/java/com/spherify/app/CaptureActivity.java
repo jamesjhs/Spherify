@@ -40,6 +40,7 @@ package com.spherify.app;
 import android.Manifest;
 import android.app.AlertDialog;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.ImageFormat;
@@ -113,6 +114,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private static final long REQUIRED_STABLE_MS = 850L;
     private static final long MIN_CAPTURE_INTERVAL_MS = 1200L;
     private static final boolean SHARED_CAMERA_AR_CAPTURE_BACKEND_ENABLED = false;
+    private static final int REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES = 270;
+    private static final boolean REFERENCE_PREVIEW_MIRROR_CORRECTION = true;
 
     private PreviewView previewView;
     private TargetGuideView guideView;
@@ -128,6 +131,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private final CandidateQualityScorer qualityScorer = new CandidateQualityScorer();
     private final OpenCvOverlapValidator overlapValidator = new OpenCvOverlapValidator();
     private final ArrayList<CaptureTarget> targets = new ArrayList<>();
+    private final ArrayList<CapturedReferenceFrame> capturedReferenceFrames = new ArrayList<>();
     private final float[] rotationMatrix = new float[9];
     private final float[] orientationValues = new float[3];
     private String sessionId;
@@ -226,6 +230,10 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        for (CapturedReferenceFrame reference : capturedReferenceFrames) {
+            reference.recycle();
+        }
+        capturedReferenceFrames.clear();
         captureExecutor.shutdownNow();
     }
 
@@ -437,7 +445,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 cameraFacts,
                 aligned,
                 stable,
-                lockProgress);
+                lockProgress,
+                capturedReferenceFrames);
         boolean productionArReady = productionArCaptureReady();
         captureButton.setEnabled(!captureInProgress && imageCapture != null && hasOrientation && target != null && productionArReady);
         int accepted = acceptedTargetCount();
@@ -573,8 +582,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     imageFile,
                     quality,
                     neighbors,
+                    exposure,
+                    hasOrientation,
                     target.pitchDegrees,
-                    !captureAnchored);
+                    !captureAnchored,
+                    hasOrientation);
             library.recordAnalyzedCandidateFrame(
                     imageFile,
                     sessionId,
@@ -588,7 +600,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     TAG_PROFILE,
                     exposure.toString(),
                     analysis);
-            runOnUiThread(() -> handleValidationResult(target, analysis));
+            runOnUiThread(() -> handleValidationResult(target, analysis, imageFile));
         } catch (IOException | JSONException e) {
             runOnUiThread(() -> {
                 captureInProgress = false;
@@ -598,7 +610,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         }
     }
 
-    private void handleValidationResult(CaptureTarget target, CandidateAnalysisResult analysis) {
+    private void handleValidationResult(CaptureTarget target, CandidateAnalysisResult analysis, File imageFile) {
         captureInProgress = false;
         lastCaptureAtMs = System.currentTimeMillis();
         if (analysis.accepted) {
@@ -611,15 +623,42 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 buildAnchoredCaptureTargets(acceptedYaw, acceptedPitch);
             }
             markTargetAccepted(acceptedYaw, acceptedPitch);
+            addCapturedReferenceFrame(imageFile, acceptedYaw, acceptedPitch);
             updateActiveTarget();
             ensureSession(true);
-            Toast.makeText(this, analysis.inlierCount > 0 ? "Accepted - overlap valid" : "Accepted - first view", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, acceptedCaptureMessage(analysis), Toast.LENGTH_SHORT).show();
         } else {
             target.weak = true;
-            Toast.makeText(this, analysis.rejectionReason.isEmpty() ? "Recapture this area" : analysis.rejectionReason, Toast.LENGTH_LONG).show();
+            Toast.makeText(this, rejectionMessage(analysis), Toast.LENGTH_LONG).show();
         }
         alignedSinceMs = 0L;
         refreshUi();
+    }
+
+    private void addCapturedReferenceFrame(File imageFile, int yawDegrees, int pitchDegrees) {
+        CapturedReferenceFrame reference = CapturedReferenceFrame.from(imageFile, yawDegrees, pitchDegrees, cameraFacts);
+        if (reference == null) {
+            return;
+        }
+        capturedReferenceFrames.add(reference);
+        while (capturedReferenceFrames.size() > 12) {
+            CapturedReferenceFrame removed = capturedReferenceFrames.remove(0);
+            removed.recycle();
+        }
+    }
+
+    private static String acceptedCaptureMessage(CandidateAnalysisResult analysis) {
+        if ("low_texture_pose_only".equals(analysis.validationCategory)) {
+            return "Low detail here, continue slowly";
+        }
+        return analysis.inlierCount > 0 ? "Accepted - overlap valid" : "Accepted - first view";
+    }
+
+    private static String rejectionMessage(CandidateAnalysisResult analysis) {
+        if ("Need more visual detail".equals(analysis.rejectionReason)) {
+            return "Low detail here, add visual detail";
+        }
+        return analysis.rejectionReason.isEmpty() ? "Recapture this area" : analysis.rejectionReason;
     }
 
     private void toggleAutoCapture() {
@@ -1037,7 +1076,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             if (!available || focalLengthMm <= 0f || sensorWidthMm <= 0f) {
                 return 75.0;
             }
-            return Math.toDegrees(2.0 * Math.atan(sensorWidthMm / (2.0 * focalLengthMm)));
+            return Math.min(
+                    Math.toDegrees(2.0 * Math.atan(sensorWidthMm / (2.0 * focalLengthMm))),
+                    verticalFovDegrees());
         }
 
         double verticalFovDegrees() {
@@ -1165,6 +1206,139 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         }
     }
 
+    private static final class CapturedReferenceFrame {
+        private static final int MAX_REFERENCE_SIZE = 360;
+        private static final int MESH_WIDTH = 10;
+        private static final int MESH_HEIGHT = 6;
+
+        final Bitmap bitmap;
+        final float centerYawDegrees;
+        final float centerPitchDegrees;
+        final float horizontalFovDegrees;
+        final float verticalFovDegrees;
+        final int meshRotationCorrectionDegrees;
+        final boolean meshMirrorCorrection;
+        final float[] meshVertices = new float[(MESH_WIDTH + 1) * (MESH_HEIGHT + 1) * 2];
+
+        private CapturedReferenceFrame(
+                Bitmap bitmap,
+                float centerYawDegrees,
+                float centerPitchDegrees,
+                float horizontalFovDegrees,
+                float verticalFovDegrees,
+                int meshRotationCorrectionDegrees,
+                boolean meshMirrorCorrection) {
+            this.bitmap = bitmap;
+            this.centerYawDegrees = centerYawDegrees;
+            this.centerPitchDegrees = centerPitchDegrees;
+            this.horizontalFovDegrees = horizontalFovDegrees;
+            this.verticalFovDegrees = verticalFovDegrees;
+            this.meshRotationCorrectionDegrees = meshRotationCorrectionDegrees;
+            this.meshMirrorCorrection = meshMirrorCorrection;
+        }
+
+        static CapturedReferenceFrame from(File imageFile, int yawDegrees, int pitchDegrees, CameraFacts cameraFacts) {
+            Bitmap bitmap = decodeReferenceBitmap(imageFile);
+            if (bitmap == null) {
+                return null;
+            }
+            Bitmap corrected = transformReferencePreview(
+                    bitmap,
+                    REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES,
+                    REFERENCE_PREVIEW_MIRROR_CORRECTION);
+            boolean rotated = REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES == 90
+                    || REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES == 270;
+            return new CapturedReferenceFrame(
+                    corrected,
+                    yawDegrees,
+                    pitchDegrees,
+                    rotated ? (float) cameraFacts.verticalFovDegrees() : (float) cameraFacts.horizontalFovDegrees(),
+                    rotated ? (float) cameraFacts.horizontalFovDegrees() : (float) cameraFacts.verticalFovDegrees(),
+                    0,
+                    false);
+        }
+
+        boolean updateMesh(
+                PreviewGeometry previewGeometry,
+                CameraFacts cameraFacts,
+                float currentYawDegrees,
+                float currentPitchDegrees,
+                int viewWidth,
+                int viewHeight) {
+            if (bitmap.isRecycled() || viewWidth <= 0 || viewHeight <= 0) {
+                return false;
+            }
+            int offset = 0;
+            int visible = 0;
+            for (int y = 0; y <= MESH_HEIGHT; y++) {
+                float normalizedY = y / (float) MESH_HEIGHT - 0.5f;
+                for (int x = 0; x <= MESH_WIDTH; x++) {
+                    float normalizedX = x / (float) MESH_WIDTH - 0.5f;
+                    float sampleYaw = normalize(centerYawDegrees + normalizedX * horizontalFovDegrees);
+                    float samplePitch = clamp(centerPitchDegrees - normalizedY * verticalFovDegrees, -89f, 89f);
+                    float yawDelta = signedHeadingDelta(sampleYaw, currentYawDegrees);
+                    float pitchDelta = samplePitch - currentPitchDegrees;
+                    float[] point = previewGeometry.projectTarget(yawDelta, pitchDelta, cameraFacts, viewWidth, viewHeight);
+                    if (Float.isFinite(point[0]) && Float.isFinite(point[1])
+                            && point[0] >= -viewWidth && point[0] <= viewWidth * 2f
+                            && point[1] >= -viewHeight && point[1] <= viewHeight * 2f) {
+                        visible++;
+                    } else if (!Float.isFinite(point[0]) || !Float.isFinite(point[1])) {
+                        point[0] = -10000f;
+                        point[1] = -10000f;
+                    }
+                    meshVertices[offset++] = point[0];
+                    meshVertices[offset++] = point[1];
+                }
+            }
+            return visible >= 4;
+        }
+
+        void recycle() {
+            if (!bitmap.isRecycled()) {
+                bitmap.recycle();
+            }
+        }
+
+        private static Bitmap decodeReferenceBitmap(File imageFile) {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return null;
+            }
+            int sample = 1;
+            while (bounds.outWidth / sample > MAX_REFERENCE_SIZE || bounds.outHeight / sample > MAX_REFERENCE_SIZE) {
+                sample *= 2;
+            }
+            BitmapFactory.Options decode = new BitmapFactory.Options();
+            decode.inSampleSize = sample;
+            decode.inPreferredConfig = Bitmap.Config.RGB_565;
+            return BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+        }
+
+        private static Bitmap transformReferencePreview(Bitmap bitmap, int rotationDegrees, boolean mirror) {
+            if (bitmap == null || (rotationDegrees == 0 && !mirror)) {
+                return bitmap;
+            }
+            Matrix matrix = new Matrix();
+            if (mirror) {
+                matrix.postScale(-1f, 1f);
+            }
+            if (rotationDegrees != 0) {
+                matrix.postRotate(rotationDegrees);
+            }
+            Bitmap transformed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            bitmap.recycle();
+            return transformed;
+        }
+
+        private static float normalize(float degrees) {
+            float normalized = degrees % 360f;
+            return normalized < 0f ? normalized + 360f : normalized;
+        }
+    }
+
     /*
      * Class: TargetGuideView
      * Educational overview:
@@ -1185,6 +1359,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         private float pitchDegrees;
         private PreviewGeometry previewGeometry = PreviewGeometry.unavailable();
         private CameraFacts cameraFacts = CameraFacts.unavailable();
+        private List<CapturedReferenceFrame> referenceFrames = new ArrayList<>();
         private boolean aligned;
         private boolean stable;
         private float lockProgress;
@@ -1211,7 +1386,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 CameraFacts cameraFacts,
                 boolean aligned,
                 boolean stable,
-                float lockProgress) {
+                float lockProgress,
+                List<CapturedReferenceFrame> referenceFrames) {
             this.targets = targets;
             this.activeTargetIndex = activeTargetIndex;
             this.headingDegrees = headingDegrees;
@@ -1221,15 +1397,73 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
             this.aligned = aligned;
             this.stable = stable;
             this.lockProgress = lockProgress;
+            this.referenceFrames = referenceFrames == null ? new ArrayList<>() : new ArrayList<>(referenceFrames);
             invalidate();
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
+            drawCapturedReferenceFrames(canvas);
             drawActiveTarget(canvas);
             drawReticle(canvas);
             drawCoverage(canvas);
+        }
+
+        private void drawCapturedReferenceFrames(Canvas canvas) {
+            if (referenceFrames.isEmpty()) {
+                return;
+            }
+            targetPaint.setStyle(Paint.Style.FILL);
+            targetPaint.setAlpha(150);
+            for (CapturedReferenceFrame reference : referenceFrames) {
+                if (!reference.updateMesh(
+                        previewGeometry,
+                        cameraFacts,
+                        headingDegrees,
+                        pitchDegrees,
+                        getWidth(),
+                        getHeight())) {
+                    continue;
+                }
+                canvas.drawBitmapMesh(
+                        reference.bitmap,
+                        CapturedReferenceFrame.MESH_WIDTH,
+                        CapturedReferenceFrame.MESH_HEIGHT,
+                        reference.meshVertices,
+                        0,
+                        null,
+                        0,
+                        targetPaint);
+                drawReferenceFootprint(canvas, reference);
+            }
+            targetPaint.setAlpha(255);
+            targetPaint.setStyle(Paint.Style.STROKE);
+        }
+
+        private void drawReferenceFootprint(Canvas canvas, CapturedReferenceFrame reference) {
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(4f);
+            targetPaint.setColor(0xFF38BDF8);
+            float[] vertices = reference.meshVertices;
+            int row = (CapturedReferenceFrame.MESH_WIDTH + 1) * 2;
+            int bottom = CapturedReferenceFrame.MESH_HEIGHT * row;
+            drawMeshLine(canvas, vertices, 0, 0, CapturedReferenceFrame.MESH_WIDTH * 2);
+            drawMeshLine(canvas, vertices, bottom, bottom, bottom + CapturedReferenceFrame.MESH_WIDTH * 2);
+            drawMeshLine(canvas, vertices, 0, 0, bottom);
+            drawMeshLine(canvas, vertices, CapturedReferenceFrame.MESH_WIDTH * 2, CapturedReferenceFrame.MESH_WIDTH * 2, bottom + CapturedReferenceFrame.MESH_WIDTH * 2);
+            targetPaint.setStyle(Paint.Style.FILL);
+        }
+
+        private void drawMeshLine(Canvas canvas, float[] vertices, int start, int from, int to) {
+            float x1 = vertices[from];
+            float y1 = vertices[from + 1];
+            float x2 = vertices[to];
+            float y2 = vertices[to + 1];
+            if (Float.isFinite(x1) && Float.isFinite(y1) && Float.isFinite(x2) && Float.isFinite(y2)
+                    && x1 > -9999f && x2 > -9999f) {
+                canvas.drawLine(x1, y1, x2, y2, targetPaint);
+            }
         }
 
         private void drawActiveTarget(Canvas canvas) {
