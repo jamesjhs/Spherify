@@ -17,6 +17,7 @@ final class CaptureSessionRecord {
     CaptureMode captureMode;
     SessionStatus status;
     boolean diagnosticSpherifyAllowed;
+    String fieldComment;
     JSONObject readiness;
     final ArrayList<CaptureFrameRecord> frames;
     final ArrayList<CaptureGraphEdgeRecord> graphEdges;
@@ -29,6 +30,7 @@ final class CaptureSessionRecord {
             CaptureMode captureMode,
             SessionStatus status,
             boolean diagnosticSpherifyAllowed,
+            String fieldComment,
             JSONObject readiness,
             List<CaptureFrameRecord> frames,
             List<CaptureGraphEdgeRecord> graphEdges) {
@@ -39,6 +41,7 @@ final class CaptureSessionRecord {
         this.captureMode = captureMode;
         this.status = status;
         this.diagnosticSpherifyAllowed = diagnosticSpherifyAllowed;
+        this.fieldComment = fieldComment == null ? "" : fieldComment;
         this.readiness = readiness == null ? new JSONObject() : readiness;
         this.frames = new ArrayList<>(frames == null ? new ArrayList<>() : frames);
         this.graphEdges = new ArrayList<>(graphEdges == null ? new ArrayList<>() : graphEdges);
@@ -64,6 +67,7 @@ final class CaptureSessionRecord {
         json.put("captureMode", captureMode.storageValue);
         json.put("status", status.storageValue);
         json.put("diagnosticSpherifyAllowed", diagnosticSpherifyAllowed);
+        json.put("fieldComment", fieldComment);
         json.put("readiness", readiness);
         JSONArray frameArray = new JSONArray();
         for (CaptureFrameRecord frame : frames) {
@@ -107,6 +111,7 @@ final class CaptureSessionRecord {
                 CaptureMode.fromStorageValue(json.optString("captureMode", "handheld")),
                 SessionStatus.fromStorageValue(json.optString("status", "new")),
                 json.optBoolean("diagnosticSpherifyAllowed", false),
+                json.optString("fieldComment", json.optString("debugComment", "")),
                 json.optJSONObject("readiness"),
                 frames,
                 edges);

@@ -44,10 +44,12 @@ final class CaptureDebugCsvWriter {
         if (!keepExisting) {
             deleteOldDebugCsv(outputDir);
         }
-        File outputFile = new File(outputDir, "capture-debug-" + stamp() + ".csv");
+        String stamp = stamp();
+        File outputFile = new File(outputDir, "capture-debug-" + stamp + ".csv");
         try (FileOutputStream output = new FileOutputStream(outputFile)) {
             output.write(buildCsv(session).getBytes(StandardCharsets.UTF_8));
         }
+        writeCommentFile(outputDir, stamp, session);
         return outputFile;
     }
 
@@ -75,6 +77,7 @@ final class CaptureDebugCsvWriter {
                 "session_status",
                 "session_created_at_ms",
                 "session_updated_at_ms",
+                "session_field_comment",
                 "frame_id",
                 "frame_role",
                 "frame_file_path",
@@ -153,6 +156,7 @@ final class CaptureDebugCsvWriter {
                 session.status.storageValue,
                 Long.toString(session.createdAt),
                 Long.toString(session.updatedAt),
+                session.fieldComment,
                 frame.id,
                 frame.role.storageValue,
                 frame.rawFacts.filePath,
@@ -242,7 +246,8 @@ final class CaptureDebugCsvWriter {
     }
 
     private static void deleteOldDebugCsv(File outputDir) {
-        File[] files = outputDir.listFiles((dir, name) -> name.startsWith("capture-debug-") && name.endsWith(".csv"));
+        File[] files = outputDir.listFiles((dir, name) -> name.startsWith("capture-debug-")
+                && (name.endsWith(".csv") || name.endsWith(".txt")));
         if (files == null) {
             return;
         }
@@ -250,6 +255,23 @@ final class CaptureDebugCsvWriter {
             if (!file.delete()) {
                 Log.w(TAG, "Could not delete old debug CSV: " + file.getAbsolutePath());
             }
+        }
+    }
+
+    private static void writeCommentFile(File outputDir, String stamp, CaptureSessionRecord session) throws IOException {
+        if (session.fieldComment == null || session.fieldComment.trim().isEmpty()) {
+            return;
+        }
+        File noteFile = new File(outputDir, "capture-debug-" + stamp + "-note.txt");
+        String text = "Spherify capture field note\n"
+                + "Session: " + session.id + "\n"
+                + "CSV: capture-debug-" + stamp + ".csv\n"
+                + "Created: " + session.createdAt + "\n"
+                + "Updated: " + session.updatedAt + "\n\n"
+                + session.fieldComment.trim()
+                + "\n";
+        try (FileOutputStream output = new FileOutputStream(noteFile)) {
+            output.write(text.getBytes(StandardCharsets.UTF_8));
         }
     }
 

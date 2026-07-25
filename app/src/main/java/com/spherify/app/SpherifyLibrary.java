@@ -350,6 +350,7 @@ final class SpherifyLibrary {
                 captureMode == null ? CaptureMode.HAND_HELD : captureMode,
                 readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW,
                 false,
+                "",
                 readiness,
                 new ArrayList<>(),
                 new ArrayList<>());
@@ -387,6 +388,7 @@ final class SpherifyLibrary {
                 captureMode == null ? CaptureMode.HAND_HELD : captureMode,
                 readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW,
                 false,
+                "",
                 readiness,
                 new ArrayList<>(),
                 new ArrayList<>());
@@ -409,6 +411,25 @@ final class SpherifyLibrary {
                         || session.status == SessionStatus.CAPTURING) {
                     session.status = readinessPasses(readiness) ? SessionStatus.READY : SessionStatus.NEW;
                 }
+                session.updatedAt = System.currentTimeMillis();
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            writeCaptureSessions(sessions);
+        }
+    }
+
+    void updateCaptureSessionFieldComment(String sessionId, String comment) throws IOException {
+        if (sessionId == null || sessionId.isEmpty()) {
+            return;
+        }
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        boolean changed = false;
+        for (CaptureSessionRecord session : sessions) {
+            if (session.id.equals(sessionId)) {
+                session.fieldComment = comment == null ? "" : comment;
                 session.updatedAt = System.currentTimeMillis();
                 changed = true;
                 break;
@@ -1563,6 +1584,7 @@ final class SpherifyLibrary {
                     CaptureMode.fromStorageValue(captureProfile),
                     SessionStatus.CAPTURING,
                     false,
+                    "",
                     new JSONObject(),
                     new ArrayList<>(),
                     new ArrayList<>());
@@ -1632,6 +1654,7 @@ final class SpherifyLibrary {
                 captureMode == null ? CaptureMode.HAND_HELD : captureMode,
                 SessionStatus.CAPTURING,
                 false,
+                "",
                 new JSONObject(),
                 new ArrayList<>(),
                 new ArrayList<>());

@@ -51,12 +51,14 @@ import android.opengl.Matrix;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.text.InputType;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.Surface;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -162,6 +164,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private boolean captureInProgress;
     private boolean completionInProgress;
     private boolean finishGuidanceActive;
+    private String fieldComment = "";
     private int activeTargetIndex;
     private int anchorYawDegrees;
     private int anchorPitchDegrees;
@@ -350,9 +353,12 @@ public final class SharedCameraCaptureActivity extends Activity
         controls.setPadding(10, 10, 10, 14);
         captureButton = makeButton("Capture");
         captureButton.setOnClickListener(v -> requestCapture());
+        Button noteButton = makeButton("Note");
+        noteButton.setOnClickListener(v -> editFieldComment());
         Button finishButton = makeButton("Finish Sphere");
         finishButton.setOnClickListener(v -> finishCapture());
         controls.addView(captureButton);
+        controls.addView(noteButton);
         controls.addView(finishButton);
         root.addView(controls, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -379,6 +385,47 @@ public final class SharedCameraCaptureActivity extends Activity
         params.setMargins(6, 0, 6, 0);
         button.setLayoutParams(params);
         return button;
+    }
+
+    private void editFieldComment() {
+        ensureSession(false);
+        CaptureSessionRecord session = library.findCaptureSession(sessionId);
+        if (session != null) {
+            fieldComment = session.fieldComment;
+        }
+        EditText input = new EditText(this);
+        input.setMinLines(3);
+        input.setMaxLines(8);
+        input.setGravity(Gravity.TOP | Gravity.START);
+        input.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        input.setText(fieldComment);
+        input.setSelection(input.getText().length());
+        input.setHint("Scene, device position, issue observed, screenshot names...");
+        int padding = (int) (16 * getResources().getDisplayMetrics().density);
+        input.setPadding(padding, padding, padding, padding);
+        new AlertDialog.Builder(this)
+                .setTitle("Capture field note")
+                .setView(input)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", (dialog, which) -> saveFieldComment(""))
+                .setPositiveButton("Save", (dialog, which) -> saveFieldComment(input.getText().toString()))
+                .show();
+    }
+
+    private void saveFieldComment(String comment) {
+        fieldComment = comment == null ? "" : comment.trim();
+        try {
+            library.updateCaptureSessionFieldComment(sessionId, fieldComment);
+            requestAutomaticDebugCsvDump();
+            Toast.makeText(
+                    this,
+                    fieldComment.isEmpty() ? "Capture note cleared" : "Capture note saved",
+                    Toast.LENGTH_SHORT).show();
+        } catch (IOException e) {
+            Toast.makeText(this, "Could not save capture note: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private void startCameraThread() {
