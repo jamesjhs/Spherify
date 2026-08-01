@@ -62,6 +62,167 @@ Szeliski, R. (2006) 'Image alignment and stitching: a tutorial', Foundations and
 
 Szeliski, R. and Shum, H.-Y. (1997) 'Creating full view panoramic image mosaics and environment maps', Proceedings of SIGGRAPH 1997, pp. 251-258.
 
+---
+
+## Literature Review, App Method Analysis, and Suggested Improvements
+
+This section formally reviews the academic and industry literature cited by the project, analyses the methods currently implemented in Spherify 0.4.2, and proposes concrete improvements for output accuracy and user-friendliness.
+
+### Reviewed Academic and Industry Literature
+
+#### Szeliski (2006) — Image Alignment and Stitching: A Tutorial
+
+Szeliski's survey establishes the canonical multi-stage pipeline for panoramic creation: feature detection, description, and matching; motion model estimation; image warping; compositing; and blending. The tutorial is explicit that parallax, exposure differences, and registration failure produce the ghosts, blur, and seams that viewers notice most. For full spherical panoramas, it identifies the pure-rotation camera model as the correct geometric assumption, and notes that any translation of the optical centre between frames creates parallax that no single warp can fully correct. The survey also covers how robust estimators such as RANSAC are needed to handle mismatched or incorrect feature correspondences before any global optimisation is attempted. The practical implication for Spherify is that the capture UI must physically constrain the user to rotate around one point, not walk between shots, and that the solver must treat inlier features — not all matched points — as evidence.
+
+#### Brown and Lowe (2007) — Automatic Panoramic Image Stitching Using Invariant Features
+
+This work frames panorama stitching as a graph problem rather than a sequential alignment problem. Each image is a node; reliable pairwise overlaps are edges. Local invariant features (SIFT in the original paper) are detected, matched across all candidate pairs, and verified with RANSAC before contributing to the graph. Global bundle adjustment then simultaneously minimises reprojection error across all nodes and edges rather than chaining pairwise transforms. The paper also describes gain compensation for photometric normalisation and multiband blending for the final composite. The critical insight is that loop closure — where the last image of a sweep overlaps the first — is handled naturally by bundle adjustment and is essential for preventing visible seams in full-circle panoramas. This paper is the direct intellectual ancestor of OpenCV's detail stitcher and of Spherify's capture-graph architecture.
+
+#### Szeliski and Shum (1997) — Creating Full View Panoramic Image Mosaics and Environment Maps
+
+This is the first major treatment of full spherical mosaics from hand-held sequences. It addresses the specific problem of assembling 360 × 180 images from a phone-like camera that rotates but inevitably translates slightly. The paper demonstrates that a pure-rotation mosaic can tolerate small hand motion when overlap is generous, feature registration is robust, and the solver distributes residual error globally. It also establishes that spherical projection — mapping each source image onto a virtual sphere from its estimated rotation and focal length — is the geometrically correct representation for full-view panoramas, as opposed to cylindrical or flat projections that break down near the poles.
+
+#### Burt and Adelson (1983) — A Multiresolution Spline with Application to Image Mosaics
+
+This paper introduced the Laplacian pyramid blending technique that underlies every modern panoramic compositing system, including OpenCV's `detail::MultiBandBlender`. The key insight is that blending should be frequency-separated: low-frequency (colour and brightness) content should be blended over a wide spatial gradient to smooth exposure discontinuities, while high-frequency (edge and texture) content should be blended over a very narrow margin to preserve sharpness. Merging these frequency layers after independent blending produces a visually seamless result even when adjacent frames differ in brightness. Without multiband blending, even geometrically perfect stitches show visible seam lines wherever exposure varied between frames.
+
+#### Boykov, Veksler and Zabih (2001) and Boykov and Kolmogorov (2004) — Graph Cuts for Energy Minimisation in Vision
+
+These two papers established graph-cut optimisation as the standard tool for seam selection in panoramic compositing. The core idea is to model the overlapping region between two frames as a graph whose nodes are pixels and whose edge weights encode the cost of placing the seam boundary at that pixel. A minimum-cut through this graph finds the seam that minimises a global cost function — typically designed to favour blank, featureless regions and penalise cuts through strong edges, faces, moving objects, or exposure discontinuities. OpenCV's `detail::GraphCutSeamFinder` and `detail::DpSeamFinder` implement variants of this idea. The practical benefit is that the seam is hidden in visual noise rather than placed arbitrarily at the image boundary, greatly reducing visible stitching artefacts even when parallax prevents a geometrically perfect overlap.
+
+#### Google Developers — ARCore SharedCamera and Camera API
+
+ARCore's `SharedCamera` API (Google Developers, 2026a; Google Developers, 2026b) allows an app to share camera control with ARCore's visual-inertial odometry (VIO) engine while obtaining `ImageReader` surfaces and Camera2 metadata from the same capture session. ARCore's VIO integrates high-frequency gyroscope data with accelerometer gravity and continuous visual feature tracking to produce stable, drift-corrected camera pose estimates that are far more reliable for spherical capture than magnetometer-only compass heading. `Camera.getPose()` provides the physical camera pose at the centre of exposure of the centre image row; `Camera.getImageIntrinsics()` provides focal length and principal point for the CPU image stream. These are the prior inputs that Spherify uses to initialise the capture-graph lattice and to compute predicted homographies for overlap validation.
+
+#### Android Developers — Camera2 TotalCaptureResult
+
+`TotalCaptureResult` (Android Developers, 2026b) is the per-frame metadata record from the Camera2 pipeline. It supplies sensor exposure time, sensitivity (ISO), lens focal length, focus distance, aperture, optical image stabilisation state, AE/AWB/AF state and mode, and all pipeline processing parameters. Pairing each captured JPEG with its `TotalCaptureResult` by sensor timestamp gives the app a complete photometric and optic record for each source frame. This is essential for reliable exposure compensation: gain and offset differences between frames can be computed from their Camera2 records rather than estimated solely from overlapping pixel values, which reduces the solver's dependency on visual photometric cues in difficult scenes.
+
+#### Google Developers — Photo Sphere XMP Metadata
+
+The GPano namespace (Google Developers, 2026c) defines the XMP metadata that tells viewers how to interpret a JPEG as a spherical panorama. Required fields for a full-sphere equirectangular image include `GPano:ProjectionType`, `GPano:FullPanoWidthPixels`, `GPano:FullPanoHeightPixels`, `GPano:CroppedAreaImageWidthPixels`, `GPano:CroppedAreaImageHeightPixels`, `GPano:CroppedAreaLeftPixels`, `GPano:CroppedAreaTopPixels`, `GPano:PoseHeadingDegrees`, and `GPano:UsePanoramaViewer`. Without these tags, common viewers including Google Photos and Maps will display the image as a flat JPEG. The metadata is therefore not decorative; it is a machine-readable certification that the pixel content and geometry match the claimed projection type and coverage.
+
+#### OpenCV Stitching and Detail Module
+
+OpenCV's stitching pipeline (OpenCV, 2026a) separates the building blocks that Brown and Lowe describe: feature finding and matching, pairwise camera estimation, bundle adjustment, wave correction, warping, exposure compensation, seam finding, and blending. The `detail::SphericalWarper` (OpenCV, 2026b) maps source images onto a sphere from camera intrinsics and rotation matrices, and the `detail::RotationWarper` interface (OpenCV, 2026c) builds projection maps from source size, camera matrix, and rotation. Using these modules rather than a custom renderer means Spherify inherits decades of optimisation, correctness, and community testing rather than inventing fragile substitutes.
+
+---
+
+### App Method Analysis
+
+#### Capture Architecture: ARCore SharedCamera with Camera2
+
+Spherify's production capture path routes through ARCore `SharedCamera` combined with Camera2. This architecture provides the full set of inputs the stitcher requires: VIO-tracked camera pose and tracking state from ARCore, calibrated CPU image intrinsics from `Camera.getImageIntrinsics()`, and timestamp-matched photometric metadata from `TotalCaptureResult`. The capture-ready packet model — where a frame is only accepted when its image bytes and Camera2 metadata can be paired by `SENSOR_TIMESTAMP` — ensures every accepted source frame has a complete and trustworthy provenance record. The CameraX-only code path is isolated to debug builds because it cannot provide the ARCore pose, tracking state, or feature-confidence signals required for graph-backed production capture.
+
+#### Guided Capture UI: Spherical Target Lattice
+
+The capture UI generates an adaptive spherical target lattice from the device camera's field of view, a desired frame-to-frame overlap, and the user's first accepted anchor frame. Users align a live reticle with target dots arranged on a virtual sphere around them. This directly implements the "UI as measurement instrument" principle identified in the literature: the user does not interact with yaw, pitch, intrinsics, or overlap percentages. They interact with one visible target at a time. The lattice adapts for polar rings (fewer targets needed near zenith because circumference is smaller), and the frontier of nearest valid targets remains reachable from the current camera direction. Auto-capture fires only when angular distance to the target, angular velocity, ARCore tracking quality, focus/exposure stability, and timestamp readiness all pass defined thresholds.
+
+#### Candidate Quality Scoring
+
+Each candidate frame is scored before being offered for overlap validation. The `CandidateQualityScorer` checks for motion blur using a Laplacian-variance sharpness measure on a downsampled version of the captured JPEG, exposure clipping (over- and under-exposed pixel fraction), low-light noise, and low-texture content. Frames failing any threshold receive a plain user-facing rejection reason (`Blurred`, `Too dark`, `Moved too fast`, `Weak overlap`) and the corresponding target is reopened. This early gate prevents low-quality frames from entering the capture graph, consistent with the literature's emphasis on source quality as a precondition for registration.
+
+#### Overlap Validation: OpenCV ORB and RANSAC
+
+The `OpenCvOverlapValidator` detects ORB features in both the candidate and each predicted-overlap neighbour, matches them with Hamming distance nearest-neighbour search, and validates with RANSAC homography estimation. A frame is accepted only when it produces enough inlier control points with acceptable reprojection residuals, or when a documented exception applies (for example, a pole frame with alternate angular support). The validator also implements a pose-normalised matching path: ARCore quaternions are used to compute a pure-rotation predicted homography, the candidate is warped into the neighbour's approximate viewing direction, and ORB/RANSAC is run on pose-normalised images. This corrects the false-rejection failure mode where tilted frames near the zenith or nadir appeared to have weak overlap when tested in flat image coordinates but had valid overlap in spherical projection.
+
+#### Capture Graph Persistence
+
+Accepted frames become nodes in a persistent capture graph stored in `capture-sessions.json`. Each node stores raw facts separately from analysis facts, so later solvers can consume the same provenance data with different algorithms without altering the original measurement record. Validated overlaps become graph edges with inlier count, residual score, confidence, sampled control points, and a parallax-risk hint. After each ring or major region, a graph health check verifies connectivity, loop closure, and cross-row linkage. The entire graph is consumed by the native stitcher; there is no intermediate "draft folder of JPEGs" pathway that can produce a sphere without graph validation.
+
+#### Native OpenCV Detail Stitcher
+
+The C++ native stitcher (`spherify_stitcher.cpp`) uses the OpenCV detail module: ORB feature extraction across all source frames, `BestOf2NearestMatcher` robust pairwise matching, homography-based camera estimation, ray bundle adjustment with wave correction, spherical warping from optimised camera/lens parameters, block-gain exposure compensation, graph-cut seam finding, and multiband blending. This implements the Brown and Lowe pipeline directly. The native dependency is optional at build time; the Java path fails closed when OpenCV stitching symbols are unavailable, preventing production export from unvalidated captures.
+
+#### GPano XMP and Export Certification
+
+`Phase5Stitcher` writes GPano XMP metadata into the output JPEG after stitching. A readback validator then reopens the saved file and verifies the required tags to confirm the write was complete and parseable. Partial captures write honest cropped-area metadata rather than claiming full-sphere coverage. The library assigns output states (`Local master`, `Needs review`, `Map-ready candidate`) based on measured coverage, residuals, pole support, wrap-seam integrity, and metadata readback result.
+
+#### GPU-Backed Viewer and Tiny Planet
+
+`GLProjectionView` renders both the PhotoSphere (equirectangular projection onto a sphere interior) and the Tiny Planet (stereographic projection) using OpenGL ES shaders. This offloads projection rendering to the GPU, leaving the CPU free for capture and analysis. Adjustment controls (field of view, camera distance, horizon, roll, pitch) operate on the GPU shader parameters without modifying the master image.
+
+---
+
+### Suggested Improvements
+
+#### Output Accuracy
+
+**1. Set `COMPOSE_MEGAPIX` to a safe non-negative value.**
+`spherify_stitcher.cpp` currently sets `COMPOSE_MEGAPIX = -1.0`, which disables output downscaling during compositing. With 30–34 frames from a modern 12–50 MP camera, the multiband blender's Laplacian pyramid can consume several hundred megabytes of native heap. Setting `COMPOSE_MEGAPIX` to `4.0`–`8.0` (four to eight megapixels per frame for compositing scale) keeps the final equirectangular output well above the 3840 × 1920 minimum while preventing out-of-memory crashes during the compositing step. This is the highest-impact single constant change for stability on mid-range devices.
+
+**2. Add AKAZE as a high-quality feature detector option.**
+ORB uses binary descriptors and Hamming matching, which is fast but less discriminative than gradient-based descriptors for low-texture, repetitive-pattern, or high-distortion scenes. Adding AKAZE — which uses M-LDB binary descriptors with better scale and rotation invariance — as a switchable high-quality mode would improve feature matching quality for difficult indoor and outdoor scenes without the licensing cost of SIFT. OpenCV ships AKAZE in the same module as ORB; the switch can be a build-time or session-level quality flag.
+
+**3. Correct radial distortion before feature matching.**
+Wide-angle phone lenses introduce measurable barrel distortion. Correcting this using the device's camera calibration matrix (available from ARCore intrinsics and Camera2 lens intrinsic calibration where present) before running feature detection would reduce the systematic misalignment that distorted lenses introduce along frame edges. OpenCV's `undistort` or `remap` functions apply the Brown–Conrady distortion model from a calibration matrix. Even approximate distortion correction improves bundle adjustment convergence and reduces residuals at frame boundaries.
+
+**4. Decode the candidate JPEG once per analysis, not once per neighbour.**
+`OpenCvOverlapValidator.match()` calls `decodeSample(candidateFile)` for every predicted-overlap neighbour, decoding the same JPEG multiple times. Decoding once per analysis pass and passing the resulting grayscale `Mat` into each per-neighbour call would eliminate the redundant JPEG decompression, reducing per-capture latency by a factor proportional to the number of predicted neighbours (typically four to six).
+
+**5. Cache the `ORB` instance across match calls.**
+`OpenCvOverlapValidator.matchGray()` calls `ORB.create(ORB_FEATURES)` inside the inner matching loop. ORB construction allocates native state each time. Since the validator runs on a single-threaded executor, a cached `ORB` instance stored as a field is safe and would eliminate the repeated native allocation.
+
+**6. Use a streaming XMP write and first-segment-only readback.**
+`Phase5Stitcher.PhotoSphereXmp.readAll()` loads the entire output JPEG into a single `byte[]` to prepend the XMP APP1 segment. For a 3840 × 1920 JPEG this is a 10–30 MB heap allocation, done twice (once for write, once for verification). Using a streaming approach — copy bytes up to the SOF marker with a fixed buffer, inject APP1, stream the rest — eliminates the full-file copy. The XMP verification pass only needs the first 64 KB of the file, since APP1 always appears near the start of a JPEG.
+
+**7. Strengthen loop-closure verification at the end of each horizontal ring.**
+After the user completes a 360-degree horizontal sweep, the capture validator should explicitly check that the last accepted frame overlaps the first accepted frame of the same ring. This graph-edge closure check, already described in the roadmap, prevents the accumulation of small yaw errors that would otherwise appear as a discontinuity where the sphere joins. If loop closure fails, the UI should ask for recapture of one or two frames at the join region while the user is still physically in position.
+
+**8. Apply `inSampleSize` in `makeThumbnail()`.**
+`SpherifyLibrary.makeThumbnail()` calls `BitmapFactory.decodeFile()` with no `BitmapOptions`, loading the full-resolution JPEG into memory before scaling it down. For a 3840 × 1920 master, this allocates approximately 29.5 MB for the thumbnail decode alone and risks `OutOfMemoryError` on devices with limited native bitmap headroom. The same two-pass `inJustDecodeBounds` + `inSampleSize` approach already used in `CandidateQualityScorer.decodeSample()` and `CapturedReferenceFrame.decodeReferenceBitmap()` should be applied here.
+
+---
+
+#### User-Friendliness
+
+**1. Add content descriptions to all interactive elements.**
+No `setContentDescription()` call exists anywhere in the codebase. All icon-only buttons, custom views (`TargetGuideView`, `CalibrationProgressView`, `CompassNeedleView`), and interactive overlays are invisible to Android Accessibility Services (TalkBack, Switch Access, Voice Access). This is a Play Store policy requirement for apps targeting API 36 and is enforced during new-app review. Adding static descriptions to buttons and implementing `onInitializeAccessibilityNodeInfo()` on state-bearing custom views with dynamically generated descriptions (for example, current tilt angle, calibration progress, number of captured dots) would make the capture flow usable for screen-reader users without changing the visual design.
+
+**2. Throttle `refreshUi()` to state changes only.**
+`SharedCameraCaptureActivity.onDrawFrame()` calls `runOnUiThread(this::refreshUi)` at every GL frame (30 fps). `refreshUi()` in turn runs target sorting, accepted-frame counting, overlay invalidation, and text updates on the UI thread on every call. This creates significant UI thread pressure and contributes to jank during the capture window. Changing the pattern so that `refreshUi()` is only posted when the capture state actually changes — new frame accepted, new target selected, coverage map updated, recapture triggered — would maintain responsive feedback while eliminating the majority of unnecessary UI thread work.
+
+**3. Replace ad-hoc capture threads with a single-threaded `ExecutorService`.**
+Each capture tap currently calls `new Thread(() -> { ... }).start()` with no lifecycle management. Rapid taps can produce multiple concurrent threads all calling `SpherifyLibrary.save()`, which is not synchronised. Using a `Executors.newSingleThreadExecutor()` field submitted as tasks, and calling `captureExecutor.shutdownNow()` in `onDestroy()`, would serialise captures, prevent concurrent write races, and ensure clean teardown when the user backs out of the capture screen.
+
+**4. Eliminate the YUV→NV21 per-pixel loop.**
+The `yuv420ToNv21()` method in `SharedCameraCaptureActivity` assembles the chroma plane using `ByteBuffer.get(int)` random-access inside a nested loop — on the order of 38,000–260,000 individual single-byte reads per frame depending on resolution. Replacing this with bulk `ByteBuffer.get(byte[], offset, length)` row copies, or configuring the `ImageReader` with `ImageFormat.JPEG` directly from Camera2 to eliminate the entire YUV-NV21-JPEG conversion chain, would meaningfully reduce per-capture latency.
+
+**5. Move `GLProjectionView.setPanorama()` pixel copy to a background thread.**
+`setPanorama()` currently calls `bitmap.getPixels()` to populate a flat `int[]` that is only used by the CPU export path. For a 3840 × 1920 PhotoSphere this copies 29.5 million integers (approximately 118 MB) on whatever thread calls `setPanorama()`, which is the UI thread during normal gallery navigation. Deferring this copy to the moment an export is actually requested, on a background thread, would eliminate the visible stall when navigating between library items.
+
+**6. Use plain-language status messages throughout capture.**
+The capture screen should expose only short, human-readable states: `Move to dot`, `Hold steady`, `Got it`, `Blurred — try again`, `Too dark`, `Moved too fast`, `Weak overlap — recapture`, `Ring complete`, and `Sphere complete`. Any developer-readable diagnostic text (RANSAC inlier count, residual score, ARCore tracking state enum, Camera2 AE state) should be confined to debug builds and the diagnostic overlay. Research on the original Google Photo Sphere consistently attributes its usability to hiding geometric complexity entirely from the end user.
+
+**7. Introduce a friendly readiness and setup flow before first capture.**
+The first capture attempt currently requires the user to understand ARCore, sensor calibration, and exposure lock before any guidance is visible. A short, skippable setup splash sequence — welcome, camera permission, motion-sensor readiness check with compass calibration offer, optional location, local library confirmation — would reduce first-run abandonment and surface the app's capabilities clearly before the user presses the shutter. Each screen should have one clear action and a skip path; every declined or denied item must degrade gracefully without blocking local creation.
+
+**8. Improve coverage mini-map visual hierarchy.**
+The compact spherical coverage map should distinguish visually among: accepted targets (solid, high-contrast fill), current target (animated highlight), weak or needs-recapture targets (distinct colour or hatching), remaining required targets (subtle outline), and optional or already-skipped targets (dimmed or hidden). A small numeric readout of accepted frames versus total required (for example, `18 / 34`) alongside the mini-map would give users a concrete progress indicator without requiring them to interpret the coverage geometry directly.
+
+---
+
+### Improvement Summary Table
+
+| Priority | Area | Change | Expected benefit |
+|---|---|---|---|
+| 🔴 Critical | Accuracy | Set `COMPOSE_MEGAPIX` to 4.0–8.0 | Prevents OOM crash during compositing on mid-range devices |
+| 🔴 Critical | Accuracy | Apply `inSampleSize` in `makeThumbnail()` | Prevents OOM during thumbnail generation for large masters |
+| 🔴 Critical | UX | Add content descriptions to all interactive elements | Accessibility compliance; Play Store API 36 requirement |
+| 🟠 High | Accuracy | Decode candidate JPEG once per analysis, not per neighbour | Reduces per-capture latency by 4–6× for the validation step |
+| 🟠 High | Accuracy | Cache `ORB` instance across match calls | Eliminates repeated native allocation in the inner matching loop |
+| 🟠 High | UX | Throttle `refreshUi()` to state changes | Eliminates 30 fps UI thread hammer; reduces capture jank |
+| 🟠 High | UX | Replace ad-hoc capture threads with `ExecutorService` | Prevents concurrent write races; enables clean lifecycle shutdown |
+| 🟠 High | UX | Replace YUV per-pixel loop with bulk reads or JPEG ImageReader | Reduces capture latency from YUV conversion |
+| 🟡 Medium | Accuracy | Add AKAZE as a high-quality feature detector option | Improves matching on low-texture, high-distortion scenes |
+| 🟡 Medium | Accuracy | Correct radial distortion before feature matching | Reduces systematic boundary misalignment from wide-angle lenses |
+| 🟡 Medium | Accuracy | Explicit loop-closure check after each horizontal ring | Catches yaw accumulation errors while user is still on-site |
+| 🟡 Medium | Accuracy | Streaming XMP write and first-segment-only readback | Removes two full-JPEG heap allocations during export |
+| 🟡 Medium | UX | Defer `setPanorama()` pixel copy to export time | Eliminates UI thread stall during gallery navigation |
+| 🟡 Medium | UX | Plain-language status messages throughout capture | Makes the capture screen understandable for non-technical users |
+| 🟢 Low | UX | Friendly readiness and setup splash before first capture | Reduces first-run confusion and permission-related abandonment |
+| 🟢 Low | UX | Improved coverage mini-map visual hierarchy | Gives users concrete progress feedback without geometric interpretation |
+
 ## Developer Build and Run Runbook
 
 This section is intentionally basic and explicit. It describes how to build, install, and run the current Android project from VS Code and terminal commands.
