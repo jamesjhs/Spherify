@@ -2306,6 +2306,347 @@ Exit criteria:
 - Google integrations enhance the product but do not define whether it works.
 - The app has a feedback loop for capture quality, device support, and publishing success.
 
+## Performance Review
+
+This section records a repo-wide performance analysis of the Android codebase, covering camera capture, image processing, stitching, bitmap and memory handling, file I/O, threading, and the C++ native component. All file and line references are accurate against the 0.4.2 codebase at the time of writing.
+
+### Executive Summary
+
+The codebase shows clear awareness of off-thread execution for expensive work, but there are a cluster of high-impact bottlenecks concentrated in four areas: (1) per-frame UI-thread pressure during live capture, (2) redundant full-file disk I/O on every captured frame, (3) expensive per-capture allocations that compound over a 30–34 frame session, and (4) memory pressure during stitching and projection export. The C++ native pipeline is well-structured but contains one silent cost multiplier. Details follow.
+
+---
+
+### 1. Live Capture – UI Thread Pressure (HIGH RISK – Jank / ANR)
+
+#### 1a. `refreshUi()` called on every GL draw frame
+
+**File:** `SharedCameraCaptureActivity.java`, line 1308
+
+```java
+runOnUiThread(this::refreshUi);
+```
+
+`onDrawFrame()` is called at 30 fps by the GL thread. `refreshUi()` posts a Runnable to the UI thread every single frame even when nothing meaningful has changed. Inside `refreshUi()` the code calls `updateActiveTarget()` (which sorts frontier targets), `captureBlocker()`, `acceptedTargetCount()` (linear scan), `overlayView.setState()` (which calls `invalidate()`), and updates text. This causes a cascade: every `invalidate()` schedules a full `onDraw()` of `TargetOverlayView`, which itself does `drawCapturedReferenceFrames()` (sorting + mesh projection for up to 3 bitmaps), `drawHorizon()`, and all target geometry. At 30 fps this is 30 UI-thread posts + 30 `View#invalidate()` calls per second, all contending with user touch events.
+
+**Suggested fix:** Gate the `runOnUiThread` call behind a change detector — only post when `latestFrameState` fields actually changed (tracking state, yaw/pitch delta above threshold, target index change). A simple dirty-flag set on the GL thread before each post eliminates the vast majority of redundant passes.
+
+---
+
+#### 1b. `TargetOverlayView.setState()` copies two `ArrayList`s on every frame
+
+**File:** `SharedCameraCaptureActivity.java`, lines 2035–2037
+
+```java
+this.selectableIndices = new ArrayList<>(selectableIndices);
+this.referenceFrames = ... new ArrayList<>(referenceFrames);
+```
+
+Called at 30 fps. The `capturedReferenceFrames` list can hold up to 96 entries (`MAX_RETAINED_REFERENCE_OVERLAYS`). A defensive copy of 96 object references is allocated 30 times per second. These allocations drive GC pressure.
+
+**Suggested fix:** Use a double-buffered immutable snapshot or a `volatile` reference to an immutable list, or commit to a single-threaded model and skip the copy entirely.
+
+---
+
+#### 1c. `runOnUiThread` called during `updateTextureHint()` on the camera thread
+
+**File:** `SharedCameraCaptureActivity.java`, lines 674–681
+
+`updateTextureHint()` is throttled to once per 650 ms (`TEXTURE_HINT_INTERVAL_MS`), but it then calls `runOnUiThread(() -> { overlayView.setTextureHint(hint); if (...) refreshUi(); })`. The inner `refreshUi()` call doubles the UI-thread load at the throttle boundary.
+
+---
+
+### 2. Per-Frame File I/O – Synchronous Full Rewrites (HIGH RISK – ANR, slow capture)
+
+#### 2a. `capture-sessions.json` is fully re-read and fully rewritten on every accepted frame
+
+**File:** `SpherifyLibrary.java`, `recordAnalyzedCandidateFrame()`, lines 1483–1547
+
+```java
+ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+// ... mutate
+writeCaptureSessions(sessions);
+```
+
+`readCaptureSessions()` opens the file, reads all bytes into a `byte[]`, parses the entire JSON structure, and deserialises every `CaptureFrameRecord`. `writeCaptureSessions()` serialises every record back to pretty-printed JSON (`toString(2)`) and writes the whole file. After 34 accepted frames, each session record contains 34 × 3 = 102 frame objects (CANDIDATE + SOURCE + ACCEPTED for each). The file read/write grows proportionally with session size. This runs on `captureExecutor` (background), but file I/O on internal storage still blocks the executor thread and can take 50–200 ms on mid-range devices.
+
+**Suggested fix:** Keep the current session object in memory between captures rather than re-reading from disk. Only persist asynchronously at the end of the capture session or when explicitly requested, for example on pause.
+
+---
+
+#### 2b. `drafts.json` is also fully re-read and rewritten per accepted frame
+
+**File:** `SpherifyLibrary.java`, `appendDraftMetadata()` (line 1718) and `recordDraftFrame()` (line 1320)
+
+Both call `readDraftMetadataOrThrow()` + `writeDraftMetadata()`. The JSON structure includes the full `exposure` blob (30+ fields per frame including 4×4 projection and view matrices serialised as `JSONArray`). After 34 accepted frames this is roughly 34 × 2 KB = ~68 KB of JSON per read-write cycle.
+
+**Suggested fix:** Buffer appends in memory and flush only on pause or finish, or switch to an append-only format such as newline-delimited JSON.
+
+---
+
+#### 2c. `ensureSession()` triggers `readCaptureSessions()` indirectly on each capture
+
+**File:** `SharedCameraCaptureActivity.java`, `ensureSession()` at lines 895–917
+
+`ensureSession` is called from `handleAnalysis()` on every accepted frame, and also from `finishCapture()` and `editFieldComment()`. Inside it calls `library.ensureCaptureSession()` → `readCaptureSessions()`. While not a per-frame hot path in isolation, the disk hit from `readCaptureSessions()` inside `updateCaptureSessionReadiness()` (line 402) compounds the I/O pressure.
+
+---
+
+### 3. Per-Capture Allocations (MEDIUM RISK – GC pressure, added latency)
+
+#### 3a. `CandidateQualityScorer`: allocates full-pixel array on every capture
+
+**File:** `CandidateQualityScorer.java`, lines 20–23
+
+```java
+int[] pixels = new int[width * height];
+bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
+```
+
+The scorer decodes a downsampled bitmap (max 640 px on a side) via `inSampleSize`, giving roughly 640 × 480 = 307,200 pixels. The `int[]` is 1.2 MB. Allocation plus `getPixels()` copy into this array happens synchronously on the executor thread every time the shutter button is pressed. The bitmap's config is `ARGB_8888`, so the bitmap itself is another 1.2 MB. The analysis then iterates every interior pixel performing `Math.sqrt()` (line 43) inside the inner loop.
+
+**Suggested fix:** (a) Use `Bitmap.Config.RGB_565` to halve the per-pixel size. (b) Replace `Math.sqrt(gx*gx + gy*gy)` with `Math.abs(gx) + Math.abs(gy)` (L1 norm), which is fast and correlates well with gradient magnitude. (c) Subsample every other row and column (step = 2) to cut loop iterations by 4×.
+
+---
+
+#### 3b. `OpenCvOverlapValidator.matchGray()`: creates a new `ORB` detector per call
+
+**File:** `OpenCvOverlapValidator.java`, line 364
+
+```java
+ORB orb = ORB.create(ORB_FEATURES);
+```
+
+Called inside `matchGray()`, which is called at minimum twice per candidate (once for full-frame, once for band), and up to roughly 12 times when there are 6 neighbours × 2 match strategies. ORB construction allocates native OpenCV state each time.
+
+**Suggested fix:** Cache the `ORB` instance as a field on `OpenCvOverlapValidator`. It is safe within a single thread because the validator runs on `captureExecutor`, which is single-threaded.
+
+---
+
+#### 3c. `OpenCvOverlapValidator.match()`: decodes the candidate JPEG once per neighbour
+
+**File:** `OpenCvOverlapValidator.java`, lines 201–252
+
+The candidate bitmap is decoded fresh inside `match()` for every neighbour (`decodeSample(candidateFile)` at line 201). With up to 6 neighbours, this means 6 JPEG decode + BitmapFactory + `Utils.bitmapToMat` + `cvtColor` cycles for the same candidate file.
+
+**Suggested fix:** Decode the candidate once in `analyze()`, convert it to a grayscale `Mat`, and pass it into each `match()` call.
+
+---
+
+#### 3d. Exposure JSON serialised to `String` then immediately re-parsed
+
+**File:** `SharedCameraCaptureActivity.java`, line 727
+
+The exposure `JSONObject` is serialised to a `String` via `exposure.toString()` to pass to `validateAndRecord()`, which immediately deserialises it back with `parseExposureJson()` in `SpherifyLibrary`. The object contains 30+ fields including two 4×4 matrices serialised as `JSONArray` values (lines 856–857). The round-trip serialisation and deserialisation is unnecessary.
+
+**Suggested fix:** Pass the `JSONObject` directly instead of converting to `String` and re-parsing.
+
+---
+
+### 4. YUV→JPEG Conversion – Inefficient Pixel Loop (HIGH RISK – Capture Latency)
+
+**File:** `SharedCameraCaptureActivity.java`, `yuv420ToNv21()`, lines 1371–1390
+
+```java
+for (int row = 0; row < height / 2; row++) {
+    for (int col = 0; col < width / 2; col++) {
+        int source = row * rowStride + col * pixelStride;
+        output[chromaOffset++] = v.get(source);
+        output[chromaOffset++] = u.get(source);
+    }
+}
+```
+
+The chroma plane is assembled via `ByteBuffer.get(int)` random-access inside a nested loop: height/2 × width/2 = roughly 240 × 160 = 38,400 individual calls for a 1280 × 960 frame, and 259,200 calls for a 1920 × 1080 frame. The Y-plane loop in `copyPlane()` (line 1392) performs a similar per-pixel `ByteBuffer.get()` call for every luma sample.
+
+**Suggested fix:** (a) Use `ByteBuffer.get(byte[], offset, length)` for bulk row copies when `pixelStride == 1`. (b) For chroma planes, call `buffer.position(source)` once per row and use `buffer.get(byte[])` for bulk reads. (c) Best option: configure the `ImageReader` with `ImageFormat.JPEG` directly from Camera2, eliminating the YUV→NV21→JPEG path entirely.
+
+---
+
+### 5. Reference Frame Bitmap Accumulation (MEDIUM RISK – Memory Pressure)
+
+**File:** `SharedCameraCaptureActivity.java`, lines 790–801
+
+```java
+capturedReferenceFrames.add(reference);
+while (capturedReferenceFrames.size() > MAX_RETAINED_REFERENCE_OVERLAYS) {
+    CapturedReferenceFrame removed = capturedReferenceFrames.remove(0);
+    removed.recycle();
+}
+```
+
+`MAX_RETAINED_REFERENCE_OVERLAYS = 96`. Each `CapturedReferenceFrame` holds a decoded `Bitmap` at up to `MAX_REFERENCE_SIZE = 360` pixels wide in `RGB_565`, roughly 360 × 270 × 2 = ~195 KB. With 96 bitmaps retained, this is ~18 MB of decoded bitmaps in the heap simultaneously. On devices with 2–3 GB of RAM running ARCore and Camera2, this is significant memory pressure alongside the frame buffers.
+
+`decodeReferenceBitmap()` uses `Bitmap.Config.RGB_565` (good), but `transformReferencePreview` creates a new bitmap and immediately recycles the original, forcing a `Bitmap.createBitmap()` allocation for every accepted capture (line 1822).
+
+**Suggested fix:** Reduce `MAX_RETAINED_REFERENCE_OVERLAYS` to 32–48. Consider storing only the raw bitmap and the rotation angle rather than the already-transformed bitmap, and applying the rotation lazily in `drawCapturedReferenceFrames()`.
+
+---
+
+### 6. `GLProjectionView.setPanorama()` – Full Pixel Copy on Calling Thread (HIGH RISK – ANR during gallery load)
+
+**File:** `GLProjectionView.java`, lines 165–166
+
+```java
+panoramaPixels = new int[panoramaWidth * panoramaHeight];
+panorama.getPixels(panoramaPixels, 0, panoramaWidth, 0, 0, panoramaWidth, panoramaHeight);
+```
+
+A PhotoSphere from the native stitcher is 3840 × 1920 or larger. `getPixels()` for a 3840 × 1920 image copies 29.5 million integers, approximately 118 MB of pixel data. This runs on whichever thread calls `setPanorama()`. In `MainActivity`, bitmap loading and `setPanorama()` are called synchronously, making this an ANR risk for large panoramas.
+
+**Suggested fix:** The CPU pixel array (`panoramaPixels`) is only needed by `exportProjection()`. Defer the `getPixels()` copy to the moment an export is actually requested, not at load time.
+
+---
+
+### 7. CPU Export Renderer – Expensive Per-Pixel Math (MEDIUM RISK – Very Slow Export)
+
+**File:** `GLProjectionView.java`, `renderProjectionOnCpu()`, lines 586–616; `sampleSphere()`, lines 626–650
+
+The CPU renderer is called with `EXPORT_SIZE = 1600` pixels square = 2.56 million pixels. For each pixel, `sampleSphere()` performs seven or more `Math.sin`, `Math.cos`, `Math.sqrt`, and related trig calls. `getEffectiveRoll()` recomputes `Math.cos(rollRad)` and `Math.sin(rollRad)` (lines 627–628) on every pixel rather than hoisting these values outside the loop. This is 2.56 million × ~2 extra trig calls, a significant throughput penalty.
+
+**Suggested fix:** Hoist `cosRoll`, `sinRoll`, `fov`, and `spread` out of `sampleSphere()` and pass them as parameters, matching the pattern already used in `sampleTinyPlanet()`. Consider delegating export to the GPU via `glReadPixels` or an EGL Pbuffer to match the live GPU renderer output exactly and at GPU speed.
+
+---
+
+### 8. `makeThumbnail()` – Decodes Full-Resolution Image Without Subsampling (HIGH RISK – OOM for large masters)
+
+**File:** `SpherifyLibrary.java`, lines 2309–2310
+
+```java
+private File makeThumbnail(File imageFile, String id) throws IOException {
+    Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath());
+```
+
+No `inSampleSize` is set. For a stitched PhotoSphere JPEG (3840 × 1920 or larger), this allocates a full-resolution `ARGB_8888` bitmap: 3840 × 1920 × 4 = **29.5 MB** just for the thumbnail decode. This runs on the executor thread after stitching, so it will not cause an ANR, but it will cause an `OutOfMemoryError` on devices with limited native bitmap memory headroom.
+
+**Suggested fix:** Apply the same two-pass `inJustDecodeBounds` + `inSampleSize` pattern already used in `CandidateQualityScorer.decodeSample()` and `CapturedReferenceFrame.decodeReferenceBitmap()`.
+
+---
+
+### 9. C++ Stitcher – Double Disk Read Per Source Image (MEDIUM RISK – Slow Stitching)
+
+**File:** `spherify_stitcher.cpp`, lines 135–153 (first pass: feature extraction) and lines 292–294 (second pass: composition)
+
+```cpp
+cv::Mat full = cv::imread(paths[i], cv::IMREAD_COLOR);    // first pass
+...
+cv::Mat full = cv::imread(paths_subset[image_index], cv::IMREAD_COLOR); // second pass
+```
+
+Every source image is read from disk twice. For 30–34 captured JPEG frames at 1–3 MB each, this is 60–68 file reads totalling 30–100 MB, all involving JPEG decompression. On a mid-range device with slow UFS storage this contributes substantially to total stitch time.
+
+The comment on line 291 notes this is intentional to keep only one full-resolution frame resident at a time — a valid memory trade-off. The path strings used for the second pass come from `paths_subset` (line 294), while the first pass used `paths` (line 136). Care should be taken to ensure `paths_subset` is correctly populated after `leaveBiggestComponent` filtering; a mismatch would silently read wrong files.
+
+---
+
+### 10. C++ Stitcher – Full-Resolution Composition Disabled (`COMPOSE_MEGAPIX = -1.0`) (HIGH RISK – OOM)
+
+**File:** `spherify_stitcher.cpp`, line 44
+
+```cpp
+constexpr double COMPOSE_MEGAPIX = -1.0;
+```
+
+The negative value disables any downscaling of the compositing step (lines 299–301: `if (COMPOSE_MEGAPIX > 0) {...}`). Combined with 30–34 full-resolution phone camera frames (12–50 MP each), the multiband blender's Laplacian pyramid can require multiple full-resolution copies simultaneously in native heap. For a 12 MP camera (4032 × 3024) with 34 frames and 5 pyramid bands, this can exceed 500 MB of native heap on high-resolution devices.
+
+**Suggested fix:** Set `COMPOSE_MEGAPIX` to a value such as `4.0` (4 megapixels ≈ 2000 × 2000), which satisfies the minimum GPano dimension of 3840 × 1920 when the output is rescaled to 2:1 equirectangular.
+
+---
+
+### 11. `validateCaptureGraphReadiness()` – O(N²) Union-Find (LOW–MEDIUM RISK)
+
+**File:** `SpherifyLibrary.java`, `union()`, lines 860–873
+
+```java
+for (Map.Entry<String, Integer> entry : componentIndexes.entrySet()) {
+    if (entry.getValue() == removed) {
+        entry.setValue(replacement);
+    }
+}
+```
+
+The union step iterates the entire `componentIndexes` map to replace one component label. With N frames and E edges, this is O(N × E). For a 34-frame session with ~50 edges it is O(1700) operations — low absolute cost — but the algorithm is O(N²) in the worst case and will not scale to larger future sessions.
+
+**Suggested fix:** Use a proper path-compressed union-find with an array-backed `int[]` indexed by position, rather than HashMap-based label replacement.
+
+---
+
+### 12. `Phase5Stitcher.PhotoSphereXmp` – Loads Entire JPEG Into Memory Twice (MEDIUM RISK)
+
+**File:** `Phase5Stitcher.java`, `PhotoSphereXmp.readAll()` (line 308) and `hasGpanoXmp()` (line 213)
+
+`readAll()` loads the entire output JPEG into a `byte[]` in order to prepend the XMP APP1 segment (line 286). For a 3840 × 1920 JPEG this can be 10–30 MB in a single heap allocation. Then `hasGpanoXmp()` also calls `PhotoSphereXmp.readAll()` (line 215) to verify the XMP, loading it again. That is two full-file `byte[]` allocations in sequence.
+
+**Suggested fix:** (a) Parse and inject APP1 by streaming: copy bytes up to the SOF marker using a fixed-size buffer, inject the APP1 segment, and stream the rest, avoiding the full-file copy. (b) Read only the first ~65 KB of the file for XMP verification, since APP1 is always near the start of a JPEG.
+
+---
+
+### 13. `SimpleDateFormat` Created in a Hot Path (LOW RISK)
+
+**File:** `Phase5Stitcher.java`, `PhotoSphereXmp.xmpDate()`, line 352
+
+```java
+return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(new Date(when));
+```
+
+Called for both `firstDate` and `lastDate` during every XMP generation. `SimpleDateFormat` construction is relatively expensive. This should be declared as a `static final` field.
+
+---
+
+### 14. `OpenCvOverlapValidator.initOpenCv()` – Called Per Match Attempt (LOW RISK)
+
+**File:** `OpenCvOverlapValidator.java`, lines 182–192
+
+```java
+private static boolean initOpenCv() {
+    try { return OpenCVLoader.initLocal(); }
+    ...
+}
+```
+
+`initOpenCv()` is called at the top of every `analyze()` invocation. `OpenCVLoader.initLocal()` is cheap after the first load (it checks an internal flag), but the try-catch wrapper executes on every call. The initialisation result should be cached in a `static volatile boolean` after the first successful init.
+
+---
+
+### 15. `camera2ResultsByTimestamp` – Synchronised Lock at 30 fps (LOW RISK)
+
+**File:** `SharedCameraCaptureActivity.java`, lines 248–253
+
+```java
+synchronized (camera2ResultsByTimestamp) {
+    camera2ResultsByTimestamp.put(timestamp, result);
+    while (camera2ResultsByTimestamp.size() > 90) {
+        camera2ResultsByTimestamp.pollFirstEntry();
+    }
+}
+```
+
+The `synchronized` block is acquired on every Camera2 capture result callback, which fires at 30 fps — 30 lock acquisitions per second on the camera thread. The `TreeMap` retains 90 entries of `TotalCaptureResult` objects, which hold references to large metadata arrays. The limit is bounded and acceptable, but this lock is also acquired in `camera2MetadataFor()` on the executor thread during capture validation, creating potential contention.
+
+**Suggested fix:** Consider `AtomicReference<TreeMap<Long, TotalCaptureResult>>` with copy-on-write semantics to eliminate the lock, or at minimum ensure the `synchronized` block remains as minimal as it currently is.
+
+---
+
+### Performance Issue Priority Summary
+
+| Risk | Issue | File | Lines |
+|---|---|---|---|
+| 🔴 HIGH | `refreshUi()` posted every GL frame (30 fps UI thread hammer) | `SharedCameraCaptureActivity.java` | 1308 |
+| 🔴 HIGH | Full JPEG decoded without `inSampleSize` for thumbnails | `SpherifyLibrary.java` | 2310 |
+| 🔴 HIGH | `COMPOSE_MEGAPIX = -1.0` — unbounded native heap during compositing | `spherify_stitcher.cpp` | 44 |
+| 🔴 HIGH | `setPanorama()` copies 118 MB pixel array on calling thread | `GLProjectionView.java` | 165–166 |
+| 🔴 HIGH | YUV→NV21: millions of random `ByteBuffer.get()` calls per capture | `SharedCameraCaptureActivity.java` | 1371–1404 |
+| 🟠 MED | Full `capture-sessions.json` read+write per captured frame | `SpherifyLibrary.java` | 1483–1547 |
+| 🟠 MED | Candidate JPEG decoded N times (once per neighbour) | `OpenCvOverlapValidator.java` | 201 |
+| 🟠 MED | `ORB.create()` inside tight matching loop | `OpenCvOverlapValidator.java` | 364 |
+| 🟠 MED | Full JPEG loaded into memory twice for XMP write and verify | `Phase5Stitcher.java` | 215, 286 |
+| 🟠 MED | `int[]` pixel array + `Math.sqrt` per pixel in quality scorer | `CandidateQualityScorer.java` | 20–43 |
+| 🟠 MED | Up to 96 reference bitmaps (~18 MB) retained in heap | `SharedCameraCaptureActivity.java` | 125, 798 |
+| 🟡 LOW | Exposure JSON serialised to `String` then immediately re-parsed | `SharedCameraCaptureActivity.java` | 727 |
+| 🟡 LOW | `sampleSphere()` recomputes invariant trig on every output pixel | `GLProjectionView.java` | 627–628 |
+| 🟡 LOW | O(N²) union-find in graph connectivity check | `SpherifyLibrary.java` | 860–873 |
+| 🟡 LOW | `new SimpleDateFormat(...)` per XMP date format call | `Phase5Stitcher.java` | 352 |
+| 🟡 LOW | `initOpenCv()` invoked on every `analyze()` call | `OpenCvOverlapValidator.java` | 182 |
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
