@@ -223,6 +223,74 @@ The compact spherical coverage map should distinguish visually among: accepted t
 | 🟢 Low | UX | Friendly readiness and setup splash before first capture | Reduces first-run confusion and permission-related abandonment |
 | 🟢 Low | UX | Improved coverage mini-map visual hierarchy | Gives users concrete progress feedback without geometric interpretation |
 
+---
+
+## Existing Methods, Products, and the "Avoid Reinventing the Wheel" Question
+
+### Summary
+
+Spherify does not need to look outside its current dependency set to produce a correct photosphere. The two libraries that cover the full pipeline are already declared in `app/build.gradle`:
+
+- **OpenCV** (`org.opencv:opencv:5.0.0.1`) — Apache 2.0. Compatible with a paid closed-source app.
+- **ARCore** (`com.google.ar:core:1.54.0`) — Apache 2.0. Compatible with a paid closed-source app.
+
+The opportunity is not to add new dependencies but to trust these two libraries more completely, removing custom code that duplicates what they already provide.
+
+### What OpenCV's `cv::Stitcher` Already Does
+
+`cv::Stitcher` in `PANORAMA` mode (spherical warper) implements the full Brown and Lowe pipeline internally without any custom code:
+
+- ORB / SIFT / AKAZE feature detection and description
+- `BestOf2NearestMatcher` robust pairwise matching
+- Homography-based camera estimation
+- Ray bundle adjustment — globally minimises reprojection error across all frames simultaneously
+- Wave correction
+- Spherical warping from optimised camera and lens parameters
+- Block-gain exposure compensation
+- Graph-cut seam finding (`detail::GraphCutSeamFinder`)
+- Multiband Laplacian pyramid blending (`detail::MultiBandBlender`)
+
+The simpler target architecture is: ARCore provides guided capture and initial rotation matrices → pass frames and initial `R` matrices to `cv::Stitcher::estimateTransform()` → write GPano XMP to output. This is what the stitcher was designed for, not a shortcut.
+
+### What ARCore Already Does
+
+ARCore's `SharedCamera` API with Visual-Inertial Odometry (VIO) integrates high-frequency gyroscope data, accelerometer gravity, and continuous visual feature tracking to produce stable, drift-corrected pose estimates. There is no better free alternative for VIO on Android that is Apache 2.0. The main alternatives — ORB-SLAM3 and OpenVINS — are both GPL-3.0 and cannot be shipped in a paid closed-source app.
+
+### Concrete "Don't Reinvent the Wheel" Opportunities
+
+| Change | Benefit |
+|---|---|
+| Replace the custom per-neighbour overlap validator with `cv::detail::BestOf2NearestMatcher` + `cv::detail::HomographyBasedEstimator` at stitch time | Consistent with the final solver; eliminates duplicate logic |
+| Feed ARCore `Camera.getDisplayOrientedPose()` quaternions as initial `R` matrices into `cv::Stitcher::estimateTransform()` | Sensor-backed warm start for bundle adjustment; faster convergence and lower residuals |
+| Use `cv::detail::MultiBandBlender` and `cv::detail::GraphCutSeamFinder` directly | Inherits OpenCV's optimised, community-tested implementations |
+| Use `androidx.exifinterface` for GPano XMP read-write | Eliminates the custom XMP byte-manipulation code; no GPL exposure |
+
+### What Exists but Cannot Be Used in a Paid App
+
+| Product / Library | Licence | Reason unavailable |
+|---|---|---|
+| Hugin | GPL-2.0 | Distributing in a paid closed-source app requires open-sourcing the entire app |
+| libpano13 / Panorama Tools | GPL-2.0 | Same as Hugin |
+| ORB-SLAM3 | GPL-3.0 | Cannot be used in closed-source paid app |
+| OpenVINS | GPL-3.0 | Same as ORB-SLAM3 |
+| exiv2 | GPL-2.0 | Use `androidx.exifinterface` instead |
+
+### What Exists but Does Not Fit the Local-First Design
+
+| Product / Service | Why it does not fit |
+|---|---|
+| Google Street View Publish API | Publishing only; no stitching pipeline; requires cloud |
+| Cloud stitching APIs (AWS Rekognition, Azure Vision, etc.) | Require sending user photos off-device; conflicts with the local-first, no-cloud-surrender premise |
+| PTGui / Autopano / Kolor | Desktop-only; no Android SDK; commercial licensing is per-seat desktop |
+| Insta360 / Ricoh Theta / Kandao SDKs | Hardware-coupled; only work with their own 360-degree camera hardware |
+| Microsoft ICE | Discontinued; Windows-only; no SDK |
+
+### Conclusion
+
+The "wheel" for photosphere stitching is `cv::Stitcher` (OpenCV, Apache 2.0). The "wheel" for pose-guided mobile acquisition is ARCore (Apache 2.0). Both are already present. Every significant external alternative is either GPL-licensed (incompatible with a paid app), cloud-dependent (conflicts with the design goal), or hardware-locked (requires a dedicated 360-degree camera rig). The correct direction is to rely on these two proven libraries more completely, replacing custom code that re-implements what they provide.
+
+---
+
 ## Developer Build and Run Runbook
 
 This section is intentionally basic and explicit. It describes how to build, install, and run the current Android project from VS Code and terminal commands.
