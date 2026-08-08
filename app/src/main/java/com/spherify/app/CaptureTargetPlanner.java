@@ -24,9 +24,9 @@ import java.util.List;
 final class CaptureTargetPlanner {
     private static final double DEFAULT_HORIZONTAL_FOV_DEGREES = 75.0;
     private static final double DEFAULT_VERTICAL_FOV_DEGREES = 60.0;
-    private static final double TARGET_OVERLAP = 0.70;
-    private static final int MIN_STEP_DEGREES = 14;
-    private static final int MAX_STEP_DEGREES = 26;
+    private static final double TARGET_OVERLAP = 0.40;
+    private static final int MIN_STEP_DEGREES = 18;
+    private static final int MAX_STEP_DEGREES = 45;
 
     private CaptureTargetPlanner() {
     }
@@ -46,29 +46,81 @@ final class CaptureTargetPlanner {
             int anchorPitchDegrees,
             double horizontalFovDegrees,
             double verticalFovDegrees) {
-        int yawStep = 45;
-        int row1 = 35;
-        int row2 = 70;
+        int yawStep = captureStep(horizontalFovDegrees);
+        int columnCount = Math.max(8, (int) Math.ceil(360.0 / yawStep));
+        int row1 = roundToNearestFive(captureStep(verticalFovDegrees));
+        int row2 = Math.min(70, roundToNearestFive(row1 * 2));
         ArrayList<CaptureTarget> targets = new ArrayList<>();
         int anchorPitch = clampPitch(anchorPitchDegrees);
         targets.add(new CaptureTarget(normalize(anchorYawDegrees), anchorPitch, CaptureTargetPhase.START));
-        for (int column = 1; column < 8; column++) {
-            int offset = column * yawStep;
+        for (int column = 1; column < columnCount; column++) {
+            int offset = Math.round(column * 360f / columnCount);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch, CaptureTargetPhase.HORIZON);
         }
-        for (int column = 0; column < 8; column++) {
-            int offset = column * yawStep;
+        for (int column = 0; column < columnCount; column++) {
+            int offset = Math.round(column * 360f / columnCount);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch + row1, CaptureTargetPhase.MID);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch - row1, CaptureTargetPhase.MID);
         }
-        for (int column = 1; column < 8; column += 2) {
-            int offset = column * yawStep;
+        int highColumnCount = Math.max(4, (int) Math.ceil(columnCount / 2.0));
+        for (int column = 0; column < highColumnCount; column++) {
+            int offset = Math.round((column + 0.5f) * 360f / highColumnCount);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch + row2, CaptureTargetPhase.HIGH);
             addTargetIfMissing(targets, anchorYawDegrees + offset, anchorPitch - row2, CaptureTargetPhase.HIGH);
         }
         addTargetIfMissing(targets, anchorYawDegrees, 85, CaptureTargetPhase.POLE);
         addTargetIfMissing(targets, anchorYawDegrees, -85, CaptureTargetPhase.POLE);
         return targets;
+    }
+
+    static TargetCoverage coverageForDraftRecords(List<DraftFrameRecord> records) {
+        if (records == null || records.isEmpty()) {
+            return new TargetCoverage(0, 0);
+        }
+        DraftFrameRecord anchor = records.get(0);
+        ArrayList<CaptureTarget> targets = anchoredTargets(
+                anchor.targetYawDegrees,
+                anchor.targetPitchDegrees,
+                fovDegrees(anchor.imageFocalLengthXPixels, anchor.imageIntrinsicsWidth),
+                fovDegrees(anchor.imageFocalLengthYPixels, anchor.imageIntrinsicsHeight));
+        for (DraftFrameRecord record : records) {
+            markCaptured(targets, record.targetYawDegrees, record.targetPitchDegrees);
+        }
+        int captured = 0;
+        for (CaptureTarget target : targets) {
+            if (target.captured) {
+                captured++;
+            }
+        }
+        return new TargetCoverage(targets.size(), captured);
+    }
+
+    static TargetCoverage coverageForAcceptedFrames(List<CaptureFrameRecord> frames) {
+        CaptureFrameRecord anchor = firstAcceptedFrame(frames);
+        if (anchor == null) {
+            return new TargetCoverage(0, 0);
+        }
+        ArrayList<CaptureTarget> targets = anchoredTargets(
+                anchor.rawFacts.targetYawDegrees,
+                anchor.rawFacts.targetPitchDegrees,
+                horizontalFovDegrees(anchor),
+                verticalFovDegrees(anchor));
+        for (CaptureFrameRecord frame : frames) {
+            if (frame.role == CaptureFrameRole.ACCEPTED) {
+                markCaptured(targets, frame.rawFacts.targetYawDegrees, frame.rawFacts.targetPitchDegrees);
+            }
+        }
+        int captured = 0;
+        for (CaptureTarget target : targets) {
+            if (target.captured) {
+                captured++;
+            }
+        }
+        return new TargetCoverage(targets.size(), captured);
+    }
+
+    static int expectedTargetCountForAcceptedFrames(List<CaptureFrameRecord> frames) {
+        return coverageForAcceptedFrames(frames).expectedTargets;
     }
 
     static CaptureTarget nextTargetFor(CaptureSessionRecord session) {
@@ -158,6 +210,10 @@ final class CaptureTargetPlanner {
         return (int) Math.max(MIN_STEP_DEGREES, Math.min(MAX_STEP_DEGREES, Math.round(fov * (1.0 - TARGET_OVERLAP))));
     }
 
+    private static int roundToNearestFive(int degrees) {
+        return Math.max(MIN_STEP_DEGREES, Math.round(degrees / 5f) * 5);
+    }
+
     private static double horizontalFovDegrees(CaptureFrameRecord frame) {
         return fovDegrees(
                 frame.rawFacts.intrinsics.optDouble("focalLengthXPixels", 0.0),
@@ -175,5 +231,26 @@ final class CaptureTargetPlanner {
             return DEFAULT_HORIZONTAL_FOV_DEGREES;
         }
         return Math.toDegrees(2.0 * Math.atan(imagePixels / (2.0 * focalPixels)));
+    }
+
+    static final class TargetCoverage {
+        final int expectedTargets;
+        final int capturedTargets;
+
+        TargetCoverage(int expectedTargets, int capturedTargets) {
+            this.expectedTargets = expectedTargets;
+            this.capturedTargets = capturedTargets;
+        }
+
+        boolean complete() {
+            return expectedTargets > 0 && capturedTargets >= expectedTargets;
+        }
+
+        int percent() {
+            if (expectedTargets <= 0) {
+                return 0;
+            }
+            return Math.round(Math.min(capturedTargets, expectedTargets) * 100f / expectedTargets);
+        }
     }
 }

@@ -85,7 +85,6 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -116,13 +115,13 @@ public final class SharedCameraCaptureActivity extends Activity
     private static final float MAX_TRANSLATION_FROM_ANCHOR_METERS = 0.12f;
     private static final long MIN_CAPTURE_INTERVAL_MS = 1100L;
     private static final long REQUIRED_ALIGNED_MS = 850L;
-    private static final long TEXTURE_HINT_INTERVAL_MS = 650L;
+    private static final long TEXTURE_HINT_INTERVAL_MS = 1200L;
     private static final int TEXTURE_HINT_GRID_COLUMNS = 5;
     private static final int TEXTURE_HINT_GRID_ROWS = 5;
     private static final int REFERENCE_PREVIEW_ROTATION_CORRECTION_DEGREES = 270;
     private static final boolean REFERENCE_PREVIEW_MIRROR_CORRECTION = true;
     private static final int MAX_VISIBLE_REFERENCE_OVERLAYS = 3;
-    private static final int MAX_RETAINED_REFERENCE_OVERLAYS = 96;
+    private static final int MAX_RETAINED_REFERENCE_OVERLAYS = 40;
     private static final float REFERENCE_OVERLAY_FADE_START_DEGREES = 14f;
     private static final float REFERENCE_OVERLAY_FADE_END_DEGREES = 52f;
     private static final int REFERENCE_OVERLAY_MAX_ALPHA = 138;
@@ -482,7 +481,7 @@ public final class SharedCameraCaptureActivity extends Activity
                     cpuSize.getWidth(),
                     cpuSize.getHeight(),
                     ImageFormat.YUV_420_888,
-                    4);
+                    2);
             cpuImageReader.setOnImageAvailableListener(this, cameraHandler);
             sharedCamera.setAppSurfaces(cameraId, Arrays.asList(cpuImageReader.getSurface()));
 
@@ -1359,12 +1358,10 @@ public final class SharedCameraCaptureActivity extends Activity
     private static void writeJpegFromYuv(Image image, File outputFile) throws IOException {
         byte[] nv21 = yuv420ToNv21(image);
         YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
-        try (FileOutputStream output = new FileOutputStream(outputFile);
-             ByteArrayOutputStream jpeg = new ByteArrayOutputStream()) {
-            if (!yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 94, jpeg)) {
+        try (FileOutputStream output = new FileOutputStream(outputFile)) {
+            if (!yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 92, output)) {
                 throw new IOException("could not encode ARCore CPU image");
             }
-            jpeg.writeTo(output);
         }
     }
 
@@ -2009,6 +2006,7 @@ public final class SharedCameraCaptureActivity extends Activity
         private List<CaptureTarget> targets = new ArrayList<>();
         private List<Integer> selectableIndices = new ArrayList<>();
         private List<CapturedReferenceFrame> referenceFrames = new ArrayList<>();
+        private final ArrayList<ReferenceOverlayCandidate> referenceOverlayCandidates = new ArrayList<>();
         private int activeTargetIndex = -1;
         private ArFrameState frameState = ArFrameState.notReady("tracking not started");
         private TextureHint textureHint = TextureHint.unavailable();
@@ -2129,18 +2127,18 @@ public final class SharedCameraCaptureActivity extends Activity
             if (!frameState.ready || referenceFrames.isEmpty()) {
                 return;
             }
-            ArrayList<ReferenceOverlayCandidate> candidates = new ArrayList<>();
+            referenceOverlayCandidates.clear();
             for (CapturedReferenceFrame reference : referenceFrames) {
                 float distance = reference.angularDistanceFrom(frameState);
                 if (distance <= REFERENCE_OVERLAY_FADE_END_DEGREES) {
-                    candidates.add(new ReferenceOverlayCandidate(reference, distance));
+                    referenceOverlayCandidates.add(new ReferenceOverlayCandidate(reference, distance));
                 }
             }
-            Collections.sort(candidates, (left, right) -> Float.compare(left.distanceDegrees, right.distanceDegrees));
+            Collections.sort(referenceOverlayCandidates, (left, right) -> Float.compare(left.distanceDegrees, right.distanceDegrees));
             targetPaint.setStyle(Paint.Style.FILL);
-            int count = Math.min(MAX_VISIBLE_REFERENCE_OVERLAYS, candidates.size());
+            int count = Math.min(MAX_VISIBLE_REFERENCE_OVERLAYS, referenceOverlayCandidates.size());
             for (int i = count - 1; i >= 0; i--) {
-                ReferenceOverlayCandidate candidate = candidates.get(i);
+                ReferenceOverlayCandidate candidate = referenceOverlayCandidates.get(i);
                 CapturedReferenceFrame reference = candidate.reference;
                 if (!reference.updateMesh(frameState, getWidth(), getHeight())) {
                     continue;

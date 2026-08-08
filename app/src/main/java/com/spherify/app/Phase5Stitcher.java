@@ -13,7 +13,6 @@ package com.spherify.app;
 import android.graphics.BitmapFactory;
 import android.media.ExifInterface;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -25,6 +24,7 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.TimeZone;
 
 final class Phase5Stitcher {
     private static final int MIN_GPANO_WIDTH = 3840;
@@ -66,23 +66,23 @@ final class Phase5Stitcher {
             throw new IOException("all accepted frames need real Camera2 exposure metadata; missing " + missingExposure);
         }
 
-        report(progress, "opencv", false, "Running native OpenCV detail pipeline");
+        report(progress, "opencv", false, "Running native OpenCV Stitcher pipeline");
         int status = NativeOpenCvStitcher.stitchPanorama(paths, outputFile.getAbsolutePath());
         if (status != NativeOpenCvStitcher.STATUS_OK) {
             throw new IOException("native OpenCV stitch failed with status " + status + ": " + statusLabel(status));
         }
-        report(progress, "opencv", true, "Native OpenCV detail pipeline wrote candidate panorama");
+        report(progress, "opencv", true, "Native OpenCV Stitcher pipeline wrote candidate panorama");
 
         ExportCheck beforeXmp = validateGooglePhotoSphereCandidate(outputFile, records, false);
         if (!beforeXmp.mapReadyWithoutXmp()) {
             throw new IOException(beforeXmp.summary);
         }
+        writeExifDiagnostics(outputFile, graphSession.id, records.size(), beforeXmp);
         PhotoSphereXmp.write(outputFile, records, beforeXmp.width, beforeXmp.height);
         ExportCheck afterXmp = validateGooglePhotoSphereCandidate(outputFile, records, true);
         if (!afterXmp.mapReady) {
             throw new IOException(afterXmp.summary);
         }
-        writeExifDiagnostics(outputFile, graphSession.id, records.size(), afterXmp);
         report(progress, "metadata", true, "GPano XMP readback passed");
         return new Result(
                 records.size(),
@@ -148,7 +148,7 @@ final class Phase5Stitcher {
         boolean resolution = bounds.outWidth >= MIN_GPANO_WIDTH && bounds.outHeight >= MIN_GPANO_WIDTH / 2;
         boolean size = outputFile.length() <= MAX_GOOGLE_FILE_BYTES;
         boolean coverage = hasFullGuidedCoverage(records);
-        boolean xmp = hasGpanoXmp(outputFile);
+        boolean xmp = requireXmp && hasGpanoXmp(outputFile);
         if (!aspect) {
             warnings.add("output is not exact 2:1 equirectangular (" + bounds.outWidth + "x" + bounds.outHeight + ")");
         }
@@ -177,42 +177,21 @@ final class Phase5Stitcher {
     }
 
     private static boolean hasFullGuidedCoverage(List<DraftFrameRecord> records) {
-        int anchorPitch = records.isEmpty() ? 0 : records.get(0).targetPitchDegrees;
-        return countRelativePitch(records, anchorPitch, -8, 8, false) >= 8
-                && countRelativePitch(records, anchorPitch, 27, 43, false) >= 8
-                && countRelativePitch(records, anchorPitch, -43, -27, false) >= 8
-                && countRelativePitch(records, anchorPitch, 58, 90, true) >= 5
-                && countRelativePitch(records, anchorPitch, -90, -58, true) >= 5;
+        return CaptureTargetPlanner.coverageForDraftRecords(records).complete();
     }
 
     private static int coveragePercent(List<DraftFrameRecord> records) {
-        int anchorPitch = records.isEmpty() ? 0 : records.get(0).targetPitchDegrees;
-        int score = 0;
-        score += Math.min(8, countRelativePitch(records, anchorPitch, -8, 8, false));
-        score += Math.min(8, countRelativePitch(records, anchorPitch, 27, 43, false));
-        score += Math.min(8, countRelativePitch(records, anchorPitch, -43, -27, false));
-        score += Math.min(5, countRelativePitch(records, anchorPitch, 58, 90, true));
-        score += Math.min(5, countRelativePitch(records, anchorPitch, -90, -58, true));
-        return Math.round(score * 100f / 34f);
-    }
-
-    private static int countRelativePitch(List<DraftFrameRecord> records, int anchorPitch, int minPitch, int maxPitch, boolean includePoles) {
-        int count = 0;
-        for (DraftFrameRecord record : records) {
-            int relativePitch = record.targetPitchDegrees - anchorPitch;
-            boolean pole = includePoles
-                    && ((maxPitch > 0 && record.targetPitchDegrees >= 80)
-                    || (minPitch < 0 && record.targetPitchDegrees <= -80));
-            if ((relativePitch >= minPitch && relativePitch <= maxPitch) || pole) {
-                count++;
-            }
-        }
-        return count;
+        return CaptureTargetPlanner.coverageForDraftRecords(records).percent();
     }
 
     private static boolean hasGpanoXmp(File file) {
-        try {
-            String text = new String(PhotoSphereXmp.readAll(file), StandardCharsets.ISO_8859_1);
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] header = new byte[256 * 1024];
+            int read = input.read(header);
+            if (read <= 0) {
+                return false;
+            }
+            String text = new String(header, 0, read, StandardCharsets.ISO_8859_1);
             return text.contains("GPano:ProjectionType")
                     && text.contains("GPano:FullPanoWidthPixels")
                     && text.contains("GPano:CroppedAreaImageWidthPixels")
@@ -283,37 +262,48 @@ final class Phase5Stitcher {
 
     private static final class PhotoSphereXmp {
         static void write(File file, List<DraftFrameRecord> records, int width, int height) throws IOException {
-            byte[] original = readAll(file);
-            if (original.length < 2 || (original[0] & 0xFF) != 0xFF || (original[1] & 0xFF) != 0xD8) {
-                throw new IOException("cannot write GPano XMP to a non-JPEG file");
-            }
             byte[] identifier = "http://ns.adobe.com/xap/1.0/\0".getBytes(StandardCharsets.UTF_8);
             byte[] payload = xmpPacket(records, width, height).getBytes(StandardCharsets.UTF_8);
             int length = identifier.length + payload.length + 2;
             if (length > 0xFFFF) {
                 throw new IOException("GPano XMP packet is too large for one JPEG APP1 segment");
             }
-            try (FileOutputStream output = new FileOutputStream(file)) {
-                output.write(original, 0, 2);
+            File temp = File.createTempFile("gpano-", ".jpg", file.getParentFile());
+            try (FileInputStream input = new FileInputStream(file);
+                 FileOutputStream output = new FileOutputStream(temp)) {
+                int soi0 = input.read();
+                int soi1 = input.read();
+                if (soi0 != 0xFF || soi1 != 0xD8) {
+                    throw new IOException("cannot write GPano XMP to a non-JPEG file");
+                }
+                output.write(soi0);
+                output.write(soi1);
                 output.write(0xFF);
                 output.write(0xE1);
                 output.write((length >> 8) & 0xFF);
                 output.write(length & 0xFF);
                 output.write(identifier);
                 output.write(payload);
-                output.write(original, 2, original.length - 2);
-            }
-        }
-
-        static byte[] readAll(File file) throws IOException {
-            try (FileInputStream input = new FileInputStream(file);
-                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
                 byte[] buffer = new byte[8192];
                 int read;
                 while ((read = input.read(buffer)) != -1) {
                     output.write(buffer, 0, read);
                 }
-                return output.toByteArray();
+            } catch (IOException e) {
+                temp.delete();
+                throw e;
+            }
+            if (!temp.renameTo(file)) {
+                try (FileInputStream input = new FileInputStream(temp);
+                     FileOutputStream output = new FileOutputStream(file)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = input.read(buffer)) != -1) {
+                        output.write(buffer, 0, read);
+                    }
+                } finally {
+                    temp.delete();
+                }
             }
         }
 
@@ -349,7 +339,9 @@ final class Phase5Stitcher {
 
         private static String xmpDate(DraftFrameRecord record) {
             long when = record == null ? System.currentTimeMillis() : record.createdAt;
-            return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(new Date(when));
+            SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US);
+            format.setTimeZone(TimeZone.getTimeZone("UTC"));
+            return format.format(new Date(when));
         }
     }
 

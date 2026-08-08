@@ -152,18 +152,18 @@ public class GLProjectionView extends GLSurfaceView {
      * Function: setPanorama
      * Arguments: panorama is the source bitmap; sourceProjection describes how
      * the app should interpret it ("sphere", "tinyplanet", or "flat").
-     * Calls: Bitmap.getPixels(), isSquareish(), queueEvent(), renderer.setPanorama(),
+     * Calls: isSquareish(), queueEvent(), renderer.setPanorama(),
      * and pushStateToRenderer().
-     * Flow: store dimensions and CPU pixels for export, infer source projection,
-     * reset orientation state, queue texture upload on the GL thread, and redraw.
+     * Flow: store dimensions for export, infer source projection, reset
+     * orientation state, queue texture upload on the GL thread, and redraw.
      */
     public void setPanorama(Bitmap panorama, String sourceProjection) {
+        Bitmap previous = this.panorama;
         this.panorama = panorama;
         panoramaWidth = panorama.getWidth();
         panoramaHeight = panorama.getHeight();
         sourceTinyPlanet = "tinyplanet".equals(sourceProjection) || isSquareish(panoramaWidth, panoramaHeight);
-        panoramaPixels = new int[panoramaWidth * panoramaHeight];
-        panorama.getPixels(panoramaPixels, 0, panoramaWidth, 0, 0, panoramaWidth, panoramaHeight);
+        panoramaPixels = new int[0];
         centerYaw = 0f;
         centerPitch = 0f;
         centerRoll = 0f;
@@ -173,8 +173,27 @@ public class GLProjectionView extends GLSurfaceView {
         horizonOffset = 0f;
         cameraDistance = 1f;
         boolean currentSourceTinyPlanet = sourceTinyPlanet;
-        queueEvent(() -> renderer.setPanorama(panorama, currentSourceTinyPlanet));
+        queueEvent(() -> {
+            renderer.setPanorama(panorama, currentSourceTinyPlanet);
+            if (previous != null && previous != panorama && !previous.isRecycled()) {
+                previous.recycle();
+            }
+        });
         pushStateToRenderer();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        Bitmap current = panorama;
+        queueEvent(() -> {
+            renderer.releaseGlResources();
+            if (current != null && !current.isRecycled()) {
+                current.recycle();
+            }
+        });
+        panorama = null;
+        panoramaPixels = new int[0];
+        super.onDetachedFromWindow();
     }
 
     /*
@@ -584,6 +603,7 @@ public class GLProjectionView extends GLSurfaceView {
      * active mode, sample the source image pixels, and write the final bitmap.
      */
     private Bitmap renderProjectionOnCpu(int width, int height) {
+        ensurePanoramaPixels();
         Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         int[] pixels = new int[width * height];
 
@@ -612,7 +632,19 @@ public class GLProjectionView extends GLSurfaceView {
         }
 
         output.setPixels(pixels, 0, width, 0, 0, width, height);
+        panoramaPixels = new int[0];
         return output;
+    }
+
+    private void ensurePanoramaPixels() {
+        if (panoramaPixels.length == panoramaWidth * panoramaHeight) {
+            return;
+        }
+        if (panorama == null || panorama.isRecycled() || panoramaWidth <= 0 || panoramaHeight <= 0) {
+            throw new IllegalStateException("No panorama pixels available");
+        }
+        panoramaPixels = new int[panoramaWidth * panoramaHeight];
+        panorama.getPixels(panoramaPixels, 0, panoramaWidth, 0, 0, panoramaWidth, panoramaHeight);
     }
 
     /*
@@ -1170,6 +1202,19 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, pendingPanorama, 0);
             pendingPanorama = null;
+        }
+
+        void releaseGlResources() {
+            pendingPanorama = null;
+            if (textureId != 0) {
+                int[] textures = new int[]{textureId};
+                GLES20.glDeleteTextures(1, textures, 0);
+                textureId = 0;
+            }
+            if (program != 0) {
+                GLES20.glDeleteProgram(program);
+                program = 0;
+            }
         }
 
         /*

@@ -362,8 +362,13 @@ final class OpenCvOverlapValidator {
         MatOfPoint2f projectedCandidateMat = new MatOfPoint2f();
         try {
             ORB orb = ORB.create(ORB_FEATURES);
-            orb.detectAndCompute(candidateGray, new Mat(), candidateKeypoints, candidateDescriptors);
-            orb.detectAndCompute(neighborGray, new Mat(), neighborKeypoints, neighborDescriptors);
+            Mat emptyMask = new Mat();
+            try {
+                orb.detectAndCompute(candidateGray, emptyMask, candidateKeypoints, candidateDescriptors);
+                orb.detectAndCompute(neighborGray, emptyMask, neighborKeypoints, neighborDescriptors);
+            } finally {
+                emptyMask.release();
+            }
             if (candidateDescriptors.empty() || neighborDescriptors.empty()) {
                 return null;
             }
@@ -377,6 +382,7 @@ final class OpenCvOverlapValidator {
             ArrayList<Point> neighborControl = new ArrayList<>();
             for (MatOfDMatch pair : knn) {
                 DMatch[] matches = pair.toArray();
+                pair.release();
                 if (matches.length < 2 || matches[0].distance >= matches[1].distance * RATIO_TEST) {
                     continue;
                 }

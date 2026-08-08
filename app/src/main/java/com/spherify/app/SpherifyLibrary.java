@@ -788,6 +788,11 @@ final class SpherifyLibrary {
         if (visualFrameIds.size() < 24) {
             blockers.add("textured visual graph needs at least 24 OpenCV-checkable frames; found " + visualFrameIds.size());
         }
+        CaptureTargetPlanner.TargetCoverage targetCoverage = CaptureTargetPlanner.coverageForAcceptedFrames(session.frames);
+        if (targetCoverage.expectedTargets > 0 && !targetCoverage.complete()) {
+            blockers.add("guided FOV target lattice is incomplete; captured "
+                    + targetCoverage.capturedTargets + "/" + targetCoverage.expectedTargets);
+        }
         HashMap<String, Integer> componentIndexes = new HashMap<>();
         for (String frameId : visualFrameIds) {
             componentIndexes.put(frameId, componentIndexes.size());
@@ -957,11 +962,16 @@ final class SpherifyLibrary {
         if (nonGuidedFrames > 0) {
             blockers.add("all production source frames must come from guided dot capture; non-guided frames " + nonGuidedFrames);
         }
+        CaptureTargetPlanner.TargetCoverage targetCoverage = CaptureTargetPlanner.coverageForDraftRecords(records);
+        if (targetCoverage.expectedTargets > 0 && !targetCoverage.complete()) {
+            blockers.add("guided FOV target lattice is incomplete; captured "
+                    + targetCoverage.capturedTargets + "/" + targetCoverage.expectedTargets);
+        }
         if (handheld && readableFrames > 0) {
             warnings.add("hand-held indoor captures need extra care around furniture and other close objects");
         }
-        if (readableFrames >= 30 && readableFrames < 34) {
-            warnings.add("capture may be solvable, but completing all 34 targets improves OpenCV matching and GPano confidence");
+        if (readableFrames >= 30 && !targetCoverage.complete()) {
+            warnings.add("capture may be solvable, but completing all FOV-derived targets improves OpenCV matching and GPano confidence");
         }
         return new DraftQualityReport(
                 blockers.isEmpty(),
@@ -1531,7 +1541,8 @@ final class SpherifyLibrary {
                         captureProfile,
                         exposure,
                         now);
-                session.status = session.countFrames(CaptureFrameRole.ACCEPTED) >= 34
+                int expectedTargets = CaptureTargetPlanner.expectedTargetCountForAcceptedFrames(session.frames);
+                session.status = expectedTargets > 0 && session.countFrames(CaptureFrameRole.ACCEPTED) >= expectedTargets
                         ? SessionStatus.CAPTURE_COMPLETE
                         : SessionStatus.CAPTURING;
             } else {
@@ -2307,7 +2318,7 @@ final class SpherifyLibrary {
      * JPEG thumbnail, recycle temporary bitmaps, and return the thumbnail File.
      */
     private File makeThumbnail(File imageFile, String id) throws IOException {
-        Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath());
+        Bitmap bitmap = decodeThumbnailSource(imageFile);
         if (bitmap == null) {
             throw new IOException("could not decode image for thumbnail");
         }
@@ -2323,6 +2334,24 @@ final class SpherifyLibrary {
             bitmap.recycle();
         }
         return thumbnailFile;
+    }
+
+    private static Bitmap decodeThumbnailSource(File imageFile) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return null;
+        }
+        int sample = 1;
+        int target = THUMBNAIL_SIZE * 2;
+        while (bounds.outWidth / sample > target || bounds.outHeight / sample > target) {
+            sample *= 2;
+        }
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = sample;
+        decode.inPreferredConfig = Bitmap.Config.RGB_565;
+        return BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
     }
 
     private static float clamp01(float value) {

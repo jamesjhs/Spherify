@@ -1044,6 +1044,24 @@ public class MainActivity extends Activity {
         return bitmap == null ? null : SpherifyLibrary.applyExifRotation(bitmap, imageFile.getAbsolutePath());
     }
 
+    private static Bitmap decodeProjectionBitmap(File imageFile) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return null;
+        }
+        int sample = 1;
+        while ((bounds.outWidth / sample) > 4096 || (bounds.outHeight / sample) > 4096) {
+            sample *= 2;
+        }
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = sample;
+        decode.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap bitmap = BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+        return bitmap == null ? null : SpherifyLibrary.applyExifRotation(bitmap, imageFile.getAbsolutePath());
+    }
+
     /*
      * Function: importFromPhotos
      * Arguments: none.
@@ -1579,10 +1597,7 @@ public class MainActivity extends Activity {
             statusText.setText(item.title + "  |  Loading\u2026");
         }
         new Thread(() -> {
-            Bitmap bmp = BitmapFactory.decodeFile(item.imagePath);
-            if (bmp != null) {
-                bmp = SpherifyLibrary.applyExifRotation(bmp, item.imagePath);
-            }
+            Bitmap bmp = decodeProjectionBitmap(item.imageFile());
             final Bitmap finalBitmap = bmp;
             runOnUiThread(() -> {
                 if (isFinishing()) {
