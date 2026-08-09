@@ -61,6 +61,8 @@ import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -78,6 +80,8 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -85,6 +89,7 @@ import android.widget.Toast;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -108,6 +113,16 @@ public class MainActivity extends Activity {
     private Button modeButton;
     private Button adjustButton;
     private Button exportButton;
+    private FrameLayout appRoot;
+    private View launchSplashOverlay;
+    private ProgressBar launchProgressBar;
+    private ScrollView launchDebugScroll;
+    private TextView launchLoadingText;
+    private TextView launchDebugText;
+    private final StringBuilder launchDebugLog = new StringBuilder();
+    private int launchLoadingTick;
+    private boolean launchSetupPending;
+    private boolean launchSplashFinished;
     private AlertDialog activeLibraryDialog;
     private boolean startCaptureAfterCameraPermission;
     private boolean continueSetupAfterLocationPermission;
@@ -129,19 +144,33 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        appRoot = new FrameLayout(this);
+        appRoot.setBackgroundColor(0xFF071018);
+        setContentView(appRoot);
+        showLaunchSplash(appRoot);
+        appendLaunchDebug("Starting Spherify", 4);
+        appRoot.post(() -> initializeHomeUi(savedInstanceState));
+    }
+
+    private void initializeHomeUi(Bundle savedInstanceState) {
+        launchSetupPending = true;
         try {
+            appendLaunchDebug("Opening local library", 12);
             library = new SpherifyLibrary(this);
+            appendLaunchDebug("Checking bundled sample image", 22);
             try (InputStream input = getAssets().open("tinyplanet.jpg")) {
                 library.ensureBundledMaster(input);
             }
+            appendLaunchDebug("Reading image catalogue", 34);
             List<LibraryItem> items = library.list(LibraryItem.FILTER_ALL);
             currentItem = restoreCurrentItem(items, savedInstanceState);
         } catch (IOException e) {
+            appendLaunchDebug("Library startup failed: " + e.getMessage(), 100);
             throw new IllegalStateException("could not initialize Spherify library", e);
         }
 
+        appendLaunchDebug("Preparing projection renderer", 48);
         projectionView = new GLProjectionView(this);
-        loadCurrentItem(savedInstanceState);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -162,7 +191,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
         TextView version = new TextView(this);
-        version.setText("0.4.2");
+        version.setText("0.5.3");
         version.setTextColor(0x8894A3B8);
         version.setTextSize(12);
         version.setGravity(Gravity.CENTER_VERTICAL);
@@ -262,9 +291,154 @@ public class MainActivity extends Activity {
             return insets;
         });
 
-        setContentView(root);
+        appRoot.addView(root, 0, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
         root.requestApplyInsets();
         updateLabels();
+        appendLaunchDebug("Home controls ready", 62);
+        loadCurrentItem(savedInstanceState);
+    }
+
+    private void showLaunchSplash(FrameLayout parent) {
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(0xF2071018);
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+        panel.setPadding(dp(22), dp(20), dp(22), dp(18));
+
+        GradientDrawable panelBackground = new GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xFF0B1721, 0xFF10211E});
+        panelBackground.setStroke(dp(1), 0x664FD1C5);
+        panelBackground.setCornerRadius(dp(8));
+        panel.setBackground(panelBackground);
+
+        TextView brand = new TextView(this);
+        brand.setText("Spherify");
+        brand.setTextColor(0xFFF8FAFC);
+        brand.setTextSize(28);
+        brand.setGravity(Gravity.CENTER);
+        panel.addView(brand, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        launchLoadingText = new TextView(this);
+        launchLoadingText.setText("loading...");
+        launchLoadingText.setTextColor(0xFF5EEAD4);
+        launchLoadingText.setTextSize(14);
+        launchLoadingText.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams loadingParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        loadingParams.setMargins(0, dp(4), 0, dp(14));
+        panel.addView(launchLoadingText, loadingParams);
+
+        launchProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        launchProgressBar.setIndeterminate(false);
+        launchProgressBar.setMax(100);
+        launchProgressBar.setProgress(0);
+        launchProgressBar.setContentDescription("App launch progress");
+        panel.addView(launchProgressBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(8)));
+
+        launchDebugText = new TextView(this);
+        launchDebugText.setTextColor(0xFFD1FAE5);
+        launchDebugText.setTextSize(11);
+        launchDebugText.setTypeface(Typeface.MONOSPACE);
+        launchDebugText.setPadding(dp(10), dp(8), dp(10), dp(8));
+        launchDebugText.setLineSpacing(0f, 1.05f);
+
+        GradientDrawable debugBackground = new GradientDrawable();
+        debugBackground.setColor(0xCC020617);
+        debugBackground.setStroke(dp(1), 0x334FD1C5);
+        debugBackground.setCornerRadius(dp(6));
+        launchDebugText.setBackground(debugBackground);
+
+        launchDebugScroll = new ScrollView(this);
+        launchDebugScroll.setFillViewport(false);
+        launchDebugScroll.addView(launchDebugText, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams debugParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(116));
+        debugParams.setMargins(0, dp(14), 0, 0);
+        panel.addView(launchDebugScroll, debugParams);
+
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        panelParams.setMargins(dp(22), 0, dp(22), 0);
+        overlay.addView(panel, panelParams);
+
+        launchSplashOverlay = overlay;
+        parent.addView(overlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        animateLaunchLoadingText();
+    }
+
+    private void animateLaunchLoadingText() {
+        if (launchSplashFinished || launchLoadingText == null) {
+            return;
+        }
+        int dotCount = launchLoadingTick % 4;
+        String dots = dotCount == 0 ? "" : dotCount == 1 ? "." : dotCount == 2 ? ".." : "...";
+        launchLoadingText.setText("loading" + dots);
+        launchLoadingTick++;
+        launchLoadingText.postDelayed(this::animateLaunchLoadingText, 280L);
+    }
+
+    private void appendLaunchDebug(String message, int progress) {
+        if (launchSplashFinished || launchDebugText == null) {
+            return;
+        }
+        int boundedProgress = Math.max(0, Math.min(100, progress));
+        if (launchProgressBar != null) {
+            launchProgressBar.setProgress(boundedProgress);
+        }
+        launchDebugLog.append(String.format(Locale.US, "%03d%%  %s\n", boundedProgress, message));
+        launchDebugText.setText(launchDebugLog.toString());
+        if (launchDebugScroll != null) {
+            launchDebugScroll.post(() -> launchDebugScroll.fullScroll(View.FOCUS_DOWN));
+        }
+    }
+
+    private void finishLaunchSplash(String message) {
+        if (launchSplashFinished) {
+            maybeShowSetupFlowAfterLaunch();
+            return;
+        }
+        appendLaunchDebug(message, 100);
+        launchSplashFinished = true;
+        if (launchSplashOverlay == null) {
+            maybeShowSetupFlowAfterLaunch();
+            return;
+        }
+        launchSplashOverlay.animate()
+                .alpha(0f)
+                .setStartDelay(250L)
+                .setDuration(220L)
+                .withEndAction(() -> {
+                    if (appRoot != null && launchSplashOverlay != null) {
+                        appRoot.removeView(launchSplashOverlay);
+                    }
+                    launchSplashOverlay = null;
+                    maybeShowSetupFlowAfterLaunch();
+                })
+                .start();
+    }
+
+    private void maybeShowSetupFlowAfterLaunch() {
+        if (!launchSetupPending) {
+            return;
+        }
+        launchSetupPending = false;
         showSetupFlowIfNeeded();
     }
 
@@ -331,7 +505,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        projectionView.onPause();
+        if (projectionView != null) {
+            projectionView.onPause();
+        }
     }
 
     /*
@@ -343,7 +519,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        projectionView.onResume();
+        if (projectionView != null) {
+            projectionView.onResume();
+        }
         refreshLibraryAfterCapture();
     }
 
@@ -651,20 +829,34 @@ public class MainActivity extends Activity {
             return;
         }
         boolean canExportFullSphere = currentItem != null && "sphere".equals(currentItem.projection);
-        String[] labels = canExportFullSphere
-                ? new String[]{"Share rendered view", "Save rendered view", "Share full PhotoSphere", "Save full PhotoSphere"}
-                : new String[]{"Share rendered view", "Save rendered view"};
+        boolean canExportReprojectedPhotoSphere = currentItem != null && "tinyplanet".equals(currentItem.projection);
+        ArrayList<String> labels = new ArrayList<>();
+        labels.add("Share rendered view");
+        labels.add("Save rendered view");
+        if (canExportFullSphere) {
+            labels.add("Share full PhotoSphere");
+            labels.add("Save full PhotoSphere");
+        }
+        if (canExportReprojectedPhotoSphere) {
+            labels.add("Share reprojected PhotoSphere");
+            labels.add("Save reprojected PhotoSphere");
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Export")
-                .setItems(labels, (dialog, which) -> {
-                    if (which == 0) {
+                .setItems(labels.toArray(new String[0]), (dialog, which) -> {
+                    String choice = labels.get(which);
+                    if ("Share rendered view".equals(choice)) {
                         shareCurrentExport();
-                    } else if (which == 1) {
+                    } else if ("Save rendered view".equals(choice)) {
                         saveCurrentExport();
-                    } else if (which == 2) {
+                    } else if ("Share full PhotoSphere".equals(choice)) {
                         shareFullResolutionPhotoSphere();
-                    } else {
+                    } else if ("Save full PhotoSphere".equals(choice)) {
                         saveFullResolutionPhotoSphere();
+                    } else if ("Share reprojected PhotoSphere".equals(choice)) {
+                        shareReprojectedPhotoSphere();
+                    } else {
+                        saveReprojectedPhotoSphere();
                     }
                 })
                 .show();
@@ -880,6 +1072,41 @@ public class MainActivity extends Activity {
     }
 
     /*
+     * Function: saveReprojectedPhotoSphere
+     * Arguments: none.
+     * Calls: projectionView.exportReprojectedPhotoSphere() on a background
+     * thread, library.saveVariant(), openFlatViewer(), and Toast.
+     * Flow: render the currently manipulated Tiny Planet source as a 2:1
+     * PhotoSphere, persist it as a sphere variant, and open the saved result.
+     */
+    private void saveReprojectedPhotoSphere() {
+        final LibraryItem sourceItem = currentItem;
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                ProjectionExport export = projectionView.exportReprojectedPhotoSphere();
+                LibraryItem saved = library.saveVariant(sourceItem, export, "sphere");
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    currentItem = saved;
+                    Toast.makeText(
+                            MainActivity.this,
+                            "Saved reprojected PhotoSphere",
+                            Toast.LENGTH_LONG).show();
+                    openFlatViewer(currentItem);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Reproject export failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /*
      * Function: shareCurrentExport
      * Arguments: none.
      * Calls: projectionView.exportProjection() on a background thread, shareFile(), and Toast.
@@ -905,6 +1132,34 @@ public class MainActivity extends Activity {
                     if (isFinishing()) return;
                     setExportControlsEnabled(true);
                     Toast.makeText(MainActivity.this, "Share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        }).start();
+    }
+
+    /*
+     * Function: shareReprojectedPhotoSphere
+     * Arguments: none.
+     * Calls: projectionView.exportReprojectedPhotoSphere() on a background
+     * thread, shareFile(), and Toast.
+     * Flow: render a 2:1 PhotoSphere from the current Tiny Planet manipulation
+     * state and send the generated file to Android's share sheet.
+     */
+    private void shareReprojectedPhotoSphere() {
+        setExportControlsEnabled(false);
+        new Thread(() -> {
+            try {
+                ProjectionExport export = projectionView.exportReprojectedPhotoSphere();
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    shareFile(export.imageFile);
+                });
+            } catch (IOException e) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    setExportControlsEnabled(true);
+                    Toast.makeText(MainActivity.this, "Reproject share failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         }).start();
@@ -1017,6 +1272,9 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Save", (dialog, which) -> {
                     try {
                         library.updateTinyPlanetCenter(item, picker.getCenterX(), picker.getCenterY());
+                        if (projectionView != null && currentItem != null && currentItem.id.equals(item.id)) {
+                            projectionView.setSourceCenter(item.tinyPlanetCenterX, item.tinyPlanetCenterY);
+                        }
                         Toast.makeText(this, "Tiny Planet center saved", Toast.LENGTH_SHORT).show();
                     } catch (IOException e) {
                         Toast.makeText(this, "Center save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
@@ -1582,17 +1840,22 @@ public class MainActivity extends Activity {
      */
     private void loadCurrentItem(Bundle savedProjectionState) {
         if (currentItem == null) {
+            appendLaunchDebug("No library image selected", 100);
+            finishLaunchSplash("Ready");
             updateLabels();
             Toast.makeText(this, "The local library is empty", Toast.LENGTH_SHORT).show();
             return;
         }
         if ("flat".equals(currentItem.projection)) {
+            appendLaunchDebug("Opening flat image viewer", 100);
+            finishLaunchSplash("Ready");
             updateLabels();
             openFlatViewer(currentItem);
             return;
         }
         final LibraryItem item = currentItem;
         final Bundle projectionState = savedProjectionState;
+        appendLaunchDebug("Decoding " + item.title, 72);
         if (statusText != null) {
             statusText.setText(item.title + "  |  Loading\u2026");
         }
@@ -1605,13 +1868,22 @@ public class MainActivity extends Activity {
                     return;
                 }
                 if (finalBitmap == null) {
+                    appendLaunchDebug("Image decode failed", 100);
+                    finishLaunchSplash("Ready with image warning");
                     Toast.makeText(MainActivity.this, "Could not load " + item.title, Toast.LENGTH_LONG).show();
                     return;
                 }
+                appendLaunchDebug("Uploading panorama texture", 88);
                 projectionView.setMode("tinyplanet".equals(item.projection)
                         ? GLProjectionView.Mode.TINY_PLANET
                         : GLProjectionView.Mode.SPHERE);
-                projectionView.setPanorama(finalBitmap, item.projection);
+                boolean mirrorImportedPhotoSphere = "sphere".equals(item.projection) && "import".equals(item.source);
+                projectionView.setPanorama(
+                        finalBitmap,
+                        item.projection,
+                        item.tinyPlanetCenterX,
+                        item.tinyPlanetCenterY,
+                        mirrorImportedPhotoSphere);
                 if (projectionState == null) {
                     projectionView.resetView();
                 } else {
@@ -1620,6 +1892,7 @@ public class MainActivity extends Activity {
                 if (modeButton != null) {
                     updateLabels();
                 }
+                finishLaunchSplash("Ready");
             });
         }).start();
     }
@@ -1678,6 +1951,9 @@ public class MainActivity extends Activity {
         private final RectF imageRect = new RectF();
         private float centerX;
         private float centerY;
+        private float lastDragX;
+        private float lastDragY;
+        private boolean draggingCenter;
 
         CenterPickerView(Context context, Bitmap bitmap, float centerX, float centerY) {
             super(context);
@@ -1730,16 +2006,38 @@ public class MainActivity extends Activity {
 
         @Override
         public boolean onTouchEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN
-                    || event.getActionMasked() == MotionEvent.ACTION_MOVE
-                    || event.getActionMasked() == MotionEvent.ACTION_UP) {
-                computeImageRect();
-                centerX = clamp01((event.getX() - imageRect.left) / Math.max(1f, imageRect.width()));
-                centerY = clamp01((event.getY() - imageRect.top) / Math.max(1f, imageRect.height()));
-                invalidate();
-                return true;
+            computeImageRect();
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    draggingCenter = imageRect.contains(event.getX(), event.getY());
+                    lastDragX = event.getX();
+                    lastDragY = event.getY();
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if (draggingCenter) {
+                        applyCenterDragDelta(event.getX() - lastDragX, event.getY() - lastDragY);
+                    }
+                    lastDragX = event.getX();
+                    lastDragY = event.getY();
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    if (draggingCenter) {
+                        applyCenterDragDelta(event.getX() - lastDragX, event.getY() - lastDragY);
+                    }
+                    draggingCenter = false;
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    draggingCenter = false;
+                    return true;
+                default:
+                    return true;
             }
-            return true;
+        }
+
+        private void applyCenterDragDelta(float dx, float dy) {
+            centerX = clamp01(centerX + dx / Math.max(1f, imageRect.width()));
+            centerY = clamp01(centerY + dy / Math.max(1f, imageRect.height()));
+            invalidate();
         }
 
         private void computeImageRect() {

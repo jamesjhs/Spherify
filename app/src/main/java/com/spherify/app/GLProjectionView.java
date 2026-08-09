@@ -34,6 +34,10 @@
  * panorama/panoramaPixels/panoramaWidth/panoramaHeight: source image data used
  * by GPU preview and CPU export.
  * sourceTinyPlanet: true when the input is already a tiny-planet-like square.
+ * mirrorEquirectSourceHorizontally: true for imported PhotoSphere sources that
+ * need longitude handedness corrected before projection.
+ * sourceCenterX/sourceCenterY: user-selected center for tiny-planet sources.
+ * sourceRadius: usable normalized tiny-planet radius around the selected center.
  * mode: current output projection, SPHERE or TINY_PLANET.
  * centerYaw/centerPitch/centerRoll: accumulated recentering offsets.
  * yaw/pitch/roll/horizonOffset/cameraDistance/zoom: live interaction and
@@ -72,12 +76,15 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     private static final int EXPORT_SIZE = 1600;
+    private static final int PHOTOSPHERE_EXPORT_WIDTH = 3200;
+    private static final int PHOTOSPHERE_EXPORT_HEIGHT = 1600;
     private static final int THUMBNAIL_SIZE = 320;
     private static final float PHOTOSPHERE_BASE_ROLL_DEGREES = 180f;
     private static final float BASE_FIELD_OF_VIEW_DEGREES = 92f;
     private static final float MIN_CAMERA_DISTANCE = 0.35f;
     private static final float MAX_CAMERA_DISTANCE = 2.5f;
     private static final float MAX_VIEW_PITCH_DEGREES = 89f;
+    private static final float MAX_TINY_PLANET_PITCH_DEGREES = 180f;
 
     private final ProjectionRenderer renderer;
     private final ScaleGestureDetector scaleDetector;
@@ -86,6 +93,10 @@ public class GLProjectionView extends GLSurfaceView {
     private int panoramaWidth;
     private int panoramaHeight;
     private boolean sourceTinyPlanet;
+    private boolean mirrorEquirectSourceHorizontally;
+    private float sourceCenterX = 0.5f;
+    private float sourceCenterY = 0.5f;
+    private float sourceRadius = 0.5f;
     private Mode mode = Mode.SPHERE;
     private float centerYaw;
     private float centerPitch;
@@ -158,11 +169,48 @@ public class GLProjectionView extends GLSurfaceView {
      * orientation state, queue texture upload on the GL thread, and redraw.
      */
     public void setPanorama(Bitmap panorama, String sourceProjection) {
+        setPanorama(panorama, sourceProjection, 0.5f, 0.5f, false);
+    }
+
+    /*
+     * Function: setPanorama
+     * Arguments: panorama is the source bitmap; sourceProjection describes how
+     * the app should interpret it; sourceCenterX/sourceCenterY identify the
+     * user-selected center for imported tiny-planet sources.
+     * Calls: isSquareish(), setSourceCenter(), queueEvent(),
+     * renderer.setPanorama(), and pushStateToRenderer().
+     * Flow: store dimensions and source-center metadata, infer source
+     * projection, reset orientation state, queue texture upload on the GL
+     * thread, and redraw.
+     */
+    public void setPanorama(Bitmap panorama, String sourceProjection, float sourceCenterX, float sourceCenterY) {
+        setPanorama(panorama, sourceProjection, sourceCenterX, sourceCenterY, false);
+    }
+
+    /*
+     * Function: setPanorama
+     * Arguments: panorama is the source bitmap; sourceProjection describes how
+     * the app should interpret it; sourceCenterX/sourceCenterY identify the
+     * user-selected center for imported tiny-planet sources;
+     * mirrorEquirectSourceHorizontally corrects imported PhotoSphere handedness.
+     * Calls: isSquareish(), setSourceCenter(), queueEvent(),
+     * renderer.setPanorama(), and pushStateToRenderer().
+     * Flow: store dimensions and source metadata, infer source projection, reset
+     * orientation state, queue texture upload on the GL thread, and redraw.
+     */
+    public void setPanorama(
+            Bitmap panorama,
+            String sourceProjection,
+            float sourceCenterX,
+            float sourceCenterY,
+            boolean mirrorEquirectSourceHorizontally) {
         Bitmap previous = this.panorama;
         this.panorama = panorama;
         panoramaWidth = panorama.getWidth();
         panoramaHeight = panorama.getHeight();
         sourceTinyPlanet = "tinyplanet".equals(sourceProjection) || isSquareish(panoramaWidth, panoramaHeight);
+        this.mirrorEquirectSourceHorizontally = mirrorEquirectSourceHorizontally && !sourceTinyPlanet;
+        setSourceCenter(sourceCenterX, sourceCenterY);
         panoramaPixels = new int[0];
         centerYaw = 0f;
         centerPitch = 0f;
@@ -173,13 +221,40 @@ public class GLProjectionView extends GLSurfaceView {
         horizonOffset = 0f;
         cameraDistance = 1f;
         boolean currentSourceTinyPlanet = sourceTinyPlanet;
+        boolean currentMirrorEquirectSourceHorizontally = this.mirrorEquirectSourceHorizontally;
+        float currentSourceCenterX = this.sourceCenterX;
+        float currentSourceCenterY = this.sourceCenterY;
         queueEvent(() -> {
-            renderer.setPanorama(panorama, currentSourceTinyPlanet);
+            renderer.setPanorama(
+                    panorama,
+                    currentSourceTinyPlanet,
+                    currentMirrorEquirectSourceHorizontally,
+                    currentSourceCenterX,
+                    currentSourceCenterY);
             if (previous != null && previous != panorama && !previous.isRecycled()) {
                 previous.recycle();
             }
         });
         pushStateToRenderer();
+    }
+
+    /*
+     * Function: setSourceCenter
+     * Arguments: centerX/centerY are normalized source image coordinates.
+     * Calls: clamp01(), queueEvent(), renderer.setSourceCenter(), and
+     * requestRender().
+     * Flow: update the center used when reversing an imported Tiny Planet into
+     * view directions without resetting the user's current viewport adjustments.
+     */
+    public void setSourceCenter(float centerX, float centerY) {
+        sourceCenterX = clamp01(centerX);
+        sourceCenterY = clamp01(centerY);
+        sourceRadius = tinyPlanetRadiusForCenter(sourceCenterX, sourceCenterY);
+        float currentSourceCenterX = sourceCenterX;
+        float currentSourceCenterY = sourceCenterY;
+        float currentSourceRadius = sourceRadius;
+        queueEvent(() -> renderer.setSourceCenter(currentSourceCenterX, currentSourceCenterY, currentSourceRadius));
+        requestRender();
     }
 
     @Override
@@ -247,14 +322,14 @@ public class GLProjectionView extends GLSurfaceView {
         centerYaw = savedState.getFloat(prefix + "centerYaw", 0f);
         centerPitch = clamp(
                 savedState.getFloat(prefix + "centerPitch", 0f),
-                -MAX_VIEW_PITCH_DEGREES,
-                MAX_VIEW_PITCH_DEGREES);
+                -getMaximumPitchDegrees(),
+                getMaximumPitchDegrees());
         centerRoll = savedState.getFloat(prefix + "centerRoll", 0f);
         yaw = savedState.getFloat(prefix + "yaw", 0f);
         pitch = clamp(
                 savedState.getFloat(prefix + "pitch", 0f),
-                -MAX_VIEW_PITCH_DEGREES,
-                MAX_VIEW_PITCH_DEGREES);
+                -getMaximumPitchDegrees(),
+                getMaximumPitchDegrees());
         roll = savedState.getFloat(prefix + "roll", 0f);
         horizonOffset = savedState.getFloat(prefix + "horizonOffset", 0f);
         cameraDistance = clamp(
@@ -312,7 +387,8 @@ public class GLProjectionView extends GLSurfaceView {
      */
     public void recentre() {
         centerYaw = normalizeDegrees(centerYaw + yaw);
-        centerPitch = clamp(centerPitch + pitch, -MAX_VIEW_PITCH_DEGREES, MAX_VIEW_PITCH_DEGREES);
+        float maximumPitch = getMaximumPitchDegrees();
+        centerPitch = clamp(centerPitch + pitch, -maximumPitch, maximumPitch);
         centerRoll = normalizeDegrees(centerRoll + roll);
         yaw = 0f;
         pitch = 0f;
@@ -414,6 +490,31 @@ public class GLProjectionView extends GLSurfaceView {
      */
     public ProjectionExport exportProjection() throws IOException {
         Bitmap image = renderProjectionOnCpu(EXPORT_SIZE, EXPORT_SIZE);
+        String prefix = mode == Mode.SPHERE ? "photosphere" : "tinyplanet";
+        return writeProjectionExport(image, prefix);
+    }
+
+    /*
+     * Function: exportReprojectedPhotoSphere
+     * Arguments: none.
+     * Calls: renderReprojectedPhotoSphereOnCpu() and writeProjectionExport().
+     * Flow: convert the active source into a full 2:1 equirectangular
+     * PhotoSphere using the current source center and adjustment state.
+     */
+    public ProjectionExport exportReprojectedPhotoSphere() throws IOException {
+        Bitmap image = renderReprojectedPhotoSphereOnCpu(PHOTOSPHERE_EXPORT_WIDTH, PHOTOSPHERE_EXPORT_HEIGHT);
+        return writeProjectionExport(image, "photosphere");
+    }
+
+    /*
+     * Function: writeProjectionExport
+     * Arguments: image is the rendered export; prefix names the output files.
+     * Calls: Bitmap.createScaledBitmap(), getExternalFilesDir(), writeBitmap(),
+     * and ProjectionExport constructor.
+     * Flow: create a thumbnail, write both temporary files, recycle temporary
+     * bitmaps, and return their File handles.
+     */
+    private ProjectionExport writeProjectionExport(Bitmap image, String prefix) throws IOException {
         Bitmap thumbnail = Bitmap.createScaledBitmap(image, THUMBNAIL_SIZE, THUMBNAIL_SIZE, true);
 
         File directory = new File(
@@ -424,7 +525,6 @@ public class GLProjectionView extends GLSurfaceView {
         }
 
         String stamp = new SimpleDateFormat("yyMMddss-SSS", Locale.US).format(new Date());
-        String prefix = mode == Mode.SPHERE ? "photosphere" : "tinyplanet";
         File imageFile = new File(directory, prefix + "-" + stamp + ".png");
         File thumbnailFile = new File(directory, prefix + "-" + stamp + "-thumb.jpg");
 
@@ -546,23 +646,25 @@ public class GLProjectionView extends GLSurfaceView {
      * Arguments: dx/dy are screen-space movement deltas in pixels.
      * Calls: getWidth(), getHeight(), normalizeDegrees(), clamp(), and
      * pushStateToRenderer().
-     * Flow: translate touch movement into camera yaw/pitch changes; both
-     * projection modes clamp pitch to avoid flipping the viewport through a pole.
+     * Flow: translate touch movement into camera yaw/pitch changes; Photo Sphere
+     * clamps near the poles, while Tiny Planet allows a full 180 degrees of
+     * vertical travel in either direction from the neutral view.
      */
     private void applyDragDelta(float dx, float dy) {
         float verticalDragReference = Math.max(1f, Math.min(getWidth(), getHeight()));
+        float maximumPitch = getMaximumPitchDegrees();
         if (mode == Mode.SPHERE) {
             yaw = normalizeDegrees(yaw + dx / Math.max(1f, getWidth()) * 180f / zoom);
             pitch = clamp(
                     pitch - dy / verticalDragReference * 120f / zoom,
-                    -MAX_VIEW_PITCH_DEGREES,
-                    MAX_VIEW_PITCH_DEGREES);
+                    -maximumPitch,
+                    maximumPitch);
         } else {
             yaw = normalizeDegrees(yaw + dx / Math.max(1f, getWidth()) * 180f / zoom);
             pitch = clamp(
                     pitch - dy / verticalDragReference * 120f / zoom,
-                    -MAX_VIEW_PITCH_DEGREES,
-                    MAX_VIEW_PITCH_DEGREES);
+                    -maximumPitch,
+                    maximumPitch);
         }
         pushStateToRenderer();
     }
@@ -615,7 +717,7 @@ public class GLProjectionView extends GLSurfaceView {
         double cosRoll = Math.cos(rollRad);
         double sinRoll = Math.sin(rollRad);
         double aspect = width / (double) height;
-        boolean flipSourceVertically = mode == Mode.TINY_PLANET;
+        boolean flipPanoramaSourceVertically = mode == Mode.TINY_PLANET;
 
         for (int y = 0; y < height; y++) {
             double rowPosition = 2.0 * y / Math.max(1, height - 1);
@@ -626,8 +728,49 @@ public class GLProjectionView extends GLSurfaceView {
                         ? sampleSphere(nx, ny, yawRad, pitchRad, currentCameraDistance)
                         : sampleTinyPlanet(nx, ny, yawRad, pitchRad, cosRoll, sinRoll, currentCameraDistance);
                 pixels[y * width + x] = sourceTinyPlanet
-                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad, flipSourceVertically)
-                        : samplePanorama(sample.u, sample.v, horizonOffsetRad, flipSourceVertically);
+                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad)
+                        : samplePanorama(sample.u, sample.v, horizonOffsetRad, flipPanoramaSourceVertically);
+            }
+        }
+
+        output.setPixels(pixels, 0, width, 0, 0, width, height);
+        panoramaPixels = new int[0];
+        return output;
+    }
+
+    /*
+     * Function: renderReprojectedPhotoSphereOnCpu
+     * Arguments: width/height are the 2:1 equirectangular output dimensions.
+     * Calls: sampleTinyPlanetSource(), samplePanorama(), rotateDirection(), and
+     * Bitmap.setPixels().
+     * Flow: visit every output longitude/latitude, rotate it by the current
+     * viewport adjustment state, then sample the active source. Imported Tiny
+     * Planet sources use the user-selected center coordinates.
+     */
+    private Bitmap renderReprojectedPhotoSphereOnCpu(int width, int height) {
+        ensurePanoramaPixels();
+        Bitmap output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] pixels = new int[width * height];
+
+        double yawRad = Math.toRadians(getEffectiveYaw());
+        double pitchRad = Math.toRadians(getEffectivePitch());
+        double rollRad = Math.toRadians(getEffectiveRoll());
+        double horizonOffsetRad = Math.toRadians(horizonOffset);
+
+        for (int y = 0; y < height; y++) {
+            double v = y / (double) Math.max(1, height - 1);
+            double latitude = Math.PI * (0.5 - v);
+            double cosLatitude = Math.cos(latitude);
+            for (int x = 0; x < width; x++) {
+                double u = x / (double) Math.max(1, width - 1);
+                double longitude = (u - 0.5) * 2.0 * Math.PI;
+                double directionX = Math.sin(longitude) * cosLatitude;
+                double directionY = Math.sin(latitude);
+                double directionZ = Math.cos(longitude) * cosLatitude;
+                Sample sample = rotateDirection(directionX, directionY, directionZ, yawRad, pitchRad, rollRad);
+                pixels[y * width + x] = sourceTinyPlanet
+                        ? sampleTinyPlanetSource(sample.x, sample.y, sample.z, horizonOffsetRad)
+                        : samplePanorama(sample.u, sample.v, horizonOffsetRad, false);
             }
         }
 
@@ -723,6 +866,39 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     /*
+     * Function: rotateDirection
+     * Arguments: x/y/z are a unit direction; yawRad/pitchRad/rollRad are current
+     * adjustment rotations.
+     * Calls: Math trig helpers and directionToSample().
+     * Flow: apply roll, yaw, and pitch to an equirectangular output direction so
+     * reprojected PhotoSphere exports respect the current manipulation state.
+     */
+    private Sample rotateDirection(
+            double x,
+            double y,
+            double z,
+            double yawRad,
+            double pitchRad,
+            double rollRad) {
+        double cosRoll = Math.cos(rollRad);
+        double sinRoll = Math.sin(rollRad);
+        double rolledX = x * cosRoll - y * sinRoll;
+        double rolledY = x * sinRoll + y * cosRoll;
+
+        double cy = Math.cos(yawRad);
+        double syaw = Math.sin(yawRad);
+        double x1 = cy * rolledX + syaw * z;
+        double z1 = -syaw * rolledX + cy * z;
+
+        double cp = Math.cos(pitchRad);
+        double sp = Math.sin(pitchRad);
+        double y2 = cp * rolledY - sp * z1;
+        double z2 = sp * rolledY + cp * z1;
+
+        return directionToSample(x1, y2, z2);
+    }
+
+    /*
      * Function: directionToSample
      * Arguments: x/y/z are a normalized 3D direction vector.
      * Calls: Math.atan2(), Math.asin(), and clamp().
@@ -745,6 +921,9 @@ public class GLProjectionView extends GLSurfaceView {
      * Flow: map u/v into integer source pixels and return the panorama color.
      */
     private int samplePanorama(double u, double v, double horizonOffsetRad, boolean flipSourceVertically) {
+        if (mirrorEquirectSourceHorizontally) {
+            u = 1.0 - u;
+        }
         int sourceX = wrap((int) (u * panoramaWidth), panoramaWidth);
         v += horizonOffsetRad / Math.PI;
         if (flipSourceVertically) {
@@ -757,7 +936,7 @@ public class GLProjectionView extends GLSurfaceView {
     /*
      * Function: sampleTinyPlanetSource
      * Arguments: x/y/z are a direction vector; horizonOffsetRad adjusts polar
-     * sampling; flipSourceVertically controls vertical orientation.
+     * sampling.
      * Calls: Math.acos(), Math.tan(), Math.atan2(), clamp().
      * Flow: reverse-map a 3D direction into a square tiny-planet source image and
      * return the nearest source pixel.
@@ -766,16 +945,12 @@ public class GLProjectionView extends GLSurfaceView {
             double x,
             double y,
             double z,
-            double horizonOffsetRad,
-            boolean flipSourceVertically) {
+            double horizonOffsetRad) {
         double polar = clamp(Math.acos(clamp(y, -1.0, 1.0)) + horizonOffsetRad, 0.0, Math.PI - 0.001);
         double radius = Math.tan(polar * 0.5);
         double angle = Math.atan2(z, x);
-        double u = 0.5 + Math.cos(angle) * radius * 0.5;
-        double v = 0.5 + Math.sin(angle) * radius * 0.5;
-        if (flipSourceVertically) {
-            v = 1.0 - v;
-        }
+        double u = sourceCenterX + Math.cos(angle) * radius * sourceRadius;
+        double v = sourceCenterY - Math.sin(angle) * radius * sourceRadius;
         int sourceX = clamp((int) (u * panoramaWidth), 0, panoramaWidth - 1);
         int sourceY = clamp((int) (v * panoramaHeight), 0, panoramaHeight - 1);
         return panoramaPixels[sourceY * panoramaWidth + sourceX];
@@ -795,11 +970,23 @@ public class GLProjectionView extends GLSurfaceView {
      * Function: getEffectivePitch
      * Arguments: none.
      * Calls: clamp().
-     * Flow: combine recentered and live pitch, clamping near the poles so
-     * viewport manipulation cannot invert the projected geometry.
+     * Flow: combine recentered and live pitch, clamping to the active mode's
+     * vertical travel limit.
      */
     private float getEffectivePitch() {
-        return clamp(centerPitch + pitch, -MAX_VIEW_PITCH_DEGREES, MAX_VIEW_PITCH_DEGREES);
+        float maximumPitch = getMaximumPitchDegrees();
+        return clamp(centerPitch + pitch, -maximumPitch, maximumPitch);
+    }
+
+    /*
+     * Function: getMaximumPitchDegrees
+     * Arguments: none.
+     * Calls: no external functions.
+     * Flow: keep Photo Sphere pole handling unchanged while letting Tiny Planet
+     * pan fully up and down from the starting orientation.
+     */
+    private float getMaximumPitchDegrees() {
+        return mode == Mode.TINY_PLANET ? MAX_TINY_PLANET_PITCH_DEGREES : MAX_VIEW_PITCH_DEGREES;
     }
 
     /*
@@ -884,6 +1071,30 @@ public class GLProjectionView extends GLSurfaceView {
     }
 
     /*
+     * Function: clamp01
+     * Arguments: value is a normalized coordinate.
+     * Calls: clamp().
+     * Flow: keep source center coordinates inside the source image bounds.
+     */
+    private static float clamp01(float value) {
+        return clamp(value, 0f, 1f);
+    }
+
+    /*
+     * Function: tinyPlanetRadiusForCenter
+     * Arguments: centerX/centerY are normalized source coordinates.
+     * Calls: Math.min().
+     * Flow: derive the farthest useful circular tiny-planet sampling radius
+     * around the selected center. Nearer edges intentionally clamp when sampled
+     * past, creating edge-pixel repeat for non-symmetrical imported sources.
+     */
+    private static float tinyPlanetRadiusForCenter(float centerX, float centerY) {
+        float horizontalRadius = Math.max(centerX, 1f - centerX);
+        float verticalRadius = Math.max(centerY, 1f - centerY);
+        return Math.max(0.01f, Math.max(horizontalRadius, verticalRadius));
+    }
+
+    /*
      * Function: clamp(int)
      * Arguments: value is bounded between minimum and maximum.
      * Calls: Math.max() and Math.min().
@@ -962,6 +1173,9 @@ public class GLProjectionView extends GLSurfaceView {
                 "uniform float uAspect;\n" +
                 "uniform float uHorizonOffset;\n" +
                 "uniform int uSourceProjection;\n" +
+                "uniform vec2 uSourceCenter;\n" +
+                "uniform float uSourceRadius;\n" +
+                "uniform int uMirrorEquirectSource;\n" +
                 "const float PI = 3.14159265358979323846;\n" +
                 "vec3 rotateYawPitch(vec3 d) {\n" +
                 "  float cy = cos(uYaw);\n" +
@@ -985,12 +1199,14 @@ public class GLProjectionView extends GLSurfaceView {
                 "  float polar = clamp(acos(clamp(d.y, -1.0, 1.0)) + uHorizonOffset, 0.0, PI - 0.001);\n" +
                 "  float radius = tan(polar * 0.5);\n" +
                 "  float angle = atan(d.z, d.x);\n" +
-                "  vec2 uv = vec2(0.5 + cos(angle) * radius * 0.5, 0.5 + sin(angle) * radius * 0.5);\n" +
+                "  vec2 uv = uSourceCenter + vec2(cos(angle), -sin(angle)) * radius * uSourceRadius;\n" +
                 "  return clamp(uv, 0.0, 1.0);\n" +
                 "}\n" +
                 "vec4 sampleSource(vec3 d) {\n" +
                 "  vec2 uv = uSourceProjection == 1 ? tinyPlanetUv(d) : equirectUv(d);\n" +
-                "  return texture2D(uTexture, vec2(uv.x, 1.0 - uv.y));\n" +
+                "  if (uSourceProjection == 0 && uMirrorEquirectSource == 1) uv.x = 1.0 - uv.x;\n" +
+                "  vec2 textureUv = uSourceProjection == 1 ? uv : vec2(uv.x, 1.0 - uv.y);\n" +
+                "  return texture2D(uTexture, textureUv);\n" +
                 "}\n" +
                 "vec2 rollScreen(vec2 p) {\n" +
                 "  float cr = cos(uRoll);\n" +
@@ -1040,9 +1256,16 @@ public class GLProjectionView extends GLSurfaceView {
         private int aspectHandle;
         private int horizonOffsetHandle;
         private int sourceProjectionHandle;
+        private int sourceCenterHandle;
+        private int sourceRadiusHandle;
+        private int mirrorEquirectSourceHandle;
         private int viewportWidth = 1;
         private int viewportHeight = 1;
         private boolean sourceTinyPlanet;
+        private boolean mirrorEquirectSourceHorizontally;
+        private float sourceCenterX = 0.5f;
+        private float sourceCenterY = 0.5f;
+        private float sourceRadius = 0.5f;
         private Mode mode = Mode.SPHERE;
         private float yaw;
         private float pitch;
@@ -1070,12 +1293,25 @@ public class GLProjectionView extends GLSurfaceView {
          * Flow: save the bitmap for GL-thread texture upload and immediately
          * upload it if the surface has already been created.
          */
-        void setPanorama(Bitmap panorama, boolean sourceTinyPlanet) {
+        void setPanorama(
+                Bitmap panorama,
+                boolean sourceTinyPlanet,
+                boolean mirrorEquirectSourceHorizontally,
+                float sourceCenterX,
+                float sourceCenterY) {
             pendingPanorama = panorama;
             this.sourceTinyPlanet = sourceTinyPlanet;
+            this.mirrorEquirectSourceHorizontally = mirrorEquirectSourceHorizontally && !sourceTinyPlanet;
+            setSourceCenter(sourceCenterX, sourceCenterY, tinyPlanetRadiusForCenter(sourceCenterX, sourceCenterY));
             if (program != 0) {
                 uploadPendingPanorama();
             }
+        }
+
+        void setSourceCenter(float sourceCenterX, float sourceCenterY, float sourceRadius) {
+            this.sourceCenterX = sourceCenterX;
+            this.sourceCenterY = sourceCenterY;
+            this.sourceRadius = sourceRadius;
         }
 
         /*
@@ -1127,6 +1363,9 @@ public class GLProjectionView extends GLSurfaceView {
             aspectHandle = GLES20.glGetUniformLocation(program, "uAspect");
             horizonOffsetHandle = GLES20.glGetUniformLocation(program, "uHorizonOffset");
             sourceProjectionHandle = GLES20.glGetUniformLocation(program, "uSourceProjection");
+            sourceCenterHandle = GLES20.glGetUniformLocation(program, "uSourceCenter");
+            sourceRadiusHandle = GLES20.glGetUniformLocation(program, "uSourceRadius");
+            mirrorEquirectSourceHandle = GLES20.glGetUniformLocation(program, "uMirrorEquirectSource");
             uploadPendingPanorama();
         }
 
@@ -1171,6 +1410,9 @@ public class GLProjectionView extends GLSurfaceView {
             GLES20.glUniform1f(aspectHandle, viewportWidth / (float) viewportHeight);
             GLES20.glUniform1f(horizonOffsetHandle, (float) Math.toRadians(horizonOffset));
             GLES20.glUniform1i(sourceProjectionHandle, sourceTinyPlanet ? 1 : 0);
+            GLES20.glUniform2f(sourceCenterHandle, sourceCenterX, sourceCenterY);
+            GLES20.glUniform1f(sourceRadiusHandle, sourceRadius);
+            GLES20.glUniform1i(mirrorEquirectSourceHandle, mirrorEquirectSourceHorizontally ? 1 : 0);
 
             GLES20.glEnableVertexAttribArray(positionHandle);
             GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertices);

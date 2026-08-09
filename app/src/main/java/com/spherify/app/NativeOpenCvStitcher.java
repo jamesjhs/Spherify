@@ -20,11 +20,23 @@ final class NativeOpenCvStitcher {
         return AVAILABLE;
     }
 
-    static int stitchPanorama(String[] inputPaths, String outputPath) {
+    static int stitchPanorama(
+            String[] inputPaths,
+            int[] matchingMask,
+            double[] cameraIntrinsics,
+            double[] cameraRotations,
+            int[] cameraPriorAvailable,
+            String outputPath) {
         if (!AVAILABLE) {
             return -1000;
         }
-        return stitchPanoramaNative(inputPaths, outputPath);
+        return stitchPanoramaNative(
+                inputPaths,
+                matchingMask,
+                cameraIntrinsics,
+                cameraRotations,
+                cameraPriorAvailable,
+                outputPath);
     }
 
     private static boolean loadNativeLibrary() {
@@ -36,5 +48,11 @@ final class NativeOpenCvStitcher {
         }
     }
 
-    private static native int stitchPanoramaNative(String[] inputPaths, String outputPath);
+    private static native int stitchPanoramaNative(
+            String[] inputPaths,
+            int[] matchingMask,
+            double[] cameraIntrinsics,
+            double[] cameraRotations,
+            int[] cameraPriorAvailable,
+            String outputPath);
 }

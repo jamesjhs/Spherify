@@ -24,9 +24,11 @@ import java.util.List;
 final class CaptureTargetPlanner {
     private static final double DEFAULT_HORIZONTAL_FOV_DEGREES = 75.0;
     private static final double DEFAULT_VERTICAL_FOV_DEGREES = 60.0;
-    private static final double TARGET_OVERLAP = 0.40;
+    private static final double HORIZONTAL_TARGET_OVERLAP = 0.52;
+    private static final double VERTICAL_TARGET_OVERLAP = 0.40;
     private static final int MIN_STEP_DEGREES = 18;
-    private static final int MAX_STEP_DEGREES = 45;
+    private static final int MAX_HORIZONTAL_STEP_DEGREES = 36;
+    private static final int MAX_VERTICAL_STEP_DEGREES = 45;
 
     private CaptureTargetPlanner() {
     }
@@ -46,9 +48,9 @@ final class CaptureTargetPlanner {
             int anchorPitchDegrees,
             double horizontalFovDegrees,
             double verticalFovDegrees) {
-        int yawStep = captureStep(horizontalFovDegrees);
+        int yawStep = horizontalCaptureStep(horizontalFovDegrees);
         int columnCount = Math.max(8, (int) Math.ceil(360.0 / yawStep));
-        int row1 = roundToNearestFive(captureStep(verticalFovDegrees));
+        int row1 = roundToNearestFive(verticalCaptureStep(verticalFovDegrees));
         int row2 = Math.min(70, roundToNearestFive(row1 * 2));
         ArrayList<CaptureTarget> targets = new ArrayList<>();
         int anchorPitch = clampPitch(anchorPitchDegrees);
@@ -205,9 +207,18 @@ final class CaptureTargetPlanner {
         return Math.max(-85, Math.min(85, degrees));
     }
 
-    private static int captureStep(double fovDegrees) {
+    private static int horizontalCaptureStep(double fovDegrees) {
         double fov = Double.isFinite(fovDegrees) && fovDegrees > 0.0 ? fovDegrees : DEFAULT_HORIZONTAL_FOV_DEGREES;
-        return (int) Math.max(MIN_STEP_DEGREES, Math.min(MAX_STEP_DEGREES, Math.round(fov * (1.0 - TARGET_OVERLAP))));
+        return (int) Math.max(
+                MIN_STEP_DEGREES,
+                Math.min(MAX_HORIZONTAL_STEP_DEGREES, Math.round(fov * (1.0 - HORIZONTAL_TARGET_OVERLAP))));
+    }
+
+    private static int verticalCaptureStep(double fovDegrees) {
+        double fov = Double.isFinite(fovDegrees) && fovDegrees > 0.0 ? fovDegrees : DEFAULT_VERTICAL_FOV_DEGREES;
+        return (int) Math.max(
+                MIN_STEP_DEGREES,
+                Math.min(MAX_VERTICAL_STEP_DEGREES, Math.round(fov * (1.0 - VERTICAL_TARGET_OVERLAP))));
     }
 
     private static int roundToNearestFive(int degrees) {

@@ -50,7 +50,10 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.Rect;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
@@ -166,8 +169,10 @@ final class SpherifyLibrary {
      * Arguments: uri points to a user-selected image; projection records whether
      * the user treats it as sphere, tinyplanet, or flat.
      * Calls: ContentResolver.openInputStream(), copy(), BitmapFactory.decodeFile(),
-     * makeThumbnail(), LibraryItem constructor, and save().
-     * Flow: copy the selected image into masters, verify it decodes, generate a
+     * normalizeTinyPlanetImport(), makeThumbnail(), LibraryItem constructor, and
+     * save().
+     * Flow: copy the selected image into masters, normalize imported Tiny Planet
+     * images into square edge-extended sources, verify it decodes, generate a
      * thumbnail, create a master LibraryItem, append it to items, and persist.
      */
     LibraryItem importImage(Uri uri, String projection) throws IOException {
@@ -179,6 +184,10 @@ final class SpherifyLibrary {
                 throw new IOException("could not open selected image");
             }
             copy(input, imageFile);
+        }
+
+        if ("tinyplanet".equals(projection)) {
+            normalizeTinyPlanetImport(imageFile);
         }
 
         BitmapFactory.Options bounds = new BitmapFactory.Options();
@@ -462,10 +471,10 @@ final class SpherifyLibrary {
     String describeCaptureSessionDiagnostics(String sessionId) {
         CaptureSessionRecord session = findCaptureSession(sessionId);
         if (session == null) {
-            return "No 0.4.2 guided capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
+            return "No 0.5.3 guided capture-session record exists yet.\n\nThis is probably an older drafts.json compatibility session.";
         }
         StringBuilder message = new StringBuilder();
-        message.append("Format: 0.4.2 guided capture session")
+        message.append("Format: 0.5.3 guided capture session")
                 .append("\nSession: ").append(session.id)
                 .append("\nMode: ").append(session.captureMode.label)
                 .append("\nStatus: ").append(session.status.storageValue)
@@ -659,7 +668,7 @@ final class SpherifyLibrary {
         if (captureSessionItem == null) {
             CaptureSessionRecord session = findCaptureSession(sessionId);
             if (session == null) {
-                throw new IOException("Spherify 0.4.2 requires a validated guided capture graph; no capture-session record was found.");
+                throw new IOException("Spherify 0.5.3 requires a validated guided capture graph; no capture-session record was found.");
             }
             upsertCaptureSessionItem(session, firstExistingFrame(session));
             captureSessionItem = findDraftSessionItem(sessionId);
@@ -697,7 +706,7 @@ final class SpherifyLibrary {
         }
         CaptureSessionRecord captureSession = findCaptureSession(draftSession.id);
         if (captureSession == null) {
-            throw new IOException("Spherify 0.4.2 requires a validated guided capture graph; this older draft session has no graph record.");
+            throw new IOException("Spherify 0.5.3 requires a validated guided capture graph; this older draft session has no graph record.");
         }
         GraphReadinessReport graphReadiness = validateCaptureGraphReadiness(captureSession);
         if (!graphReadiness.pass) {
@@ -776,7 +785,7 @@ final class SpherifyLibrary {
                 acceptedFrames.add(frame);
                 acceptedFrameIds.add(frame.id);
                 acceptedFramesById.put(frame.id, frame);
-                if (!isLowTexturePoseOnly(frame)) {
+                if (!isPoseOnly(frame)) {
                     visualFrameIds.add(frame.id);
                 }
             }
@@ -784,9 +793,6 @@ final class SpherifyLibrary {
         ArrayList<String> blockers = new ArrayList<>();
         if (acceptedFrameIds.size() < 30) {
             blockers.add("graph needs at least 30 readable accepted guided frames; found " + acceptedFrameIds.size());
-        }
-        if (visualFrameIds.size() < 24) {
-            blockers.add("textured visual graph needs at least 24 OpenCV-checkable frames; found " + visualFrameIds.size());
         }
         CaptureTargetPlanner.TargetCoverage targetCoverage = CaptureTargetPlanner.coverageForAcceptedFrames(session.frames);
         if (targetCoverage.expectedTargets > 0 && !targetCoverage.complete()) {
@@ -822,22 +828,24 @@ final class SpherifyLibrary {
             }
         }
         for (CaptureFrameRecord frame : acceptedFrames) {
-            if (isLowTexturePoseOnly(frame) && nearbyVisualAnchorCount(frame, acceptedFramesById) < 2) {
-                blockers.add("low-detail frame " + frame.id + " is not bracketed by textured neighbors");
+            if (isPoseOnly(frame) && nearbyVisualAnchorCount(frame, acceptedFramesById) < 2) {
+                blockers.add("pose-only frame " + frame.id + " is not bracketed by textured neighbors");
                 break;
             }
         }
         return new GraphReadinessReport(blockers.isEmpty(), acceptedFrameIds.size(), session.graphEdges.size(), acceptedEdges, rejectedEdges, blockers);
     }
 
-    private static boolean isLowTexturePoseOnly(CaptureFrameRecord frame) {
-        return frame != null && "low_texture_pose_only".equals(frame.analysisFacts.validationCategory);
+    private static boolean isPoseOnly(CaptureFrameRecord frame) {
+        return frame != null
+                && ("low_texture_pose_only".equals(frame.analysisFacts.validationCategory)
+                || "pose_guided_overlap".equals(frame.analysisFacts.validationCategory));
     }
 
     private static int nearbyVisualAnchorCount(CaptureFrameRecord frame, HashMap<String, CaptureFrameRecord> acceptedFramesById) {
         int count = 0;
         for (CaptureFrameRecord candidate : acceptedFramesById.values()) {
-            if (candidate == frame || isLowTexturePoseOnly(candidate)) {
+            if (candidate == frame || isPoseOnly(candidate)) {
                 continue;
             }
             float yawDelta = Math.abs(signedHeadingDelta(
@@ -1162,7 +1170,7 @@ final class SpherifyLibrary {
 
         static GraphReadinessReport missingSession() {
             ArrayList<String> blockers = new ArrayList<>();
-            blockers.add("Spherify 0.4.2 requires a validated guided capture graph; no capture-session record was found");
+            blockers.add("Spherify 0.5.3 requires a validated guided capture graph; no capture-session record was found");
             return new GraphReadinessReport(false, 0, 0, 0, 0, blockers);
         }
 
@@ -1613,6 +1621,20 @@ final class SpherifyLibrary {
         intrinsics.put("principalPointYPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointYPixels", 0.0));
         intrinsics.put("width", exposure == null ? 0 : exposure.optInt("imageIntrinsicsWidth", 0));
         intrinsics.put("height", exposure == null ? 0 : exposure.optInt("imageIntrinsicsHeight", 0));
+        copyArrayIfPresent(exposure, intrinsics, "lensIntrinsicCalibration");
+        copyArrayIfPresent(exposure, intrinsics, "lensDistortion");
+        copyArrayIfPresent(exposure, intrinsics, "availableDistortionCorrectionModes");
+        if (exposure != null && exposure.has("distortionCorrectionMode")) {
+            intrinsics.put("distortionCorrectionMode", exposure.optInt("distortionCorrectionMode", -1));
+        }
+        if (exposure != null && exposure.has("manualLensUndistortionRequired")) {
+            intrinsics.put("manualLensUndistortionRequired", exposure.optBoolean("manualLensUndistortionRequired", false));
+        }
+        if (exposure != null && exposure.has("lensDistortionModel")) {
+            intrinsics.put("lensDistortionModel", exposure.optString("lensDistortionModel", ""));
+            intrinsics.put("preCorrectionActiveArrayWidth", exposure.optInt("preCorrectionActiveArrayWidth", 0));
+            intrinsics.put("preCorrectionActiveArrayHeight", exposure.optInt("preCorrectionActiveArrayHeight", 0));
+        }
 
         String frameId = "frame-" + friendlyDateLabel(now) + "-" + target.frames.size();
         CaptureRawFacts rawFacts = new CaptureRawFacts(
@@ -1696,6 +1718,20 @@ final class SpherifyLibrary {
         intrinsics.put("principalPointYPixels", exposure == null ? 0.0 : exposure.optDouble("imagePrincipalPointYPixels", 0.0));
         intrinsics.put("width", exposure == null ? 0 : exposure.optInt("imageIntrinsicsWidth", 0));
         intrinsics.put("height", exposure == null ? 0 : exposure.optInt("imageIntrinsicsHeight", 0));
+        copyArrayIfPresent(exposure, intrinsics, "lensIntrinsicCalibration");
+        copyArrayIfPresent(exposure, intrinsics, "lensDistortion");
+        copyArrayIfPresent(exposure, intrinsics, "availableDistortionCorrectionModes");
+        if (exposure != null && exposure.has("distortionCorrectionMode")) {
+            intrinsics.put("distortionCorrectionMode", exposure.optInt("distortionCorrectionMode", -1));
+        }
+        if (exposure != null && exposure.has("manualLensUndistortionRequired")) {
+            intrinsics.put("manualLensUndistortionRequired", exposure.optBoolean("manualLensUndistortionRequired", false));
+        }
+        if (exposure != null && exposure.has("lensDistortionModel")) {
+            intrinsics.put("lensDistortionModel", exposure.optString("lensDistortionModel", ""));
+            intrinsics.put("preCorrectionActiveArrayWidth", exposure.optInt("preCorrectionActiveArrayWidth", 0));
+            intrinsics.put("preCorrectionActiveArrayHeight", exposure.optInt("preCorrectionActiveArrayHeight", 0));
+        }
         return new CaptureRawFacts(
                 imageFile.getAbsolutePath(),
                 now,
@@ -1930,6 +1966,16 @@ final class SpherifyLibrary {
         return frame.rawFacts.capturedPoseAvailable
                 ? normalizeHeading(frame.rawFacts.capturedYawDegrees)
                 : normalizeHeading(frame.rawFacts.targetYawDegrees);
+    }
+
+    private static void copyArrayIfPresent(JSONObject source, JSONObject destination, String key) throws JSONException {
+        if (source == null || destination == null) {
+            return;
+        }
+        JSONArray array = source.optJSONArray(key);
+        if (array != null) {
+            destination.put(key, new JSONArray(array.toString()));
+        }
     }
 
     private static float idealHorizontalStepDegrees(CaptureFrameRecord frame) {
@@ -2352,6 +2398,81 @@ final class SpherifyLibrary {
         decode.inSampleSize = sample;
         decode.inPreferredConfig = Bitmap.Config.RGB_565;
         return BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+    }
+
+    /*
+     * Function: normalizeTinyPlanetImport
+     * Arguments: imageFile is the copied user-selected image.
+     * Calls: BitmapFactory.decodeFile(), applyExifRotation(),
+     * padTinyPlanetToSquare(), Bitmap.compress(), and FileOutputStream.
+     * Flow: rewrite imported Tiny Planet sources as square JPEGs. Rectangular
+     * images are center-placed in a square canvas and the exposed sides are
+     * filled by stretching the nearest edge pixel row or column.
+     */
+    private static void normalizeTinyPlanetImport(File imageFile) throws IOException {
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap decoded = BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+        if (decoded == null) {
+            throw new IOException("selected file is not a readable image");
+        }
+
+        Bitmap rotated = applyExifRotation(decoded, imageFile.getAbsolutePath());
+        Bitmap normalized = padTinyPlanetToSquare(rotated);
+        if (normalized == rotated && rotated == decoded && decoded.getWidth() == decoded.getHeight()) {
+            decoded.recycle();
+            return;
+        }
+
+        try (FileOutputStream output = new FileOutputStream(imageFile)) {
+            if (!normalized.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
+                throw new IOException("could not normalize Tiny Planet import");
+            }
+        } finally {
+            if (normalized != rotated) {
+                normalized.recycle();
+            }
+            if (rotated != decoded) {
+                rotated.recycle();
+            }
+            decoded.recycle();
+        }
+    }
+
+    /*
+     * Function: padTinyPlanetToSquare
+     * Arguments: bitmap is an imported Tiny Planet source.
+     * Calls: Bitmap.createBitmap(), Canvas.drawBitmap(), and Rect.
+     * Flow: preserve the original image pixels while extending the shorter axis
+     * with repeated edge rows or columns so tiny-planet conversion has a square
+     * working source.
+     */
+    private static Bitmap padTinyPlanetToSquare(Bitmap bitmap) {
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        if (width == height) {
+            return bitmap;
+        }
+
+        int side = Math.max(width, height);
+        Bitmap square = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(square);
+        Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
+
+        if (width > height) {
+            int top = (side - height) / 2;
+            int bottom = top + height;
+            canvas.drawBitmap(bitmap, new Rect(0, 0, width, 1), new Rect(0, 0, side, top), paint);
+            canvas.drawBitmap(bitmap, new Rect(0, height - 1, width, height), new Rect(0, bottom, side, side), paint);
+            canvas.drawBitmap(bitmap, 0f, top, paint);
+        } else {
+            int left = (side - width) / 2;
+            int right = left + width;
+            canvas.drawBitmap(bitmap, new Rect(0, 0, 1, height), new Rect(0, 0, left, side), paint);
+            canvas.drawBitmap(bitmap, new Rect(width - 1, 0, width, height), new Rect(right, 0, side, side), paint);
+            canvas.drawBitmap(bitmap, left, 0f, paint);
+        }
+        return square;
     }
 
     private static float clamp01(float value) {

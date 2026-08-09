@@ -112,9 +112,11 @@ public final class SharedCameraCaptureActivity extends Activity
     private static final float FRONTIER_TARGET_MAX_DEGREES = 52f;
     private static final float ACTIVE_TARGET_HYSTERESIS_DEGREES = 24f;
     private static final int MAX_VISIBLE_FRONTIER_TARGETS = 8;
-    private static final float MAX_TRANSLATION_FROM_ANCHOR_METERS = 0.12f;
+    private static final float MAX_TRANSLATION_FROM_ANCHOR_METERS = 0.08f;
     private static final long MIN_CAPTURE_INTERVAL_MS = 1100L;
     private static final long REQUIRED_ALIGNED_MS = 850L;
+    private static final long LOW_TEXTURE_INITIAL_POSE_STABLE_MS = 650L;
+    private static final float LOW_TEXTURE_INITIAL_POSE_STABLE_DEGREES = 2.5f;
     private static final long TEXTURE_HINT_INTERVAL_MS = 1200L;
     private static final int TEXTURE_HINT_GRID_COLUMNS = 5;
     private static final int TEXTURE_HINT_GRID_ROWS = 5;
@@ -169,6 +171,9 @@ public final class SharedCameraCaptureActivity extends Activity
     private int anchorPitchDegrees;
     private float[] anchorTranslationMeters;
     private long alignedSinceMs;
+    private long initialPoseStableSinceMs;
+    private float initialPoseStableYawDegrees;
+    private float initialPoseStablePitchDegrees;
     private long lastCaptureAtMs;
     private int cameraTextureId;
     private int viewportWidth;
@@ -572,6 +577,11 @@ public final class SharedCameraCaptureActivity extends Activity
             }
             previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             previewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            if (cameraFacts.supportsHighQualityDistortionCorrection()) {
+                previewRequestBuilder.set(
+                        CaptureRequest.DISTORTION_CORRECTION_MODE,
+                        CaptureRequest.DISTORTION_CORRECTION_MODE_HIGH_QUALITY);
+            }
             CameraCaptureSession.StateCallback wrapped =
                     sharedCamera.createARSessionStateCallback(cameraSessionCallback, cameraHandler);
             cameraDevice.createCaptureSession(surfaces, wrapped, cameraHandler);
@@ -673,7 +683,7 @@ public final class SharedCameraCaptureActivity extends Activity
         if (overlayView != null) {
             runOnUiThread(() -> {
                 overlayView.setTextureHint(hint);
-                if (!latestFrameState.ready && "Point at textured detail".equals(latestFrameState.blocker)) {
+                if (!latestFrameState.ready && "Scan detailed area to lock tracking".equals(latestFrameState.blocker)) {
                     refreshUi();
                 }
             });
@@ -694,6 +704,7 @@ public final class SharedCameraCaptureActivity extends Activity
                     neighbors,
                     exposure,
                     state.ready,
+                    target.yawDegrees,
                     target.pitchDegrees,
                     !captureAnchored,
                     state.ready);
@@ -750,6 +761,7 @@ public final class SharedCameraCaptureActivity extends Activity
                 rebuildAnchoredTargets(acceptedYaw, acceptedPitch);
             }
             markTargetAccepted(acceptedYaw, acceptedPitch);
+            addAdaptiveHorizontalTargetsForWeakOverlap(acceptedYaw, acceptedPitch, analysis);
             addCapturedReferenceFrame(imageFile, acceptedYaw, acceptedPitch, captureState);
             finishGuidanceActive = false;
             target.weak = false;
@@ -828,6 +840,18 @@ public final class SharedCameraCaptureActivity extends Activity
         json.put("sensorPhysicalHeightMm", cameraFacts.sensorHeightMm);
         json.put("cameraSensorOrientationDegrees", cameraFacts.sensorOrientationDegrees);
         json.put("cameraFrontFacing", cameraFacts.frontFacing);
+        json.put("preCorrectionActiveArrayWidth", cameraFacts.preCorrectionActiveArrayWidth);
+        json.put("preCorrectionActiveArrayHeight", cameraFacts.preCorrectionActiveArrayHeight);
+        putIntArrayIfPresent(json, "availableDistortionCorrectionModes", cameraFacts.availableDistortionCorrectionModes);
+        Integer distortionCorrectionMode = metadata.get(CaptureResult.DISTORTION_CORRECTION_MODE);
+        putIfPresent(json, "distortionCorrectionMode", distortionCorrectionMode);
+        json.put("manualLensUndistortionRequired", distortionCorrectionMode != null
+                && distortionCorrectionMode == CaptureResult.DISTORTION_CORRECTION_MODE_OFF);
+        putFloatArrayIfPresent(json, "lensIntrinsicCalibration", cameraFacts.lensIntrinsicCalibration);
+        putFloatArrayIfPresent(json, "lensDistortion", cameraFacts.lensDistortion);
+        if (cameraFacts.lensDistortion.length >= 5) {
+            json.put("lensDistortionModel", "android_brown_conrady_pre_correction_normalized");
+        }
         json.put("sensorToDisplayRotationDegrees", state.sensorToDisplayRotationDegrees);
         json.put("mirrorForDisplay", state.mirrorForDisplay);
         json.put("arCoreSelectedCpuImageWidth", selectedCpuImageSize.getWidth());
@@ -868,6 +892,28 @@ public final class SharedCameraCaptureActivity extends Activity
         if (value != null) {
             json.put(key, value);
         }
+    }
+
+    private static void putFloatArrayIfPresent(JSONObject json, String key, float[] values) throws JSONException {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        JSONArray array = new JSONArray();
+        for (float value : values) {
+            array.put(value);
+        }
+        json.put(key, array);
+    }
+
+    private static void putIntArrayIfPresent(JSONObject json, String key, int[] values) throws JSONException {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        JSONArray array = new JSONArray();
+        for (int value : values) {
+            array.put(value);
+        }
+        json.put(key, array);
     }
 
     private static JSONArray matrixJson(float[] matrix) throws JSONException {
@@ -935,6 +981,56 @@ public final class SharedCameraCaptureActivity extends Activity
                 return;
             }
         }
+    }
+
+    private void addAdaptiveHorizontalTargetsForWeakOverlap(
+            int acceptedYaw,
+            int acceptedPitch,
+            CandidateAnalysisResult analysis) {
+        if (analysis == null || (!"pose_guided_overlap".equals(analysis.validationCategory) && analysis.confidence >= 0.35)) {
+            return;
+        }
+        ArrayList<Integer> midpointYaws = new ArrayList<>();
+        for (CaptureTarget captured : targets) {
+            if (!captured.captured || captured.pitchDegrees != acceptedPitch || captured.yawDegrees == normalizeDegrees(acceptedYaw)) {
+                continue;
+            }
+            float delta = signedHeadingDelta(acceptedYaw, captured.yawDegrees);
+            float absDelta = Math.abs(delta);
+            if (absDelta < 26f || absDelta > 60f) {
+                continue;
+            }
+            int midpointYaw = normalizeDegrees(Math.round(captured.yawDegrees + delta * 0.5f));
+            if (!targetExists(midpointYaw, acceptedPitch) && !midpointYaws.contains(midpointYaw)) {
+                midpointYaws.add(midpointYaw);
+            }
+        }
+        for (Integer midpointYaw : midpointYaws) {
+            addTargetIfMissing(midpointYaw, acceptedPitch, CaptureTargetPhase.HORIZON, true);
+        }
+    }
+
+    private void addTargetIfMissing(int yawDegrees, int pitchDegrees, CaptureTargetPhase phase, boolean weak) {
+        int yaw = normalizeDegrees(yawDegrees);
+        for (CaptureTarget target : targets) {
+            if (target.yawDegrees == yaw && target.pitchDegrees == pitchDegrees) {
+                target.weak = target.weak || weak;
+                return;
+            }
+        }
+        CaptureTarget target = new CaptureTarget(yaw, pitchDegrees, phase);
+        target.weak = weak;
+        targets.add(target);
+    }
+
+    private boolean targetExists(int yawDegrees, int pitchDegrees) {
+        int yaw = normalizeDegrees(yawDegrees);
+        for (CaptureTarget target : targets) {
+            if (target.yawDegrees == yaw && target.pitchDegrees == pitchDegrees) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static int normalizeDegrees(int degrees) {
@@ -1031,6 +1127,10 @@ public final class SharedCameraCaptureActivity extends Activity
         if (!state.ready) {
             return state.blocker;
         }
+        if (!captureAnchored && state.featurePointCount < MIN_TRACKING_FEATURE_POINTS
+                && !initialPoseStableForLowTexture(state)) {
+            return "Hold steady to lock tracking";
+        }
         if (!isAligned(target, state)) {
             return "Move to target";
         }
@@ -1052,8 +1152,9 @@ public final class SharedCameraCaptureActivity extends Activity
         updateActiveTarget();
         CaptureTarget target = activeTarget();
         ArFrameState state = latestFrameState;
+        String blocker = target == null ? "" : captureBlocker(target, state);
         boolean canCapture = target != null
-                && captureBlocker(target, state).isEmpty()
+                && blocker.isEmpty()
                 && !captureInProgress
                 && !completionInProgress;
         boolean autoCaptureReady = canCapture && captureAnchored;
@@ -1089,10 +1190,14 @@ public final class SharedCameraCaptureActivity extends Activity
                 ? "Ready to solve PhotoSphere"
                 : !state.ready
                 ? textureGuidanceText(state)
+                : !blocker.isEmpty()
+                ? blocker
                 : !isAligned(target, state)
                 ? selectableTargetIndices.size() > 1 ? "Choose nearby target" : "Move to target"
                 : !state.parallaxWarning.isEmpty()
                 ? state.parallaxWarning
+                : !captureAnchored && state.featurePointCount < MIN_TRACKING_FEATURE_POINTS
+                ? "Low visual detail - press Capture slowly"
                 : !captureAnchored
                 ? "Press Capture to start"
                 : "Hold steady - capture ready";
@@ -1100,23 +1205,42 @@ public final class SharedCameraCaptureActivity extends Activity
     }
 
     private String textureGuidanceText(ArFrameState state) {
-        if ("Point at textured detail".equals(state.blocker) && latestTextureHint.available) {
+        if ("Scan detailed area to lock tracking".equals(state.blocker) && latestTextureHint.available) {
             float dx = latestTextureHint.viewX - 0.5f;
             float dy = latestTextureHint.viewY - 0.5f;
             if (Math.abs(dx) < 0.12f && Math.abs(dy) < 0.12f) {
-                return "Hold on textured detail";
+                return "Hold on detailed area";
             }
             String horizontal = Math.abs(dx) < 0.12f ? "" : dx < 0f ? "left" : "right";
             String vertical = Math.abs(dy) < 0.12f ? "" : dy < 0f ? "up" : "down";
             if (horizontal.isEmpty()) {
-                return "Aim " + vertical + " for textured detail";
+                return "Aim " + vertical + " for detail";
             }
             if (vertical.isEmpty()) {
-                return "Aim " + horizontal + " for textured detail";
+                return "Aim " + horizontal + " for detail";
             }
-            return "Aim " + vertical + "-" + horizontal + " for textured detail";
+            return "Aim " + vertical + "-" + horizontal + " for detail";
         }
         return state.blocker;
+    }
+
+    private boolean initialPoseStableForLowTexture(ArFrameState state) {
+        if (captureAnchored || state.featurePointCount >= MIN_TRACKING_FEATURE_POINTS) {
+            initialPoseStableSinceMs = 0L;
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (initialPoseStableSinceMs == 0L
+                || Math.abs(signedHeadingDelta(state.yawDegrees, initialPoseStableYawDegrees))
+                > LOW_TEXTURE_INITIAL_POSE_STABLE_DEGREES
+                || Math.abs(state.pitchDegrees - initialPoseStablePitchDegrees)
+                > LOW_TEXTURE_INITIAL_POSE_STABLE_DEGREES) {
+            initialPoseStableSinceMs = now;
+            initialPoseStableYawDegrees = state.yawDegrees;
+            initialPoseStablePitchDegrees = state.pitchDegrees;
+            return false;
+        }
+        return now - initialPoseStableSinceMs >= LOW_TEXTURE_INITIAL_POSE_STABLE_MS;
     }
 
     private int acceptedTargetCount() {
@@ -1411,34 +1535,67 @@ public final class SharedCameraCaptureActivity extends Activity
         final float sensorHeightMm;
         final int sensorOrientationDegrees;
         final boolean frontFacing;
+        final int preCorrectionActiveArrayWidth;
+        final int preCorrectionActiveArrayHeight;
+        final int[] availableDistortionCorrectionModes;
+        final float[] lensIntrinsicCalibration;
+        final float[] lensDistortion;
 
         CameraFacts(
                 boolean available,
                 float sensorWidthMm,
                 float sensorHeightMm,
                 int sensorOrientationDegrees,
-                boolean frontFacing) {
+                boolean frontFacing,
+                int preCorrectionActiveArrayWidth,
+                int preCorrectionActiveArrayHeight,
+                int[] availableDistortionCorrectionModes,
+                float[] lensIntrinsicCalibration,
+                float[] lensDistortion) {
             this.available = available;
             this.sensorWidthMm = sensorWidthMm;
             this.sensorHeightMm = sensorHeightMm;
             this.sensorOrientationDegrees = sensorOrientationDegrees;
             this.frontFacing = frontFacing;
+            this.preCorrectionActiveArrayWidth = preCorrectionActiveArrayWidth;
+            this.preCorrectionActiveArrayHeight = preCorrectionActiveArrayHeight;
+            this.availableDistortionCorrectionModes = availableDistortionCorrectionModes == null
+                    ? new int[0]
+                    : availableDistortionCorrectionModes.clone();
+            this.lensIntrinsicCalibration = lensIntrinsicCalibration == null ? new float[0] : lensIntrinsicCalibration.clone();
+            this.lensDistortion = lensDistortion == null ? new float[0] : lensDistortion.clone();
         }
 
         static CameraFacts unavailable() {
-            return new CameraFacts(false, 0f, 0f, 0, false);
+            return new CameraFacts(false, 0f, 0f, 0, false, 0, 0, null, null, null);
+        }
+
+        boolean supportsHighQualityDistortionCorrection() {
+            for (int mode : availableDistortionCorrectionModes) {
+                if (mode == CameraCharacteristics.DISTORTION_CORRECTION_MODE_HIGH_QUALITY) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         static CameraFacts from(CameraCharacteristics characteristics) {
             android.util.SizeF size = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
             Integer sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
             Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+            android.graphics.Rect preCorrectionActiveArray =
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
             return size == null ? unavailable() : new CameraFacts(
                     true,
                     size.getWidth(),
                     size.getHeight(),
                     sensorOrientation == null ? 0 : sensorOrientation,
-                    facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT);
+                    facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT,
+                    preCorrectionActiveArray == null ? 0 : preCorrectionActiveArray.width(),
+                    preCorrectionActiveArray == null ? 0 : preCorrectionActiveArray.height(),
+                    characteristics.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES),
+                    characteristics.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION),
+                    characteristics.get(CameraCharacteristics.LENS_DISTORTION));
         }
     }
 
@@ -1562,7 +1719,7 @@ public final class SharedCameraCaptureActivity extends Activity
                 translation = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
             }
             String parallax = translation > MAX_TRANSLATION_FROM_ANCHOR_METERS
-                    ? "Too close - rotate around one point"
+                    ? "Rotate around the lens"
                     : "";
             com.google.ar.core.CameraIntrinsics intrinsics = camera.getImageIntrinsics();
             float[] focal = intrinsics.getFocalLength();
@@ -1570,14 +1727,11 @@ public final class SharedCameraCaptureActivity extends Activity
             int[] dimensions = intrinsics.getImageDimensions();
             boolean intrinsicsReady = focal[0] > 0f && focal[1] > 0f && dimensions[0] > 0 && dimensions[1] > 0;
             boolean ready = tracking == TrackingState.TRACKING
-                    && intrinsicsReady
-                    && (anchored || featurePoints >= MIN_TRACKING_FEATURE_POINTS);
+                    && intrinsicsReady;
             String blocker = tracking != TrackingState.TRACKING
-                    ? "Waiting for AR tracking"
+                    ? "Scan detailed area to lock tracking"
                     : !intrinsicsReady
                     ? "Waiting for camera calibration"
-                    : !anchored && featurePoints < MIN_TRACKING_FEATURE_POINTS
-                    ? "Point at textured detail"
                     : "";
             return new ArFrameState(
                     ready,
@@ -2104,7 +2258,7 @@ public final class SharedCameraCaptureActivity extends Activity
         }
 
         private void drawTextureHint(Canvas canvas) {
-            if (textureHint == null || !textureHint.available || !"Point at textured detail".equals(frameState.blocker)) {
+            if (textureHint == null || !textureHint.available || !"Scan detailed area to lock tracking".equals(frameState.blocker)) {
                 return;
             }
             float x = textureHint.viewX * getWidth();

@@ -18,8 +18,8 @@ android {
         applicationId "com.spherify.app"
         minSdk 26
         targetSdk 36
-        versionCode 42
-        versionName "0.4.2"
+        versionCode 44
+        versionName "0.5.3"
         if (nativeStitcherEnabled) {
             ndk {
                 abiFilters "arm64-v8a"

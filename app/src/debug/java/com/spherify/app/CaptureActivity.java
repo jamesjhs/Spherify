@@ -57,6 +57,7 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.location.Location;
@@ -356,6 +357,9 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setJpegQuality(94);
         new Camera2Interop.Extender<>(captureBuilder)
+                .setCaptureRequestOption(
+                        CaptureRequest.DISTORTION_CORRECTION_MODE,
+                        CaptureRequest.DISTORTION_CORRECTION_MODE_HIGH_QUALITY)
                 .setSessionCaptureCallback(new CameraCaptureSession.CaptureCallback() {
                     @Override
                     public void onCaptureCompleted(
@@ -584,6 +588,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     neighbors,
                     exposure,
                     hasOrientation,
+                    target.yawDegrees,
                     target.pitchDegrees,
                     !captureAnchored,
                     hasOrientation);
@@ -780,6 +785,18 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         json.put("lensFocalLengthMm", focal);
         json.put("sensorPhysicalWidthMm", sensorWidth);
         json.put("sensorPhysicalHeightMm", sensorHeight);
+        json.put("preCorrectionActiveArrayWidth", cameraFacts.preCorrectionActiveArrayWidth);
+        json.put("preCorrectionActiveArrayHeight", cameraFacts.preCorrectionActiveArrayHeight);
+        putIntArrayIfPresent(json, "availableDistortionCorrectionModes", cameraFacts.availableDistortionCorrectionModes);
+        Integer distortionCorrectionMode = metadata.get(CaptureResult.DISTORTION_CORRECTION_MODE);
+        putIfPresent(json, "distortionCorrectionMode", distortionCorrectionMode);
+        json.put("manualLensUndistortionRequired", distortionCorrectionMode != null
+                && distortionCorrectionMode == CaptureResult.DISTORTION_CORRECTION_MODE_OFF);
+        putFloatArrayIfPresent(json, "lensIntrinsicCalibration", cameraFacts.lensIntrinsicCalibration);
+        putFloatArrayIfPresent(json, "lensDistortion", cameraFacts.lensDistortion);
+        if (cameraFacts.lensDistortion.length >= 5) {
+            json.put("lensDistortionModel", "android_brown_conrady_pre_correction_normalized");
+        }
         json.put("imageFocalLengthXPixels", focal / sensorWidth * width);
         json.put("imageFocalLengthYPixels", focal / sensorHeight * height);
         json.put("imagePrincipalPointXPixels", width * 0.5f);
@@ -842,6 +859,28 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         if (value != null) {
             json.put(key, value);
         }
+    }
+
+    private static void putFloatArrayIfPresent(JSONObject json, String key, float[] values) throws JSONException {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        JSONArray array = new JSONArray();
+        for (float value : values) {
+            array.put(value);
+        }
+        json.put(key, array);
+    }
+
+    private static void putIntArrayIfPresent(JSONObject json, String key, int[] values) throws JSONException {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        JSONArray array = new JSONArray();
+        for (int value : values) {
+            array.put(value);
+        }
+        json.put(key, array);
     }
 
     private String readLocationSummary() {
@@ -971,13 +1010,20 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                 SizeF sensor = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
                 float[] focals = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
                 float[] apertures = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES);
+                Rect preCorrectionActiveArray =
+                        characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
                 return new CameraFacts(
                         sensor != null,
                         sensor == null ? 0f : sensor.getWidth(),
                         sensor == null ? 0f : sensor.getHeight(),
                         focals == null || focals.length == 0 ? 0f : focals[0],
                         apertures == null || apertures.length == 0 ? 0f : apertures[0],
-                        id);
+                        id,
+                        preCorrectionActiveArray == null ? 0 : preCorrectionActiveArray.width(),
+                        preCorrectionActiveArray == null ? 0 : preCorrectionActiveArray.height(),
+                        characteristics.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES),
+                        characteristics.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION),
+                        characteristics.get(CameraCharacteristics.LENS_DISTORTION));
             }
         } catch (CameraAccessException | SecurityException ignored) {
             return CameraFacts.unavailable();
@@ -1054,18 +1100,45 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
         final float focalLengthMm;
         final float aperture;
         final String cameraId;
+        final int preCorrectionActiveArrayWidth;
+        final int preCorrectionActiveArrayHeight;
+        final int[] availableDistortionCorrectionModes;
+        final float[] lensIntrinsicCalibration;
+        final float[] lensDistortion;
 
         CameraFacts(boolean available, float sensorWidthMm, float sensorHeightMm, float focalLengthMm, float aperture) {
-            this(available, sensorWidthMm, sensorHeightMm, focalLengthMm, aperture, "");
+            this(available, sensorWidthMm, sensorHeightMm, focalLengthMm, aperture, "", 0, 0, null, null, null);
         }
 
         CameraFacts(boolean available, float sensorWidthMm, float sensorHeightMm, float focalLengthMm, float aperture, String cameraId) {
+            this(available, sensorWidthMm, sensorHeightMm, focalLengthMm, aperture, cameraId, 0, 0, null, null, null);
+        }
+
+        CameraFacts(
+                boolean available,
+                float sensorWidthMm,
+                float sensorHeightMm,
+                float focalLengthMm,
+                float aperture,
+                String cameraId,
+                int preCorrectionActiveArrayWidth,
+                int preCorrectionActiveArrayHeight,
+                int[] availableDistortionCorrectionModes,
+                float[] lensIntrinsicCalibration,
+                float[] lensDistortion) {
             this.available = available;
             this.sensorWidthMm = sensorWidthMm;
             this.sensorHeightMm = sensorHeightMm;
             this.focalLengthMm = focalLengthMm;
             this.aperture = aperture;
             this.cameraId = cameraId == null ? "" : cameraId;
+            this.preCorrectionActiveArrayWidth = preCorrectionActiveArrayWidth;
+            this.preCorrectionActiveArrayHeight = preCorrectionActiveArrayHeight;
+            this.availableDistortionCorrectionModes = availableDistortionCorrectionModes == null
+                    ? new int[0]
+                    : availableDistortionCorrectionModes.clone();
+            this.lensIntrinsicCalibration = lensIntrinsicCalibration == null ? new float[0] : lensIntrinsicCalibration.clone();
+            this.lensDistortion = lensDistortion == null ? new float[0] : lensDistortion.clone();
         }
 
         static CameraFacts unavailable() {
