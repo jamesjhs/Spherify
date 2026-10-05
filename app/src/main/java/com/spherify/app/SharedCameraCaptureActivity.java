@@ -60,6 +60,7 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -131,6 +132,20 @@ public final class SharedCameraCaptureActivity extends Activity
     private static final String CAPTURE_PROFILE = "arcore_shared_camera";
     private static final String TAG = "SpherifySharedCamera";
 
+    private enum CaptureWorkflowState {
+        IDLE,
+        TRACKING_NOT_READY,
+        SEARCHING_TARGET,
+        APPROACHING_TARGET,
+        ALIGNED_STABILIZING,
+        CAPTURING,
+        VALIDATING,
+        COMPLETE,
+        QUALITY_REPAIR,
+        PROCESSING_PREVIEW,
+        PROCESSING_MASTER
+    }
+
     private final ExecutorService captureExecutor = Executors.newSingleThreadExecutor();
     private final CandidateQualityScorer qualityScorer = new CandidateQualityScorer();
     private final OpenCvOverlapValidator overlapValidator = new OpenCvOverlapValidator();
@@ -165,6 +180,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private boolean captureInProgress;
     private boolean completionInProgress;
     private boolean finishGuidanceActive;
+    private CaptureWorkflowState workflowState = CaptureWorkflowState.IDLE;
     private String fieldComment = "";
     private int activeTargetIndex;
     private int anchorYawDegrees;
@@ -184,6 +200,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private String cameraConfigSummary = "";
     private AlertDialog completionDialog;
     private TextView completionText;
+    private ImageView completionPreviewImage;
     private final CameraBackgroundRenderer backgroundRenderer = new CameraBackgroundRenderer();
     private ArFrameState latestFrameState = ArFrameState.notReady("tracking not started");
     private TextureHint latestTextureHint = TextureHint.unavailable();
@@ -653,6 +670,7 @@ public final class SharedCameraCaptureActivity extends Activity
                 captureInProgress = false;
                 return;
             }
+            int targetIndex = target.index >= 0 ? target.index : activeTargetIndex;
             TotalCaptureResult metadata = camera2MetadataFor(image.getTimestamp());
             if (metadata == null) {
                 runOnUiThread(() -> rejectInUi("Camera2 metadata did not match image timestamp"));
@@ -660,7 +678,7 @@ public final class SharedCameraCaptureActivity extends Activity
             }
             File outputFile = library.createDraftFrameFile();
             writeJpegFromYuv(image, outputFile);
-            captureExecutor.submit(() -> validateAndRecord(outputFile, target, state, metadata));
+            captureExecutor.submit(() -> validateAndRecord(outputFile, target, targetIndex, state, metadata));
         } catch (IOException e) {
             runOnUiThread(() -> rejectInUi(e.getMessage()));
         } finally {
@@ -690,7 +708,12 @@ public final class SharedCameraCaptureActivity extends Activity
         }
     }
 
-    private void validateAndRecord(File imageFile, CaptureTarget target, ArFrameState state, TotalCaptureResult metadata) {
+    private void validateAndRecord(
+            File imageFile,
+            CaptureTarget target,
+            int targetIndex,
+            ArFrameState state,
+            TotalCaptureResult metadata) {
         try {
             JSONObject exposure = exposureJsonFor(metadata, state);
             CandidateQualityReport quality = qualityScorer.score(imageFile, 0.0, 0.0, 0.0);
@@ -722,6 +745,72 @@ public final class SharedCameraCaptureActivity extends Activity
                         "",
                         new JSONArray());
             }
+            if (requiresPoseOnlyConfirmation(analysis)) {
+                CandidateAnalysisResult finalAnalysis = analysis;
+                runOnUiThread(() -> showPoseOnlyConfirmation(imageFile, target, targetIndex, state, exposure, finalAnalysis));
+                return;
+            }
+            persistAnalysisAndHandle(imageFile, target, targetIndex, state, exposure, analysis);
+        } catch (IOException | JSONException e) {
+            runOnUiThread(() -> rejectInUi(e.getMessage()));
+        }
+    }
+
+    private boolean requiresPoseOnlyConfirmation(CandidateAnalysisResult analysis) {
+        return CaptureAcceptancePolicy.POSE_ONLY_ACCEPTANCE_ENABLED
+                && CaptureAcceptancePolicy.POSE_ONLY_REQUIRES_USER_CONFIRMATION
+                && analysis != null
+                && analysis.accepted
+                && "low_texture_pose_only".equals(analysis.validationCategory);
+    }
+
+    private void showPoseOnlyConfirmation(
+            File imageFile,
+            CaptureTarget target,
+            int targetIndex,
+            ArFrameState state,
+            JSONObject exposure,
+            CandidateAnalysisResult analysis) {
+        new AlertDialog.Builder(this)
+                .setTitle("Accept pose-only frame?")
+                .setMessage("Spatial tracking is strong, but this view has too few visual features to match. Accept it using pose data only?")
+                .setNegativeButton("Recapture", (dialog, which) -> {
+                    CandidateAnalysisResult declined = poseOnlyDeclinedResult(analysis);
+                    captureExecutor.submit(() -> persistAnalysisAndHandle(imageFile, target, targetIndex, state, exposure, declined));
+                })
+                .setPositiveButton("Accept Pose-Only", (dialog, which) ->
+                        captureExecutor.submit(() -> persistAnalysisAndHandle(imageFile, target, targetIndex, state, exposure, analysis)))
+                .setOnCancelListener(dialog -> {
+                    CandidateAnalysisResult declined = poseOnlyDeclinedResult(analysis);
+                    captureExecutor.submit(() -> persistAnalysisAndHandle(imageFile, target, targetIndex, state, exposure, declined));
+                })
+                .show();
+    }
+
+    private CandidateAnalysisResult poseOnlyDeclinedResult(CandidateAnalysisResult analysis) {
+        return new CandidateAnalysisResult(
+                false,
+                analysis.quality,
+                analysis.predictedOverlapSet,
+                "pose_only_user_declined",
+                analysis.inlierCount,
+                analysis.residualScore,
+                0.0,
+                analysis.parallaxRiskHint,
+                "Pose-only frame declined",
+                "",
+                new JSONArray(),
+                "rejected");
+    }
+
+    private void persistAnalysisAndHandle(
+            File imageFile,
+            CaptureTarget target,
+            int targetIndex,
+            ArFrameState state,
+            JSONObject exposure,
+            CandidateAnalysisResult analysis) {
+        try {
             library.recordAnalyzedCandidateFrame(
                     imageFile,
                     sessionId,
@@ -731,15 +820,14 @@ public final class SharedCameraCaptureActivity extends Activity
                     state.rollDegrees,
                     target.yawDegrees,
                     target.pitchDegrees,
+                    CaptureTargetPlanner.DEFAULT_PROFILE_ID,
+                    targetIndex,
                     "arcore-shared-camera",
                     CAPTURE_PROFILE,
                     exposure.toString(),
                     analysis);
-            CandidateAnalysisResult finalAnalysis = analysis;
-            File acceptedImageFile = imageFile;
-            ArFrameState captureState = state;
-            runOnUiThread(() -> handleAnalysis(target, finalAnalysis, acceptedImageFile, captureState));
-        } catch (IOException | JSONException e) {
+            runOnUiThread(() -> handleAnalysis(target, analysis, imageFile, state));
+        } catch (IOException e) {
             runOnUiThread(() -> rejectInUi(e.getMessage()));
         }
     }
@@ -864,6 +952,15 @@ public final class SharedCameraCaptureActivity extends Activity
         json.put("imagePrincipalPointYPixels", state.imageCy);
         json.put("imageIntrinsicsWidth", state.imageWidth);
         json.put("imageIntrinsicsHeight", state.imageHeight);
+        json.put("effectiveCaptureWidthPixels", effectiveCaptureWidth(state));
+        json.put("effectiveCaptureHeightPixels", effectiveCaptureHeight(state));
+        json.put("effectiveCapturePortrait", effectiveCaptureIsPortrait(state));
+        json.put("previewWidthPixels", viewportWidth);
+        json.put("previewHeightPixels", viewportHeight);
+        json.put("previewCropLeft", 0);
+        json.put("previewCropTop", 0);
+        json.put("previewCropRight", viewportWidth);
+        json.put("previewCropBottom", viewportHeight);
         json.put("arCoreTrackingState", state.trackingState);
         json.put("arCoreFeaturePointCount", state.featurePointCount);
         json.put("arCoreFeatureConfidence", state.featureConfidence);
@@ -952,8 +1049,20 @@ public final class SharedCameraCaptureActivity extends Activity
             readiness.put("arCoreCpuImageHeight", selectedCpuImageSize.getHeight());
             readiness.put("arCoreGpuTextureWidth", selectedGpuTextureSize.getWidth());
             readiness.put("arCoreGpuTextureHeight", selectedGpuTextureSize.getHeight());
+            readiness.put("previewWidthPixels", viewportWidth);
+            readiness.put("previewHeightPixels", viewportHeight);
+            readiness.put("effectiveCaptureWidthPixels", effectiveCaptureWidth(latestFrameState));
+            readiness.put("effectiveCaptureHeightPixels", effectiveCaptureHeight(latestFrameState));
+            readiness.put("effectiveCapturePortrait", effectiveCaptureIsPortrait(latestFrameState));
             readiness.put("storageAvailable", true);
             readiness.put("phase4Method", "arcore_shared_camera_guided_still_capture");
+            readiness.put("captureWorkflowState", workflowState.name().toLowerCase(Locale.US));
+            readiness.put("targetProfile", CaptureTargetPlanner.DEFAULT_PROFILE_ID);
+            readiness.put("targetProfileExpectedCount", CaptureTargetPlanner.FIXED_36_TARGET_COUNT);
+            readiness.put("acceptancePolicyVersion", CaptureAcceptancePolicy.DEFAULT_VERSION);
+            readiness.put("poseOnlyAcceptanceEnabled", CaptureAcceptancePolicy.POSE_ONLY_ACCEPTANCE_ENABLED);
+            readiness.put("poseOnlyRequiresUserConfirmation", CaptureAcceptancePolicy.POSE_ONLY_REQUIRES_USER_CONFIRMATION);
+            readiness.put("partialFinishPublic", CaptureAcceptancePolicy.PARTIAL_FINISH_PUBLIC);
             library.ensureCaptureSession(sessionId, CaptureMode.HAND_HELD, readiness);
             library.updateCaptureSessionReadiness(sessionId, readiness, capturing);
         } catch (IOException | JSONException e) {
@@ -987,6 +1096,9 @@ public final class SharedCameraCaptureActivity extends Activity
             int acceptedYaw,
             int acceptedPitch,
             CandidateAnalysisResult analysis) {
+        if (!CaptureAcceptancePolicy.RECOVERY_FILL_TARGETS_PUBLIC_DEFAULT) {
+            return;
+        }
         if (analysis == null || (!"pose_guided_overlap".equals(analysis.validationCategory) && analysis.confidence >= 0.35)) {
             return;
         }
@@ -1127,6 +1239,12 @@ public final class SharedCameraCaptureActivity extends Activity
         if (!state.ready) {
             return state.blocker;
         }
+        if (cameraFacts.frontFacing) {
+            return "Use the rear camera";
+        }
+        if (!effectiveCaptureIsPortrait(state)) {
+            return "Rotate phone to portrait";
+        }
         if (!captureAnchored && state.featurePointCount < MIN_TRACKING_FEATURE_POINTS
                 && !initialPoseStableForLowTexture(state)) {
             return "Hold steady to lock tracking";
@@ -1148,11 +1266,61 @@ public final class SharedCameraCaptureActivity extends Activity
                 && Math.abs(target.pitchDegrees - state.pitchDegrees) <= TARGET_PITCH_TOLERANCE_DEGREES;
     }
 
+    private static int effectiveCaptureWidth(ArFrameState state) {
+        if (state == null) {
+            return 0;
+        }
+        return state.sensorToDisplayRotationDegrees == 90 || state.sensorToDisplayRotationDegrees == 270
+                ? state.imageHeight
+                : state.imageWidth;
+    }
+
+    private static int effectiveCaptureHeight(ArFrameState state) {
+        if (state == null) {
+            return 0;
+        }
+        return state.sensorToDisplayRotationDegrees == 90 || state.sensorToDisplayRotationDegrees == 270
+                ? state.imageWidth
+                : state.imageHeight;
+    }
+
+    private static boolean effectiveCaptureIsPortrait(ArFrameState state) {
+        int width = effectiveCaptureWidth(state);
+        int height = effectiveCaptureHeight(state);
+        return width > 0 && height > 0 && height >= width;
+    }
+
+    private CaptureWorkflowState workflowStateFor(CaptureTarget target, ArFrameState state, String blocker) {
+        if (completionInProgress) {
+            return CaptureWorkflowState.PROCESSING_MASTER;
+        }
+        if (captureInProgress) {
+            return CaptureWorkflowState.CAPTURING;
+        }
+        if (target == null && captureAnchored) {
+            return CaptureWorkflowState.COMPLETE;
+        }
+        if (state == null || !state.ready) {
+            return CaptureWorkflowState.TRACKING_NOT_READY;
+        }
+        if (!captureAnchored) {
+            return CaptureWorkflowState.IDLE;
+        }
+        if (target == null) {
+            return CaptureWorkflowState.SEARCHING_TARGET;
+        }
+        if (!blocker.isEmpty()) {
+            return CaptureWorkflowState.APPROACHING_TARGET;
+        }
+        return CaptureWorkflowState.ALIGNED_STABILIZING;
+    }
+
     private void refreshUi() {
         updateActiveTarget();
         CaptureTarget target = activeTarget();
         ArFrameState state = latestFrameState;
         String blocker = target == null ? "" : captureBlocker(target, state);
+        workflowState = workflowStateFor(target, state, blocker);
         boolean canCapture = target != null
                 && blocker.isEmpty()
                 && !captureInProgress
@@ -1170,14 +1338,14 @@ public final class SharedCameraCaptureActivity extends Activity
         }
         captureButton.setEnabled(canCapture);
         int acceptedCount = acceptedTargetCount();
-        int requiredCount = Math.max(1, targets.size());
+        int requiredCount = Math.max(CaptureTargetPlanner.FIXED_36_TARGET_COUNT, targets.size());
         captureProgressBar.setMax(requiredCount);
         captureProgressBar.setProgress(Math.min(acceptedCount, requiredCount));
         captureProgressBar.setContentDescription(String.format(
                 Locale.US,
                 "Capture progress %d of %d",
                 acceptedCount,
-                targets.size()));
+                requiredCount));
         overlayView.setState(targets, activeTargetIndex, selectableTargetIndices, state, capturedReferenceFrames);
         overlayView.setTextureHint(latestTextureHint);
         String text = completionInProgress
@@ -1200,8 +1368,17 @@ public final class SharedCameraCaptureActivity extends Activity
                 ? "Low visual detail - press Capture slowly"
                 : !captureAnchored
                 ? "Press Capture to start"
-                : "Hold steady - capture ready";
-        statusText.setText(String.format(Locale.US, "%s  |  %d/%d", text, acceptedCount, targets.size()));
+                : stabilityCountdownText();
+        statusText.setText(String.format(Locale.US, "%s  |  %d/%d", text, acceptedCount, requiredCount));
+    }
+
+    private String stabilityCountdownText() {
+        if (alignedSinceMs <= 0L) {
+            return "Hold steady";
+        }
+        long elapsed = Math.max(0L, System.currentTimeMillis() - alignedSinceMs);
+        int percent = (int) Math.min(100L, Math.round(elapsed * 100.0 / REQUIRED_ALIGNED_MS));
+        return percent >= 100 ? "Capturing" : "Hold steady " + percent + "%";
     }
 
     private String textureGuidanceText(ArFrameState state) {
@@ -1263,7 +1440,9 @@ public final class SharedCameraCaptureActivity extends Activity
     }
 
     private boolean minimumRequiredCaptureComplete() {
-        return captureAnchored && acceptedTargetCount() >= 30 && activeTarget() == null;
+        return captureAnchored
+                && acceptedTargetCount() >= CaptureTargetPlanner.FIXED_36_TARGET_COUNT
+                && activeTarget() == null;
     }
 
     private void guideMissingRequiredCapture() {
@@ -1285,6 +1464,26 @@ public final class SharedCameraCaptureActivity extends Activity
         showCompletionDialog("Preparing capture graph for native stitching");
         captureExecutor.submit(() -> {
             try {
+                try {
+                    workflowState = CaptureWorkflowState.PROCESSING_PREVIEW;
+                    SpherifyLibrary.PreviewRenderResult preview = library.createPreviewFromCaptureSession(
+                            sessionId,
+                            (stepKey, complete, message) -> runOnUiThread(() ->
+                                    updateCompletionDialog((complete ? "Done: " : "Working: ") + message)));
+                    runOnUiThread(() -> showCompletionPreview(preview.previewFile));
+                } catch (IOException previewError) {
+                    runOnUiThread(() -> updateCompletionDialog("Preview unavailable: "
+                            + previewError.getMessage()
+                            + "\n\nCreating master..."));
+                }
+                SpherifyLibrary.GraphReadinessReport graphReadiness = library.assessCaptureGraphReadiness(sessionId);
+                if (!graphReadiness.pass) {
+                    workflowState = CaptureWorkflowState.QUALITY_REPAIR;
+                    library.markCaptureSessionQualityRepair(sessionId);
+                    runOnUiThread(() -> failQualityRepair(graphReadiness.failureMessage()));
+                    return;
+                }
+                workflowState = CaptureWorkflowState.PROCESSING_MASTER;
                 StitchMasterResult result = library.createMasterFromCaptureSession(
                         sessionId,
                         "normal",
@@ -1333,13 +1532,25 @@ public final class SharedCameraCaptureActivity extends Activity
     }
 
     private void showCompletionDialog(String message) {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(32, 24, 32, 24);
         completionText = new TextView(this);
         completionText.setText(message);
         completionText.setTextSize(14f);
-        completionText.setPadding(32, 24, 32, 24);
+        completionPreviewImage = new ImageView(this);
+        completionPreviewImage.setAdjustViewBounds(true);
+        completionPreviewImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        completionPreviewImage.setVisibility(View.GONE);
+        LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                Math.round(getResources().getDisplayMetrics().density * 168f));
+        previewParams.topMargin = Math.round(getResources().getDisplayMetrics().density * 12f);
+        container.addView(completionText);
+        container.addView(completionPreviewImage, previewParams);
         completionDialog = new AlertDialog.Builder(this)
                 .setTitle("Creating PhotoSphere")
-                .setView(completionText)
+                .setView(container)
                 .setCancelable(false)
                 .show();
     }
@@ -1350,11 +1561,25 @@ public final class SharedCameraCaptureActivity extends Activity
         }
     }
 
+    private void showCompletionPreview(File previewFile) {
+        if (completionPreviewImage == null || previewFile == null || !previewFile.exists()) {
+            return;
+        }
+        Bitmap preview = BitmapFactory.decodeFile(previewFile.getAbsolutePath());
+        if (preview == null) {
+            return;
+        }
+        completionPreviewImage.setImageBitmap(preview);
+        completionPreviewImage.setVisibility(View.VISIBLE);
+        updateCompletionDialog("Preview ready. Creating certified master...");
+    }
+
     private void finishIntegratedSpherification(StitchMasterResult result) {
         if (completionDialog != null) {
             completionDialog.dismiss();
             completionDialog = null;
         }
+        completionPreviewImage = null;
         getSharedPreferences("spherify", MODE_PRIVATE)
                 .edit()
                 .putString("lastIntegratedMasterId", result.item.id)
@@ -1368,6 +1593,7 @@ public final class SharedCameraCaptureActivity extends Activity
             completionDialog.dismiss();
             completionDialog = null;
         }
+        completionPreviewImage = null;
         completionInProgress = false;
         refreshUi();
         new AlertDialog.Builder(this)
@@ -1375,6 +1601,23 @@ public final class SharedCameraCaptureActivity extends Activity
                 .setMessage(message == null || message.isEmpty()
                         ? "The capture graph is not strong enough to create a seamless PhotoSphere."
                         : message)
+                .setNegativeButton("Close Capture", (dialog, which) -> finish())
+                .setPositiveButton("Continue Capture", null)
+                .show();
+    }
+
+    private void failQualityRepair(String message) {
+        if (completionDialog != null) {
+            completionDialog.dismiss();
+            completionDialog = null;
+        }
+        completionPreviewImage = null;
+        completionInProgress = false;
+        refreshUi();
+        new AlertDialog.Builder(this)
+                .setTitle("Quality repair needed")
+                .setMessage("Capture complete. Quality repair needed:"
+                        + (message == null || message.isEmpty() ? "" : "\n\n" + message))
                 .setNegativeButton("Close Capture", (dialog, which) -> finish())
                 .setPositiveButton("Continue Capture", null)
                 .show();

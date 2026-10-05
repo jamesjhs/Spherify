@@ -9,6 +9,7 @@ package com.spherify.app;
  * reproducible from persisted capture-session metadata.
  */
 final class CaptureTarget {
+    final int index;
     int yawDegrees;
     int pitchDegrees;
     final CaptureTargetPhase phase;
@@ -16,6 +17,11 @@ final class CaptureTarget {
     boolean weak;
 
     CaptureTarget(int yawDegrees, int pitchDegrees, CaptureTargetPhase phase) {
+        this(-1, yawDegrees, pitchDegrees, phase);
+    }
+
+    CaptureTarget(int index, int yawDegrees, int pitchDegrees, CaptureTargetPhase phase) {
+        this.index = index;
         this.yawDegrees = yawDegrees;
         this.pitchDegrees = pitchDegrees;
         this.phase = phase;

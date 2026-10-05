@@ -20,6 +20,8 @@ final class DraftFrameRecord {
     final float rollDegrees;
     final boolean capturedPoseAvailable;
     final String captureProfile;
+    final String targetProfileId;
+    final int targetIndex;
     final int targetYawDegrees;
     final int targetPitchDegrees;
     final String captureMode;
@@ -44,6 +46,8 @@ final class DraftFrameRecord {
             float rollDegrees,
             boolean capturedPoseAvailable,
             String captureProfile,
+            String targetProfileId,
+            int targetIndex,
             int targetYawDegrees,
             int targetPitchDegrees,
             String captureMode,
@@ -66,6 +70,10 @@ final class DraftFrameRecord {
         this.rollDegrees = rollDegrees;
         this.capturedPoseAvailable = capturedPoseAvailable;
         this.captureProfile = captureProfile;
+        this.targetProfileId = targetProfileId == null || targetProfileId.isEmpty()
+                ? CaptureTargetPlanner.DEFAULT_PROFILE_ID
+                : targetProfileId;
+        this.targetIndex = targetIndex;
         this.targetYawDegrees = targetYawDegrees;
         this.targetPitchDegrees = targetPitchDegrees;
         this.captureMode = captureMode;

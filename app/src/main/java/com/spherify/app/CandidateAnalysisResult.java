@@ -82,6 +82,7 @@ final class CandidateAnalysisResult {
                 confidence,
                 parallaxRiskHint,
                 rejectionReason,
+                CaptureAcceptancePolicy.DEFAULT_VERSION,
                 validationCategory);
     }
 }

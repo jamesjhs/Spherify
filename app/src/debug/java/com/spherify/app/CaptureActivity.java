@@ -601,6 +601,8 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
                     rollDegrees,
                     target.yawDegrees,
                     target.pitchDegrees,
+                    CaptureTargetPlanner.DEFAULT_PROFILE_ID,
+                    target.index >= 0 ? target.index : activeTargetIndex,
                     automatic ? "dot-auto" : "dot-manual",
                     TAG_PROFILE,
                     exposure.toString(),

@@ -15,6 +15,7 @@ final class CaptureAnalysisFacts {
     final double confidence;
     final String parallaxRiskHint;
     final String rejectionReason;
+    final String acceptancePolicyVersion;
     final String validationCategory;
 
     CaptureAnalysisFacts(
@@ -39,6 +40,7 @@ final class CaptureAnalysisFacts {
                 confidence,
                 parallaxRiskHint,
                 rejectionReason,
+                CaptureAcceptancePolicy.DEFAULT_VERSION,
                 "");
     }
 
@@ -54,6 +56,34 @@ final class CaptureAnalysisFacts {
             String parallaxRiskHint,
             String rejectionReason,
             String validationCategory) {
+        this(
+                blurScore,
+                exposureScore,
+                textureScore,
+                predictedOverlapSet,
+                opencvRansacResult,
+                inlierCount,
+                residualScore,
+                confidence,
+                parallaxRiskHint,
+                rejectionReason,
+                CaptureAcceptancePolicy.DEFAULT_VERSION,
+                validationCategory);
+    }
+
+    CaptureAnalysisFacts(
+            double blurScore,
+            double exposureScore,
+            double textureScore,
+            JSONArray predictedOverlapSet,
+            String opencvRansacResult,
+            int inlierCount,
+            double residualScore,
+            double confidence,
+            String parallaxRiskHint,
+            String rejectionReason,
+            String acceptancePolicyVersion,
+            String validationCategory) {
         this.blurScore = blurScore;
         this.exposureScore = exposureScore;
         this.textureScore = textureScore;
@@ -64,6 +94,9 @@ final class CaptureAnalysisFacts {
         this.confidence = confidence;
         this.parallaxRiskHint = parallaxRiskHint == null ? "" : parallaxRiskHint;
         this.rejectionReason = rejectionReason == null ? "" : rejectionReason;
+        this.acceptancePolicyVersion = acceptancePolicyVersion == null || acceptancePolicyVersion.isEmpty()
+                ? CaptureAcceptancePolicy.DEFAULT_VERSION
+                : acceptancePolicyVersion;
         this.validationCategory = validationCategory == null ? "" : validationCategory;
     }
 
@@ -93,6 +126,7 @@ final class CaptureAnalysisFacts {
         json.put("confidence", confidence);
         json.put("parallaxRiskHint", parallaxRiskHint);
         json.put("rejectionReason", rejectionReason);
+        json.put("acceptancePolicyVersion", acceptancePolicyVersion);
         json.put("validationCategory", validationCategory);
         return json;
     }
@@ -112,6 +146,7 @@ final class CaptureAnalysisFacts {
                 json.optDouble("confidence", 0.0),
                 json.optString("parallaxRiskHint", ""),
                 json.optString("rejectionReason", ""),
+                json.optString("acceptancePolicyVersion", CaptureAcceptancePolicy.DEFAULT_VERSION),
                 json.optString("validationCategory", ""));
     }
 }

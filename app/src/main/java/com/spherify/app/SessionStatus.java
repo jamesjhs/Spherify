@@ -7,6 +7,7 @@ enum SessionStatus {
     CANDIDATE_PENDING_ANALYSIS("candidate_pending_analysis"),
     NEEDS_RECAPTURE("needs_recapture"),
     CAPTURE_COMPLETE("capture_complete"),
+    QUALITY_REPAIR("quality_repair"),
     VALID_FOR_SPHERIFY("valid_for_spherify"),
     SPHERIFYING("spherifying"),
     MASTER_CREATED("master_created"),

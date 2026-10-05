@@ -151,6 +151,8 @@ final class Phase5Stitcher {
                     frame.rawFacts.capturedRollDegrees,
                     frame.rawFacts.capturedPoseAvailable,
                     frame.rawFacts.captureProfile,
+                    frame.rawFacts.targetProfileId,
+                    frame.rawFacts.targetIndex,
                     frame.rawFacts.targetYawDegrees,
                     frame.rawFacts.targetPitchDegrees,
                     "dot-accepted",

@@ -18,10 +18,14 @@ import java.util.List;
  *
  * Method:
  * The first target is user-anchored. The accepted first view defines the local
- * yaw and pitch origin. Remaining targets expand from local neighbours toward
- * wider horizon closure, then upper/lower rows, then poles.
+ * yaw origin. The public default then uses the Stanford-style 36 target
+ * profile: one horizon row and two tilted rows, each with twelve columns. The
+ * previous FOV-adaptive profile remains available as a field-test fallback.
  */
 final class CaptureTargetPlanner {
+    static final String DEFAULT_PROFILE_ID = CaptureProfile.STANFORD_FIXED_36_ID;
+    static final int FIXED_36_TARGET_COUNT = 36;
+
     private static final double DEFAULT_HORIZONTAL_FOV_DEGREES = 75.0;
     private static final double DEFAULT_VERTICAL_FOV_DEGREES = 60.0;
     private static final double HORIZONTAL_TARGET_OVERLAP = 0.52;
@@ -40,10 +44,28 @@ final class CaptureTargetPlanner {
     }
 
     static ArrayList<CaptureTarget> anchoredTargets(int anchorYawDegrees, int anchorPitchDegrees) {
-        return anchoredTargets(anchorYawDegrees, anchorPitchDegrees, DEFAULT_HORIZONTAL_FOV_DEGREES, DEFAULT_VERTICAL_FOV_DEGREES);
+        return fixed36Targets(anchorYawDegrees, anchorPitchDegrees);
     }
 
-    static ArrayList<CaptureTarget> anchoredTargets(
+    static ArrayList<CaptureTarget> fixed36Targets(int anchorYawDegrees, int anchorPitchDegrees) {
+        ArrayList<CaptureTarget> targets = new ArrayList<>();
+        CaptureProfile profile = CaptureProfile.stanfordFixed36();
+        for (CaptureProfile.CaptureTargetSpec spec : profile.targetSpecs) {
+            addTargetIfMissing(
+                    targets,
+                    spec.index,
+                    anchorYawDegrees + spec.localYawDegrees,
+                    spec.localPitchDegrees,
+                    spec.phase);
+        }
+        return targets;
+    }
+
+    static ArrayList<CaptureTarget> adaptiveFovTargets(int anchorYawDegrees, int anchorPitchDegrees) {
+        return adaptiveFovTargets(anchorYawDegrees, anchorPitchDegrees, DEFAULT_HORIZONTAL_FOV_DEGREES, DEFAULT_VERTICAL_FOV_DEGREES);
+    }
+
+    static ArrayList<CaptureTarget> adaptiveFovTargets(
             int anchorYawDegrees,
             int anchorPitchDegrees,
             double horizontalFovDegrees,
@@ -75,16 +97,22 @@ final class CaptureTargetPlanner {
         return targets;
     }
 
+    static ArrayList<CaptureTarget> anchoredTargets(
+            int anchorYawDegrees,
+            int anchorPitchDegrees,
+            double horizontalFovDegrees,
+            double verticalFovDegrees) {
+        return fixed36Targets(anchorYawDegrees, anchorPitchDegrees);
+    }
+
     static TargetCoverage coverageForDraftRecords(List<DraftFrameRecord> records) {
         if (records == null || records.isEmpty()) {
             return new TargetCoverage(0, 0);
         }
         DraftFrameRecord anchor = records.get(0);
-        ArrayList<CaptureTarget> targets = anchoredTargets(
+        ArrayList<CaptureTarget> targets = fixed36Targets(
                 anchor.targetYawDegrees,
-                anchor.targetPitchDegrees,
-                fovDegrees(anchor.imageFocalLengthXPixels, anchor.imageIntrinsicsWidth),
-                fovDegrees(anchor.imageFocalLengthYPixels, anchor.imageIntrinsicsHeight));
+                anchor.targetPitchDegrees);
         for (DraftFrameRecord record : records) {
             markCaptured(targets, record.targetYawDegrees, record.targetPitchDegrees);
         }
@@ -102,11 +130,9 @@ final class CaptureTargetPlanner {
         if (anchor == null) {
             return new TargetCoverage(0, 0);
         }
-        ArrayList<CaptureTarget> targets = anchoredTargets(
+        ArrayList<CaptureTarget> targets = fixed36Targets(
                 anchor.rawFacts.targetYawDegrees,
-                anchor.rawFacts.targetPitchDegrees,
-                horizontalFovDegrees(anchor),
-                verticalFovDegrees(anchor));
+                anchor.rawFacts.targetPitchDegrees);
         for (CaptureFrameRecord frame : frames) {
             if (frame.role == CaptureFrameRole.ACCEPTED) {
                 markCaptured(targets, frame.rawFacts.targetYawDegrees, frame.rawFacts.targetPitchDegrees);
@@ -137,11 +163,9 @@ final class CaptureTargetPlanner {
         if (anchor == null) {
             return null;
         }
-        ArrayList<CaptureTarget> targets = anchoredTargets(
+        ArrayList<CaptureTarget> targets = fixed36Targets(
                 anchor.rawFacts.targetYawDegrees,
-                anchor.rawFacts.targetPitchDegrees,
-                horizontalFovDegrees(anchor),
-                verticalFovDegrees(anchor));
+                anchor.rawFacts.targetPitchDegrees);
         for (CaptureFrameRecord frame : frames) {
             if (frame.role == CaptureFrameRole.ACCEPTED) {
                 markCaptured(targets, frame.rawFacts.targetYawDegrees, frame.rawFacts.targetPitchDegrees);
@@ -188,6 +212,15 @@ final class CaptureTargetPlanner {
     }
 
     private static void addTargetIfMissing(ArrayList<CaptureTarget> targets, int yawDegrees, int pitchDegrees, CaptureTargetPhase phase) {
+        addTargetIfMissing(targets, -1, yawDegrees, pitchDegrees, phase);
+    }
+
+    private static void addTargetIfMissing(
+            ArrayList<CaptureTarget> targets,
+            int index,
+            int yawDegrees,
+            int pitchDegrees,
+            CaptureTargetPhase phase) {
         int yaw = normalize(yawDegrees);
         int pitch = clampPitch(pitchDegrees);
         for (CaptureTarget target : targets) {
@@ -195,7 +228,7 @@ final class CaptureTargetPlanner {
                 return;
             }
         }
-        targets.add(new CaptureTarget(yaw, pitch, phase));
+        targets.add(new CaptureTarget(index, yaw, pitch, phase));
     }
 
     private static int normalize(int degrees) {

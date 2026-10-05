@@ -54,6 +54,7 @@ final class LibraryItem {
     final String source;
     final String projection;
     final String parentId;
+    final String outputState;
     String imagePath;
     String thumbnailPath;
     final long createdAt;
@@ -91,6 +92,7 @@ final class LibraryItem {
                 thumbnailPath,
                 createdAt,
                 updatedAt,
+                outputStateFor(type, source),
                 0.5f,
                 0.5f);
     }
@@ -108,12 +110,45 @@ final class LibraryItem {
             long updatedAt,
             float tinyPlanetCenterX,
             float tinyPlanetCenterY) {
+        this(
+                id,
+                title,
+                type,
+                source,
+                projection,
+                parentId,
+                imagePath,
+                thumbnailPath,
+                createdAt,
+                updatedAt,
+                outputStateFor(type, source),
+                tinyPlanetCenterX,
+                tinyPlanetCenterY);
+    }
+
+    LibraryItem(
+            String id,
+            String title,
+            String type,
+            String source,
+            String projection,
+            String parentId,
+            String imagePath,
+            String thumbnailPath,
+            long createdAt,
+            long updatedAt,
+            String outputState,
+            float tinyPlanetCenterX,
+            float tinyPlanetCenterY) {
         this.id = id;
         this.title = title;
         this.type = type;
         this.source = source;
         this.projection = projection;
         this.parentId = parentId;
+        this.outputState = outputState == null || outputState.isEmpty()
+                ? outputStateFor(type, source)
+                : outputState;
         this.imagePath = imagePath;
         this.thumbnailPath = thumbnailPath;
         this.createdAt = createdAt;
@@ -189,6 +224,7 @@ final class LibraryItem {
         json.put("source", source);
         json.put("projection", projection);
         json.put("parentId", parentId);
+        json.put("outputState", outputState);
         json.put("imagePath", imagePath);
         json.put("thumbnailPath", thumbnailPath);
         json.put("createdAt", createdAt);
@@ -218,7 +254,23 @@ final class LibraryItem {
                 json.getString("thumbnailPath"),
                 json.getLong("createdAt"),
                 json.optLong("updatedAt", json.getLong("createdAt")),
+                json.optString("outputState", outputStateFor(
+                        json.optString("type", ""),
+                        json.optString("source", "local"))),
                 (float) json.optDouble("tinyPlanetCenterX", 0.5),
                 (float) json.optDouble("tinyPlanetCenterY", 0.5));
+    }
+
+    private static String outputStateFor(String type, String source) {
+        if (TYPE_DRAFT_SESSION.equals(type)) {
+            return CaptureOutputState.DRAFT_MASTER;
+        }
+        if (TYPE_MASTER.equals(type) && "phase5_stitch".equals(source)) {
+            return CaptureOutputState.CERTIFIED_PHOTOSPHERE;
+        }
+        if (TYPE_MASTER.equals(type)) {
+            return CaptureOutputState.MASTER;
+        }
+        return "";
     }
 }

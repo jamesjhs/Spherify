@@ -6,6 +6,8 @@ import org.json.JSONObject;
 final class CaptureRawFacts {
     final String filePath;
     final long timestampMillis;
+    final String targetProfileId;
+    final int targetIndex;
     final int targetYawDegrees;
     final int targetPitchDegrees;
     final float capturedYawDegrees;
@@ -22,6 +24,8 @@ final class CaptureRawFacts {
     CaptureRawFacts(
             String filePath,
             long timestampMillis,
+            String targetProfileId,
+            int targetIndex,
             int targetYawDegrees,
             int targetPitchDegrees,
             float capturedYawDegrees,
@@ -36,6 +40,10 @@ final class CaptureRawFacts {
             String cameraId) {
         this.filePath = filePath;
         this.timestampMillis = timestampMillis;
+        this.targetProfileId = targetProfileId == null || targetProfileId.isEmpty()
+                ? CaptureTargetPlanner.DEFAULT_PROFILE_ID
+                : targetProfileId;
+        this.targetIndex = targetIndex;
         this.targetYawDegrees = targetYawDegrees;
         this.targetPitchDegrees = targetPitchDegrees;
         this.capturedYawDegrees = capturedYawDegrees;
@@ -54,6 +62,8 @@ final class CaptureRawFacts {
         JSONObject json = new JSONObject();
         json.put("filePath", filePath);
         json.put("timestampMillis", timestampMillis);
+        json.put("targetProfileId", targetProfileId);
+        json.put("targetIndex", targetIndex);
         json.put("targetYawDegrees", targetYawDegrees);
         json.put("targetPitchDegrees", targetPitchDegrees);
         json.put("capturedYawDegrees", capturedYawDegrees);
@@ -73,6 +83,8 @@ final class CaptureRawFacts {
         return new CaptureRawFacts(
                 json.optString("filePath", ""),
                 json.optLong("timestampMillis", 0L),
+                json.optString("targetProfileId", CaptureTargetPlanner.DEFAULT_PROFILE_ID),
+                json.optInt("targetIndex", -1),
                 json.optInt("targetYawDegrees", 0),
                 json.optInt("targetPitchDegrees", 0),
                 (float) json.optDouble("capturedYawDegrees", 0.0),

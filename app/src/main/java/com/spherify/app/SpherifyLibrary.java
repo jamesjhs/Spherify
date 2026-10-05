@@ -54,6 +54,7 @@ import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
@@ -83,10 +84,15 @@ import java.util.Map;
 
 final class SpherifyLibrary {
     private static final int THUMBNAIL_SIZE = 320;
+    private static final int PREVIEW_ERP_WIDTH = 2048;
+    private static final int PREVIEW_ERP_HEIGHT = 1024;
+    private static final float PREVIEW_DEFAULT_YAW_SPAN_DEGREES = 44f;
+    private static final float PREVIEW_DEFAULT_PITCH_SPAN_DEGREES = 48f;
 
     private final Context context;
     private final File root;
     private final File mastersDir;
+    private final File previewsDir;
     private final File variantsDir;
     private final File draftsDir;
     private final File thumbnailsDir;
@@ -110,6 +116,7 @@ final class SpherifyLibrary {
         this.context = context.getApplicationContext();
         root = new File(context.getFilesDir(), "library");
         mastersDir = new File(root, "masters");
+        previewsDir = new File(root, "previews");
         variantsDir = new File(root, "variants");
         draftsDir = new File(root, "drafts");
         thumbnailsDir = new File(root, "thumbnails");
@@ -631,6 +638,8 @@ final class SpherifyLibrary {
                     (float) json.optDouble("rollDegrees", 0.0),
                     json.has("headingDegrees") && json.has("pitchDegrees") && json.has("rollDegrees"),
                     json.optString("captureProfile", "handheld"),
+                    json.optString("targetProfileId", CaptureTargetPlanner.DEFAULT_PROFILE_ID),
+                    json.optInt("targetIndex", -1),
                     json.optInt("targetYawDegrees", 0),
                     json.optInt("targetPitchDegrees", 0),
                     json.optString("captureMode", "manual"),
@@ -754,6 +763,257 @@ final class SpherifyLibrary {
         return new StitchMasterResult(item, stitch);
     }
 
+    PreviewRenderResult createPreviewFromCaptureSession(
+            String sessionId,
+            ProgressReporter progress) throws IOException {
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        if (session == null) {
+            throw new IOException("capture session not found");
+        }
+        report(progress, "preview", false, "Rendering fast preview");
+        ArrayList<CaptureFrameRecord> frames = acceptedFrameRecords(session);
+        frames.sort(Comparator.comparingLong(frame -> frame.rawFacts.timestampMillis));
+        if (frames.isEmpty()) {
+            throw new IOException("capture session has no accepted frames for preview");
+        }
+        long now = System.currentTimeMillis();
+        long startedAt = System.currentTimeMillis();
+        String id = "preview-" + newId(now);
+        File previewFile = new File(previewsDir, id + ".jpg");
+        File maskFile = new File(previewsDir, id + "-pose-mask.png");
+        renderFastPreview(frames, previewFile, maskFile);
+        long generationMs = Math.max(0L, System.currentTimeMillis() - startedAt);
+        persistPreviewMetadata(sessionId, previewFile, maskFile, frames.size(), generationMs, now);
+        File thumbnailFile = makeThumbnail(previewFile, id);
+        items.add(new LibraryItem(
+                id,
+                "Preview PhotoSphere " + friendlyDateLabel(now),
+                LibraryItem.TYPE_VARIANT,
+                "capture_preview",
+                "sphere",
+                sessionId,
+                previewFile.getAbsolutePath(),
+                thumbnailFile.getAbsolutePath(),
+                now,
+                now,
+                CaptureOutputState.PREVIEW_PANO,
+                0.5f,
+                0.5f));
+        save();
+        report(progress, "preview", true, "Preview ready");
+        return new PreviewRenderResult(previewFile, maskFile, frames.size());
+    }
+
+    private void renderFastPreview(
+            List<CaptureFrameRecord> frames,
+            File previewFile,
+            File maskFile) throws IOException {
+        Bitmap preview = Bitmap.createBitmap(PREVIEW_ERP_WIDTH, PREVIEW_ERP_HEIGHT, Bitmap.Config.ARGB_8888);
+        Bitmap mask = Bitmap.createBitmap(PREVIEW_ERP_WIDTH, PREVIEW_ERP_HEIGHT, Bitmap.Config.ARGB_8888);
+        Canvas previewCanvas = new Canvas(preview);
+        Canvas maskCanvas = new Canvas(mask);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+        Paint maskPaint = new Paint();
+        previewCanvas.drawColor(0xFF101214);
+        maskCanvas.drawColor(0xFF000000);
+        try {
+            for (CaptureFrameRecord frame : frames) {
+                Bitmap source = decodePreviewSource(new File(frame.rawFacts.filePath));
+                if (source == null) {
+                    continue;
+                }
+                Bitmap rotated = applyExifRotation(source, frame.rawFacts.filePath);
+                if (rotated != source) {
+                    source.recycle();
+                    source = rotated;
+                }
+                float yaw = frameCenterYawDegrees(frame);
+                float pitch = frame.rawFacts.capturedPoseAvailable
+                        ? frame.rawFacts.capturedPitchDegrees
+                        : frame.rawFacts.targetPitchDegrees;
+                float yawSpan = previewYawSpan(frame);
+                float pitchSpan = previewPitchSpan(frame);
+                drawPreviewPatch(previewCanvas, source, yaw, pitch, yawSpan, pitchSpan, paint);
+                maskPaint.setColor(isPoseOnly(frame) ? 0xFFFFFFFF : 0xFF000000);
+                drawMaskPatch(maskCanvas, yaw, pitch, yawSpan, pitchSpan, maskPaint);
+                source.recycle();
+            }
+            try (FileOutputStream output = new FileOutputStream(previewFile)) {
+                if (!preview.compress(Bitmap.CompressFormat.JPEG, 88, output)) {
+                    throw new IOException("could not write preview pano");
+                }
+            }
+            try (FileOutputStream output = new FileOutputStream(maskFile)) {
+                if (!mask.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    throw new IOException("could not write preview pose mask");
+                }
+            }
+        } finally {
+            preview.recycle();
+            mask.recycle();
+        }
+    }
+
+    private static Bitmap decodePreviewSource(File imageFile) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(imageFile.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return null;
+        }
+        int sample = 1;
+        int target = 720;
+        while (bounds.outWidth / sample > target || bounds.outHeight / sample > target) {
+            sample *= 2;
+        }
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = sample;
+        decode.inPreferredConfig = Bitmap.Config.RGB_565;
+        return BitmapFactory.decodeFile(imageFile.getAbsolutePath(), decode);
+    }
+
+    private static void drawPreviewPatch(
+            Canvas canvas,
+            Bitmap source,
+            float yawDegrees,
+            float pitchDegrees,
+            float yawSpanDegrees,
+            float pitchSpanDegrees,
+            Paint paint) {
+        Rect src = centerCropSource(source);
+        for (RectF dst : previewPatchRects(yawDegrees, pitchDegrees, yawSpanDegrees, pitchSpanDegrees)) {
+            canvas.drawBitmap(source, src, dst, paint);
+        }
+    }
+
+    private static void drawMaskPatch(
+            Canvas canvas,
+            float yawDegrees,
+            float pitchDegrees,
+            float yawSpanDegrees,
+            float pitchSpanDegrees,
+            Paint paint) {
+        for (RectF dst : previewPatchRects(yawDegrees, pitchDegrees, yawSpanDegrees, pitchSpanDegrees)) {
+            canvas.drawRect(dst, paint);
+        }
+    }
+
+    private static List<RectF> previewPatchRects(
+            float yawDegrees,
+            float pitchDegrees,
+            float yawSpanDegrees,
+            float pitchSpanDegrees) {
+        ArrayList<RectF> rects = new ArrayList<>();
+        float centerX = normalizeHeading(yawDegrees) / 360f * PREVIEW_ERP_WIDTH;
+        float centerY = (90f - Math.max(-89f, Math.min(89f, pitchDegrees))) / 180f * PREVIEW_ERP_HEIGHT;
+        float halfWidth = yawSpanDegrees / 360f * PREVIEW_ERP_WIDTH * 0.5f;
+        float halfHeight = pitchSpanDegrees / 180f * PREVIEW_ERP_HEIGHT * 0.5f;
+        addWrappedRect(rects, centerX - halfWidth, centerY - halfHeight, centerX + halfWidth, centerY + halfHeight);
+        return rects;
+    }
+
+    private static void addWrappedRect(ArrayList<RectF> rects, float left, float top, float right, float bottom) {
+        float clampedTop = Math.max(0f, top);
+        float clampedBottom = Math.min(PREVIEW_ERP_HEIGHT, bottom);
+        if (clampedBottom <= clampedTop) {
+            return;
+        }
+        if (left < 0f) {
+            rects.add(new RectF(left + PREVIEW_ERP_WIDTH, clampedTop, PREVIEW_ERP_WIDTH, clampedBottom));
+            rects.add(new RectF(0f, clampedTop, right, clampedBottom));
+        } else if (right > PREVIEW_ERP_WIDTH) {
+            rects.add(new RectF(left, clampedTop, PREVIEW_ERP_WIDTH, clampedBottom));
+            rects.add(new RectF(0f, clampedTop, right - PREVIEW_ERP_WIDTH, clampedBottom));
+        } else {
+            rects.add(new RectF(left, clampedTop, right, clampedBottom));
+        }
+    }
+
+    private static Rect centerCropSource(Bitmap source) {
+        int width = source.getWidth();
+        int height = source.getHeight();
+        float targetAspect = PREVIEW_DEFAULT_YAW_SPAN_DEGREES / PREVIEW_DEFAULT_PITCH_SPAN_DEGREES;
+        int cropWidth = width;
+        int cropHeight = Math.round(width / targetAspect);
+        if (cropHeight > height) {
+            cropHeight = height;
+            cropWidth = Math.round(height * targetAspect);
+        }
+        int left = Math.max(0, (width - cropWidth) / 2);
+        int top = Math.max(0, (height - cropHeight) / 2);
+        return new Rect(left, top, Math.min(width, left + cropWidth), Math.min(height, top + cropHeight));
+    }
+
+    private static float previewYawSpan(CaptureFrameRecord frame) {
+        float fov = horizontalFovDegrees(frame);
+        return Float.isFinite(fov) && fov > 0f
+                ? Math.max(32f, Math.min(70f, fov * 0.62f))
+                : PREVIEW_DEFAULT_YAW_SPAN_DEGREES;
+    }
+
+    private static float previewPitchSpan(CaptureFrameRecord frame) {
+        float fov = verticalFovDegrees(frame);
+        return Float.isFinite(fov) && fov > 0f
+                ? Math.max(34f, Math.min(64f, fov * 0.74f))
+                : PREVIEW_DEFAULT_PITCH_SPAN_DEGREES;
+    }
+
+    private static float horizontalFovDegrees(CaptureFrameRecord frame) {
+        JSONObject intrinsics = frame.rawFacts.intrinsics;
+        double fx = firstPositive(
+                intrinsics.optDouble("imageFocalLengthXPixels", 0.0),
+                intrinsics.optDouble("focalLengthXPixels", 0.0),
+                intrinsics.optDouble("fx", 0.0));
+        double width = firstPositive(
+                intrinsics.optDouble("imageIntrinsicsWidth", 0.0),
+                intrinsics.optDouble("width", 0.0));
+        return fx > 0.0 && width > 0.0
+                ? (float) Math.toDegrees(2.0 * Math.atan(width / (2.0 * fx)))
+                : PREVIEW_DEFAULT_YAW_SPAN_DEGREES / 0.62f;
+    }
+
+    private static float verticalFovDegrees(CaptureFrameRecord frame) {
+        JSONObject intrinsics = frame.rawFacts.intrinsics;
+        double fy = firstPositive(
+                intrinsics.optDouble("imageFocalLengthYPixels", 0.0),
+                intrinsics.optDouble("focalLengthYPixels", 0.0),
+                intrinsics.optDouble("fy", 0.0));
+        double height = firstPositive(
+                intrinsics.optDouble("imageIntrinsicsHeight", 0.0),
+                intrinsics.optDouble("height", 0.0));
+        return fy > 0.0 && height > 0.0
+                ? (float) Math.toDegrees(2.0 * Math.atan(height / (2.0 * fy)))
+                : PREVIEW_DEFAULT_PITCH_SPAN_DEGREES / 0.74f;
+    }
+
+    private void persistPreviewMetadata(
+            String sessionId,
+            File previewFile,
+            File maskFile,
+            int sourceFrameCount,
+            long generationMs,
+            long now) throws IOException {
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        for (CaptureSessionRecord session : sessions) {
+            if (session.id.equals(sessionId)) {
+                try {
+                    session.readiness.put("previewPath", previewFile.getAbsolutePath());
+                    session.readiness.put("previewMaskPath", maskFile.getAbsolutePath());
+                    session.readiness.put("previewOutputState", CaptureOutputState.PREVIEW_PANO);
+                    session.readiness.put("previewWidthPixels", PREVIEW_ERP_WIDTH);
+                    session.readiness.put("previewHeightPixels", PREVIEW_ERP_HEIGHT);
+                    session.readiness.put("previewSourceFrameCount", sourceFrameCount);
+                    session.readiness.put("previewGenerationMs", generationMs);
+                } catch (JSONException e) {
+                    throw new IOException("could not record preview metadata", e);
+                }
+                session.updatedAt = now;
+                writeCaptureSessions(sessions);
+                return;
+            }
+        }
+    }
+
     private static void report(ProgressReporter progress, String stepKey, boolean complete, String message) {
         if (progress != null) {
             progress.onProgress(stepKey, complete, message);
@@ -770,6 +1030,25 @@ final class SpherifyLibrary {
                 ? GraphReadinessReport.missingSession()
                 : validateCaptureGraphReadiness(captureSession);
         return draftQuality.withGraphReadiness(graphQuality);
+    }
+
+    GraphReadinessReport assessCaptureGraphReadiness(String sessionId) {
+        CaptureSessionRecord session = findCaptureSession(sessionId);
+        return session == null
+                ? GraphReadinessReport.missingSession()
+                : validateCaptureGraphReadiness(session);
+    }
+
+    void markCaptureSessionQualityRepair(String sessionId) throws IOException {
+        ArrayList<CaptureSessionRecord> sessions = readCaptureSessions();
+        for (CaptureSessionRecord session : sessions) {
+            if (session.id.equals(sessionId)) {
+                session.status = SessionStatus.QUALITY_REPAIR;
+                session.updatedAt = System.currentTimeMillis();
+                writeCaptureSessions(sessions);
+                return;
+            }
+        }
     }
 
     private static GraphReadinessReport validateCaptureGraphReadiness(CaptureSessionRecord session) {
@@ -791,8 +1070,8 @@ final class SpherifyLibrary {
             }
         }
         ArrayList<String> blockers = new ArrayList<>();
-        if (acceptedFrameIds.size() < 30) {
-            blockers.add("graph needs at least 30 readable accepted guided frames; found " + acceptedFrameIds.size());
+        if (acceptedFrameIds.size() < CaptureTargetPlanner.FIXED_36_TARGET_COUNT) {
+            blockers.add("graph needs 36 readable accepted guided frames; found " + acceptedFrameIds.size());
         }
         CaptureTargetPlanner.TargetCoverage targetCoverage = CaptureTargetPlanner.coverageForAcceptedFrames(session.frames);
         if (targetCoverage.expectedTargets > 0 && !targetCoverage.complete()) {
@@ -1183,6 +1462,18 @@ final class SpherifyLibrary {
         }
     }
 
+    static final class PreviewRenderResult {
+        final File previewFile;
+        final File poseMaskFile;
+        final int sourceFrameCount;
+
+        PreviewRenderResult(File previewFile, File poseMaskFile, int sourceFrameCount) {
+            this.previewFile = previewFile;
+            this.poseMaskFile = poseMaskFile;
+            this.sourceFrameCount = sourceFrameCount;
+        }
+    }
+
     /*
      * Function: deleteDraftFrame
      * Arguments: imageFile is a captured draft JPEG selected from the Draft Frames
@@ -1332,6 +1623,8 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
+            String targetProfileId,
+            int targetIndex,
             String captureMode,
             String captureProfile,
             String exposureJson) throws IOException {
@@ -1348,6 +1641,10 @@ final class SpherifyLibrary {
             json.put("rollDegrees", rollDegrees);
             json.put("targetYawDegrees", targetYawDegrees);
             json.put("targetPitchDegrees", targetPitchDegrees);
+            json.put("targetProfileId", targetProfileId == null || targetProfileId.isEmpty()
+                    ? CaptureTargetPlanner.DEFAULT_PROFILE_ID
+                    : targetProfileId);
+            json.put("targetIndex", targetIndex);
             json.put("captureMode", captureMode == null ? "manual" : captureMode);
             json.put("captureProfile", normalizeCaptureProfile(captureProfile));
             JSONObject exposure = parseExposureJson(exposureJson);
@@ -1367,6 +1664,8 @@ final class SpherifyLibrary {
                     rollDegrees,
                     targetYawDegrees,
                     targetPitchDegrees,
+                    targetProfileId,
+                    targetIndex,
                     captureMode,
                     captureProfile,
                     exposure,
@@ -1463,6 +1762,8 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
+            String targetProfileId,
+            int targetIndex,
             String captureMode,
             String captureProfile,
             String exposureJson,
@@ -1495,6 +1796,8 @@ final class SpherifyLibrary {
                     rollDegrees,
                     targetYawDegrees,
                     targetPitchDegrees,
+                    targetProfileId,
+                    targetIndex,
                     captureProfile,
                     exposure,
                     now);
@@ -1545,6 +1848,8 @@ final class SpherifyLibrary {
                         rollDegrees,
                         targetYawDegrees,
                         targetPitchDegrees,
+                        targetProfileId,
+                        targetIndex,
                         captureMode,
                         captureProfile,
                         exposure,
@@ -1579,6 +1884,8 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
+            String targetProfileId,
+            int targetIndex,
             String captureMode,
             String captureProfile,
             JSONObject exposure,
@@ -1640,6 +1947,8 @@ final class SpherifyLibrary {
         CaptureRawFacts rawFacts = new CaptureRawFacts(
                 imageFile.getAbsolutePath(),
                 now,
+                targetProfileId,
+                targetIndex,
                 targetYawDegrees,
                 targetPitchDegrees,
                 headingDegrees,
@@ -1703,6 +2012,8 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
+            String targetProfileId,
+            int targetIndex,
             String captureProfile,
             JSONObject exposure,
             long now) throws JSONException {
@@ -1735,6 +2046,8 @@ final class SpherifyLibrary {
         return new CaptureRawFacts(
                 imageFile.getAbsolutePath(),
                 now,
+                targetProfileId,
+                targetIndex,
                 targetYawDegrees,
                 targetPitchDegrees,
                 headingDegrees,
@@ -1758,6 +2071,8 @@ final class SpherifyLibrary {
             float rollDegrees,
             int targetYawDegrees,
             int targetPitchDegrees,
+            String targetProfileId,
+            int targetIndex,
             String captureMode,
             String captureProfile,
             JSONObject exposure,
@@ -1773,6 +2088,10 @@ final class SpherifyLibrary {
         json.put("rollDegrees", rollDegrees);
         json.put("targetYawDegrees", targetYawDegrees);
         json.put("targetPitchDegrees", targetPitchDegrees);
+        json.put("targetProfileId", targetProfileId == null || targetProfileId.isEmpty()
+                ? CaptureTargetPlanner.DEFAULT_PROFILE_ID
+                : targetProfileId);
+        json.put("targetIndex", targetIndex);
         json.put("captureMode", captureMode == null ? "manual" : captureMode);
         json.put("captureProfile", normalizeCaptureProfile(captureProfile));
         json.put("exposure", exposure);
@@ -1805,6 +2124,19 @@ final class SpherifyLibrary {
             return new ArrayList<>();
         }
         return sessions;
+    }
+
+    private static ArrayList<CaptureFrameRecord> acceptedFrameRecords(CaptureSessionRecord session) {
+        ArrayList<CaptureFrameRecord> records = new ArrayList<>();
+        if (session == null) {
+            return records;
+        }
+        for (CaptureFrameRecord frame : session.frames) {
+            if (frame.role == CaptureFrameRole.ACCEPTED && new File(frame.rawFacts.filePath).exists()) {
+                records.add(frame);
+            }
+        }
+        return records;
     }
 
     private void writeCaptureSessions(List<CaptureSessionRecord> sessions) throws IOException {
@@ -2299,6 +2631,7 @@ final class SpherifyLibrary {
     private void ensureDirs() throws IOException {
         mkdir(root);
         mkdir(mastersDir);
+        mkdir(previewsDir);
         mkdir(variantsDir);
         mkdir(draftsDir);
         mkdir(thumbnailsDir);
