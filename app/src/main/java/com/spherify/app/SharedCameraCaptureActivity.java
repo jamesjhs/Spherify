@@ -127,6 +127,8 @@ public final class SharedCameraCaptureActivity extends Activity
     private static final float REFERENCE_OVERLAY_FADE_END_DEGREES = 52f;
     private static final int REFERENCE_OVERLAY_MAX_ALPHA = 138;
     private static final int REFERENCE_OVERLAY_MIN_ALPHA = 42;
+    private static final float POSITION_MODEL_SOFT_LIMIT_METERS = 0.03f;
+    private static final float POSITION_MODEL_HARD_LIMIT_METERS = MAX_TRANSLATION_FROM_ANCHOR_METERS;
     private static final String CAPTURE_PROFILE = "arcore_shared_camera";
     private static final String TAG = "SpherifySharedCamera";
 
@@ -1862,6 +1864,7 @@ public final class SharedCameraCaptureActivity extends Activity
         final int imageHeight;
         final int sensorToDisplayRotationDegrees;
         final boolean mirrorForDisplay;
+        final boolean anchored;
         final float poseTx;
         final float poseTy;
         final float poseTz;
@@ -1872,6 +1875,15 @@ public final class SharedCameraCaptureActivity extends Activity
         final float anchorTx;
         final float anchorTy;
         final float anchorTz;
+        final float deviceRightX;
+        final float deviceRightY;
+        final float deviceRightZ;
+        final float deviceUpX;
+        final float deviceUpY;
+        final float deviceUpZ;
+        final float deviceForwardX;
+        final float deviceForwardY;
+        final float deviceForwardZ;
         final float[] projectionMatrix = new float[16];
         final float[] viewMatrix = new float[16];
 
@@ -1894,6 +1906,19 @@ public final class SharedCameraCaptureActivity extends Activity
                 int imageHeight,
                 int sensorToDisplayRotationDegrees,
                 boolean mirrorForDisplay,
+                boolean anchored,
+                float anchorTx,
+                float anchorTy,
+                float anchorTz,
+                float deviceRightX,
+                float deviceRightY,
+                float deviceRightZ,
+                float deviceUpX,
+                float deviceUpY,
+                float deviceUpZ,
+                float deviceForwardX,
+                float deviceForwardY,
+                float deviceForwardZ,
                 Pose pose) {
             this.ready = ready;
             this.blocker = blocker;
@@ -1913,6 +1938,7 @@ public final class SharedCameraCaptureActivity extends Activity
             this.imageHeight = imageHeight;
             this.sensorToDisplayRotationDegrees = sensorToDisplayRotationDegrees;
             this.mirrorForDisplay = mirrorForDisplay;
+            this.anchored = anchored;
             this.poseTx = pose == null ? 0f : pose.tx();
             this.poseTy = pose == null ? 0f : pose.ty();
             this.poseTz = pose == null ? 0f : pose.tz();
@@ -1920,15 +1946,25 @@ public final class SharedCameraCaptureActivity extends Activity
             this.poseQy = pose == null ? 0f : pose.qy();
             this.poseQz = pose == null ? 0f : pose.qz();
             this.poseQw = pose == null ? 1f : pose.qw();
-            this.anchorTx = this.poseTx;
-            this.anchorTy = this.poseTy;
-            this.anchorTz = this.poseTz;
+            this.anchorTx = anchored ? anchorTx : this.poseTx;
+            this.anchorTy = anchored ? anchorTy : this.poseTy;
+            this.anchorTz = anchored ? anchorTz : this.poseTz;
+            this.deviceRightX = deviceRightX;
+            this.deviceRightY = deviceRightY;
+            this.deviceRightZ = deviceRightZ;
+            this.deviceUpX = deviceUpX;
+            this.deviceUpY = deviceUpY;
+            this.deviceUpZ = deviceUpZ;
+            this.deviceForwardX = deviceForwardX;
+            this.deviceForwardY = deviceForwardY;
+            this.deviceForwardZ = deviceForwardZ;
         }
 
         static ArFrameState notReady(String blocker) {
             return new ArFrameState(
                     false, blocker, "not_tracking", 0f, 0f, 0f, 0, 0f, 0f, "",
-                    0f, 0f, 0f, 0f, 0, 0, 0, false, null);
+                    0f, 0f, 0f, 0f, 0, 0, 0, false, false, 0f, 0f, 0f,
+                    1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f, null);
         }
 
         static ArFrameState from(
@@ -1956,10 +1992,16 @@ public final class SharedCameraCaptureActivity extends Activity
             }
             float confidence = Math.min(1f, featurePoints / 120f);
             float translation = 0f;
+            float anchorTx = pose.tx();
+            float anchorTy = pose.ty();
+            float anchorTz = pose.tz();
             if (anchored && anchorTranslation != null) {
-                float dx = pose.tx() - anchorTranslation[0];
-                float dy = pose.ty() - anchorTranslation[1];
-                float dz = pose.tz() - anchorTranslation[2];
+                anchorTx = anchorTranslation[0];
+                anchorTy = anchorTranslation[1];
+                anchorTz = anchorTranslation[2];
+                float dx = pose.tx() - anchorTx;
+                float dy = pose.ty() - anchorTy;
+                float dz = pose.tz() - anchorTz;
                 translation = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
             }
             String parallax = translation > MAX_TRANSLATION_FROM_ANCHOR_METERS
@@ -1999,6 +2041,19 @@ public final class SharedCameraCaptureActivity extends Activity
                             displayRotationDegrees,
                             cameraFacts.frontFacing),
                     cameraFacts.frontFacing,
+                    anchored,
+                    anchorTx,
+                    anchorTy,
+                    anchorTz,
+                    matrix[0],
+                    matrix[1],
+                    matrix[2],
+                    matrix[4],
+                    matrix[5],
+                    matrix[6],
+                    forwardX,
+                    forwardY,
+                    forwardZ,
                     pose);
         }
 
@@ -2457,6 +2512,7 @@ public final class SharedCameraCaptureActivity extends Activity
             reticlePaint.setStyle(Paint.Style.STROKE);
             canvas.drawCircle(cx, cy, 34f, reticlePaint);
             drawCoverageMap(canvas);
+            drawRelativePositionModel(canvas);
             if (!frameState.ready) {
                 drawTextureHint(canvas);
                 return;
@@ -2766,6 +2822,160 @@ public final class SharedCameraCaptureActivity extends Activity
         private static int colorWithAlpha(int color, float alphaScale) {
             int alpha = Math.max(35, Math.min(255, Math.round(((color >>> 24) & 0xFF) * alphaScale)));
             return (color & 0x00FFFFFF) | (alpha << 24);
+        }
+
+        private void drawRelativePositionModel(Canvas canvas) {
+            if (!frameState.ready || !frameState.anchored) {
+                return;
+            }
+            float size = Math.min(230f, Math.max(164f, getWidth() * 0.48f));
+            float centerX = getWidth() * 0.5f;
+            float centerY = 18f + size * 0.5f;
+            float scale = size * 0.34f / Math.max(0.01f, POSITION_MODEL_HARD_LIMIT_METERS);
+            float[] drift = deviceRelativeDrift();
+            float dx = drift[0];
+            float dy = drift[1];
+            float dz = drift[2];
+            float displayLimit = POSITION_MODEL_HARD_LIMIT_METERS * 1.35f;
+            float displayX = clampForModel(dx, -displayLimit, displayLimit);
+            float displayY = clampForModel(dy, -displayLimit, displayLimit);
+            float displayZ = clampForModel(dz, -displayLimit, displayLimit);
+            float[] origin = modelPoint(centerX, centerY, 0f, 0f, 0f, scale);
+            float[] phone = modelPoint(centerX, centerY, displayX, displayY, displayZ, scale);
+            float risk = Math.max(0f, Math.min(1f,
+                    (frameState.translationFromAnchorMeters - POSITION_MODEL_SOFT_LIMIT_METERS)
+                            / Math.max(0.01f, POSITION_MODEL_HARD_LIMIT_METERS - POSITION_MODEL_SOFT_LIMIT_METERS)));
+            int phoneColor = risk >= 1f ? 0xFFF97316 : risk > 0f ? 0xFFFACC15 : 0xFF34D399;
+
+            coveragePaint.setStyle(Paint.Style.FILL);
+            coveragePaint.setColor(0x44000000);
+            canvas.drawCircle(centerX, centerY, size * 0.48f, coveragePaint);
+
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(2.5f);
+            targetPaint.setColor(0x77E2E8F0);
+            drawModelGrid(canvas, centerX, centerY, scale);
+            drawModelAxes(canvas, centerX, centerY, scale);
+
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(4f);
+            targetPaint.setColor(0xAAE2E8F0);
+            canvas.drawLine(origin[0], origin[1], phone[0], phone[1], targetPaint);
+            if (frameState.translationFromAnchorMeters > POSITION_MODEL_SOFT_LIMIT_METERS) {
+                drawModelArrow(canvas, phone[0], phone[1], origin[0], origin[1], phoneColor);
+            }
+
+            coveragePaint.setStyle(Paint.Style.FILL);
+            coveragePaint.setColor(0xFFE2E8F0);
+            canvas.drawCircle(origin[0], origin[1], 8f, coveragePaint);
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(3f);
+            targetPaint.setColor(0xFF34D399);
+            canvas.drawCircle(origin[0], origin[1], 15f, targetPaint);
+            drawPhoneMarker(canvas, phone[0], phone[1], phoneColor);
+        }
+
+        private void drawModelGrid(Canvas canvas, float centerX, float centerY, float scale) {
+            float r = POSITION_MODEL_HARD_LIMIT_METERS;
+            float[] frontLeft = modelPoint(centerX, centerY, -r, 0f, r, scale);
+            float[] frontRight = modelPoint(centerX, centerY, r, 0f, r, scale);
+            float[] backRight = modelPoint(centerX, centerY, r, 0f, -r, scale);
+            float[] backLeft = modelPoint(centerX, centerY, -r, 0f, -r, scale);
+            canvas.drawLine(backLeft[0], backLeft[1], backRight[0], backRight[1], targetPaint);
+            canvas.drawLine(backRight[0], backRight[1], frontRight[0], frontRight[1], targetPaint);
+            canvas.drawLine(frontRight[0], frontRight[1], frontLeft[0], frontLeft[1], targetPaint);
+            canvas.drawLine(frontLeft[0], frontLeft[1], backLeft[0], backLeft[1], targetPaint);
+            canvas.drawLine(backLeft[0], backLeft[1], frontRight[0], frontRight[1], targetPaint);
+            canvas.drawLine(backRight[0], backRight[1], frontLeft[0], frontLeft[1], targetPaint);
+        }
+
+        private void drawModelAxes(Canvas canvas, float centerX, float centerY, float scale) {
+            float r = POSITION_MODEL_HARD_LIMIT_METERS * 0.92f;
+            float[] origin = modelPoint(centerX, centerY, 0f, 0f, 0f, scale);
+            float[] leftAxis = modelPoint(centerX, centerY, -r, 0f, 0f, scale);
+            float[] xAxis = modelPoint(centerX, centerY, r, 0f, 0f, scale);
+            float[] yAxis = modelPoint(centerX, centerY, 0f, r, 0f, scale);
+            float[] backAxis = modelPoint(centerX, centerY, 0f, 0f, -r, scale);
+            float[] forwardAxis = modelPoint(centerX, centerY, 0f, 0f, r, scale);
+            targetPaint.setStrokeWidth(4f);
+            targetPaint.setColor(0xCC38BDF8);
+            canvas.drawLine(origin[0], origin[1], leftAxis[0], leftAxis[1], targetPaint);
+            canvas.drawLine(origin[0], origin[1], xAxis[0], xAxis[1], targetPaint);
+            targetPaint.setColor(0xCC34D399);
+            canvas.drawLine(origin[0], origin[1], yAxis[0], yAxis[1], targetPaint);
+            targetPaint.setColor(0xCCF97316);
+            canvas.drawLine(origin[0], origin[1], backAxis[0], backAxis[1], targetPaint);
+            canvas.drawLine(origin[0], origin[1], forwardAxis[0], forwardAxis[1], targetPaint);
+            targetPaint.setStrokeWidth(2.5f);
+        }
+
+        private void drawPhoneMarker(Canvas canvas, float x, float y, int color) {
+            cuePath.reset();
+            cuePath.moveTo(x, y - 17f);
+            cuePath.lineTo(x + 13f, y - 4f);
+            cuePath.lineTo(x + 10f, y + 17f);
+            cuePath.lineTo(x - 10f, y + 17f);
+            cuePath.lineTo(x - 13f, y - 4f);
+            cuePath.close();
+            coveragePaint.setStyle(Paint.Style.FILL);
+            coveragePaint.setColor(color);
+            canvas.drawPath(cuePath, coveragePaint);
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(3f);
+            targetPaint.setColor(0xEEFFFFFF);
+            canvas.drawPath(cuePath, targetPaint);
+        }
+
+        private void drawModelArrow(Canvas canvas, float fromX, float fromY, float toX, float toY, int color) {
+            float dx = toX - fromX;
+            float dy = toY - fromY;
+            float length = (float) Math.sqrt(dx * dx + dy * dy);
+            if (length < 1f) {
+                return;
+            }
+            float ux = dx / length;
+            float uy = dy / length;
+            float startX = fromX + ux * 20f;
+            float startY = fromY + uy * 20f;
+            float endX = toX - ux * 22f;
+            float endY = toY - uy * 22f;
+            targetPaint.setStyle(Paint.Style.STROKE);
+            targetPaint.setStrokeWidth(6f);
+            targetPaint.setColor(color);
+            canvas.drawLine(startX, startY, endX, endY, targetPaint);
+            float angle = (float) Math.atan2(uy, ux);
+            cuePath.reset();
+            cuePath.moveTo(endX, endY);
+            cuePath.lineTo(endX - (float) Math.cos(angle - 0.55f) * 18f,
+                    endY - (float) Math.sin(angle - 0.55f) * 18f);
+            cuePath.lineTo(endX - (float) Math.cos(angle + 0.55f) * 18f,
+                    endY - (float) Math.sin(angle + 0.55f) * 18f);
+            cuePath.close();
+            coveragePaint.setStyle(Paint.Style.FILL);
+            coveragePaint.setColor(color);
+            canvas.drawPath(cuePath, coveragePaint);
+        }
+
+        private float[] modelPoint(float centerX, float centerY, float x, float y, float z, float scale) {
+            return new float[]{
+                    centerX + x * scale + z * scale * 0.48f,
+                    centerY - y * scale - z * scale * 0.28f
+            };
+        }
+
+        private float[] deviceRelativeDrift() {
+            float wx = frameState.poseTx - frameState.anchorTx;
+            float wy = frameState.poseTy - frameState.anchorTy;
+            float wz = frameState.poseTz - frameState.anchorTz;
+            return new float[]{
+                    wx * frameState.deviceRightX + wy * frameState.deviceRightY + wz * frameState.deviceRightZ,
+                    wx * frameState.deviceUpX + wy * frameState.deviceUpY + wz * frameState.deviceUpZ,
+                    wx * frameState.deviceForwardX + wy * frameState.deviceForwardY + wz * frameState.deviceForwardZ
+            };
+        }
+
+        private static float clampForModel(float value, float min, float max) {
+            return Math.max(min, Math.min(max, value));
         }
 
         private void drawOffscreenCue(Canvas canvas, float targetX, float targetY) {
