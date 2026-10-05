@@ -194,7 +194,8 @@ final class Phase5Stitcher {
                 CaptureFrameRecord b = frames.get(right);
                 float yawDelta = Math.abs(signedHeadingDelta(a.rawFacts.targetYawDegrees, b.rawFacts.targetYawDegrees));
                 int pitchDelta = Math.abs(a.rawFacts.targetPitchDegrees - b.rawFacts.targetPitchDegrees);
-                if (yawDelta <= 70f && pitchDelta <= 48) {
+                if (yawDelta <= CaptureGeometry.PREDICTED_NEIGHBOR_MAX_YAW_DELTA_DEGREES
+                        && pitchDelta <= CaptureGeometry.PREDICTED_NEIGHBOR_MAX_PITCH_DELTA_DEGREES) {
                     mask[left * count + right] = 1;
                     mask[right * count + left] = 1;
                 }

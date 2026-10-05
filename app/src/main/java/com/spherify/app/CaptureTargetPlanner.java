@@ -55,7 +55,7 @@ final class CaptureTargetPlanner {
                     targets,
                     spec.index,
                     anchorYawDegrees + spec.localYawDegrees,
-                    spec.localPitchDegrees,
+                    anchorPitchDegrees + spec.localPitchDegrees,
                     spec.phase);
         }
         return targets;
@@ -202,9 +202,8 @@ final class CaptureTargetPlanner {
 
     private static void markCaptured(ArrayList<CaptureTarget> targets, int yawDegrees, int pitchDegrees) {
         int yaw = normalize(yawDegrees);
-        int pitch = clampPitch(pitchDegrees);
         for (CaptureTarget target : targets) {
-            if (target.yawDegrees == yaw && target.pitchDegrees == pitch) {
+            if (CaptureGeometry.isSameTargetCell(target.yawDegrees, target.pitchDegrees, yaw, pitchDegrees)) {
                 target.captured = true;
                 return;
             }

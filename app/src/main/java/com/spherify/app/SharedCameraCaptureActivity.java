@@ -105,8 +105,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class SharedCameraCaptureActivity extends Activity
         implements GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener, ImageReader.OnImageAvailableListener {
-    private static final float TARGET_YAW_TOLERANCE_DEGREES = 6.5f;
-    private static final float TARGET_PITCH_TOLERANCE_DEGREES = 6.0f;
     private static final int MIN_CPU_IMAGE_WIDTH = 1280;
     private static final int MIN_TRACKING_FEATURE_POINTS = 12;
     private static final int LOW_CONFIDENCE_FEATURE_POINTS = 30;
@@ -1084,7 +1082,7 @@ public final class SharedCameraCaptureActivity extends Activity
     private void markTargetAccepted(int yawDegrees, int pitchDegrees) {
         int yaw = normalizeDegrees(yawDegrees);
         for (CaptureTarget candidate : targets) {
-            if (candidate.yawDegrees == yaw && candidate.pitchDegrees == pitchDegrees) {
+            if (CaptureGeometry.isSameTargetCell(candidate.yawDegrees, candidate.pitchDegrees, yaw, pitchDegrees)) {
                 candidate.captured = true;
                 candidate.weak = false;
                 return;
@@ -1262,8 +1260,11 @@ public final class SharedCameraCaptureActivity extends Activity
     }
 
     private boolean isAligned(CaptureTarget target, ArFrameState state) {
-        return Math.abs(signedHeadingDelta(target.yawDegrees, state.yawDegrees)) <= TARGET_YAW_TOLERANCE_DEGREES
-                && Math.abs(target.pitchDegrees - state.pitchDegrees) <= TARGET_PITCH_TOLERANCE_DEGREES;
+        return CaptureGeometry.isWithinLiveCaptureTolerance(
+                target.yawDegrees,
+                target.pitchDegrees,
+                state.yawDegrees,
+                state.pitchDegrees);
     }
 
     private static int effectiveCaptureWidth(ArFrameState state) {

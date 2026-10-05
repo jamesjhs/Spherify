@@ -1131,7 +1131,8 @@ final class SpherifyLibrary {
                     frame.rawFacts.targetYawDegrees,
                     candidate.rawFacts.targetYawDegrees));
             int pitchDelta = Math.abs(frame.rawFacts.targetPitchDegrees - candidate.rawFacts.targetPitchDegrees);
-            if (yawDelta <= 50f && pitchDelta <= 50) {
+            if (yawDelta <= CaptureGeometry.POSE_ONLY_BRACKET_MAX_YAW_DELTA_DEGREES
+                    && pitchDelta <= CaptureGeometry.POSE_ONLY_BRACKET_MAX_PITCH_DELTA_DEGREES) {
                 count++;
             }
         }
@@ -1731,7 +1732,8 @@ final class SpherifyLibrary {
             }
             float yawDelta = Math.abs(signedHeadingDelta(targetYawDegrees, frameCenterYawDegrees(frame)));
             float pitchDelta = Math.abs(targetPitchDegrees - frame.rawFacts.targetPitchDegrees);
-            if (pitchDelta <= 42f && yawDelta <= 70f) {
+            if (pitchDelta <= CaptureGeometry.PREDICTED_NEIGHBOR_MAX_PITCH_DELTA_DEGREES
+                    && yawDelta <= CaptureGeometry.PREDICTED_NEIGHBOR_MAX_YAW_DELTA_DEGREES) {
                 neighbors.add(frame);
             }
         }
@@ -1854,8 +1856,8 @@ final class SpherifyLibrary {
                         captureProfile,
                         exposure,
                         now);
-                int expectedTargets = CaptureTargetPlanner.expectedTargetCountForAcceptedFrames(session.frames);
-                session.status = expectedTargets > 0 && session.countFrames(CaptureFrameRole.ACCEPTED) >= expectedTargets
+                CaptureTargetPlanner.TargetCoverage targetCoverage = CaptureTargetPlanner.coverageForAcceptedFrames(session.frames);
+                session.status = targetCoverage.complete()
                         ? SessionStatus.CAPTURE_COMPLETE
                         : SessionStatus.CAPTURING;
             } else {

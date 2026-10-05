@@ -36,12 +36,12 @@ final class OpenCvOverlapValidator {
     private static final int MIN_INLIERS = 12;
     private static final double RATIO_TEST = 0.78;
     private static final double RANSAC_REPROJECTION_THRESHOLD = 8.0;
-    private static final double ADJACENT_ROW_MIN_PITCH_DELTA = 16.0;
-    private static final double ADJACENT_ROW_MAX_PITCH_DELTA = 48.0;
+    private static final double ADJACENT_ROW_MIN_PITCH_DELTA = CaptureGeometry.ADJACENT_ROW_MIN_PITCH_DELTA_DEGREES;
+    private static final double ADJACENT_ROW_MAX_PITCH_DELTA = CaptureGeometry.ADJACENT_ROW_MAX_PITCH_DELTA_DEGREES;
     private static final double VERTICAL_OVERLAP_BAND_FRACTION = 0.62;
-    private static final double SAME_ROW_MAX_PITCH_DELTA = 12.0;
-    private static final double HORIZONTAL_OVERLAP_MIN_YAW_DELTA = 16.0;
-    private static final double HORIZONTAL_OVERLAP_MAX_YAW_DELTA = 60.0;
+    private static final double SAME_ROW_MAX_PITCH_DELTA = CaptureGeometry.SAME_ROW_MAX_PITCH_DELTA_DEGREES;
+    private static final double HORIZONTAL_OVERLAP_MIN_YAW_DELTA = CaptureGeometry.HORIZONTAL_OVERLAP_MIN_YAW_DELTA_DEGREES;
+    private static final double HORIZONTAL_OVERLAP_MAX_YAW_DELTA = CaptureGeometry.HORIZONTAL_OVERLAP_MAX_YAW_DELTA_DEGREES;
     private static final double HORIZONTAL_OVERLAP_BAND_FRACTION = 0.62;
 
     CandidateAnalysisResult analyze(

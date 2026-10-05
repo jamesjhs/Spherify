@@ -109,8 +109,6 @@ import java.util.concurrent.Executors;
 
 public class CaptureActivity extends ComponentActivity implements SensorEventListener {
     private static final String TAG_PROFILE = "handheld";
-    private static final float TARGET_YAW_TOLERANCE_DEGREES = 7.5f;
-    private static final float TARGET_PITCH_TOLERANCE_DEGREES = 6.5f;
     private static final float MAX_CAPTURE_RATE_DEGREES_PER_SECOND = 3.5f;
     private static final long REQUIRED_STABLE_MS = 850L;
     private static final long MIN_CAPTURE_INTERVAL_MS = 1200L;
@@ -963,7 +961,7 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     private void markTargetAccepted(int yawDegrees, int pitchDegrees) {
         int yaw = normalizeDegrees(yawDegrees);
         for (CaptureTarget candidate : targets) {
-            if (candidate.yawDegrees == yaw && candidate.pitchDegrees == pitchDegrees) {
+            if (CaptureGeometry.isSameTargetCell(candidate.yawDegrees, candidate.pitchDegrees, yaw, pitchDegrees)) {
                 candidate.captured = true;
                 candidate.weak = false;
                 return;
@@ -977,8 +975,11 @@ public class CaptureActivity extends ComponentActivity implements SensorEventLis
     }
 
     private boolean isAligned(CaptureTarget target) {
-        return Math.abs(signedHeadingDelta(target.yawDegrees, headingDegrees)) <= TARGET_YAW_TOLERANCE_DEGREES
-                && Math.abs(target.pitchDegrees - pitchDegrees) <= TARGET_PITCH_TOLERANCE_DEGREES;
+        return CaptureGeometry.isWithinLiveCaptureTolerance(
+                target.yawDegrees,
+                target.pitchDegrees,
+                headingDegrees,
+                pitchDegrees);
     }
 
     private boolean isMotionStable() {
